@@ -290,9 +290,87 @@ pub struct ModuleCheck {
     pub result: bool,
 }
 
+/// `OTA_WIFI_CHECK` 的结果：ESP32 向 `wifi_api_base_url` + `wifi_ota_info_path`
+/// 拉取版本信息后，告知是否有新固件。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct WifiOtaCheck {
+    pub update_available: bool,
+}
+
+/// WiFi 模块 OTA 状态机（`OTA_WIFI_STATUS` 响应与 `OTA_WIFI_PROCESS` 推送共用）。
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize, Serialize, Default)]
+#[serde(from = "String", into = "String")]
+pub enum OtaStatus {
+    #[default]
+    Idle,
+    Checking,
+    UpdateAvailable,
+    Downloading,
+    /// 下载并写入成功；ESP32 随即自行重启（AP 会重新启动）。
+    Success,
+    Failed,
+    /// 未来固件新增的状态，原字符串保留。
+    Other(String),
+}
+
+impl OtaStatus {
+    pub fn wire_name(&self) -> &str {
+        match self {
+            Self::Idle => "IDLE",
+            Self::Checking => "CHECKING",
+            Self::UpdateAvailable => "UPDATE_AVAILABLE",
+            Self::Downloading => "DOWNLOADING",
+            Self::Success => "SUCCESS",
+            Self::Failed => "FAILED",
+            Self::Other(name) => name,
+        }
+    }
+
+    pub fn parse(text: &str) -> Self {
+        match text {
+            "IDLE" => Self::Idle,
+            "CHECKING" => Self::Checking,
+            "UPDATE_AVAILABLE" => Self::UpdateAvailable,
+            "DOWNLOADING" => Self::Downloading,
+            "SUCCESS" => Self::Success,
+            "FAILED" => Self::Failed,
+            other => Self::Other(other.to_owned()),
+        }
+    }
+
+    /// 升级流程是否已结束（成功或失败）。
+    pub fn is_terminal(&self) -> bool {
+        matches!(self, Self::Success | Self::Failed)
+    }
+}
+
+impl From<String> for OtaStatus {
+    fn from(text: String) -> Self {
+        Self::parse(&text)
+    }
+}
+
+impl From<OtaStatus> for String {
+    fn from(status: OtaStatus) -> Self {
+        match status {
+            OtaStatus::Other(name) => name,
+            known => known.wire_name().to_owned(),
+        }
+    }
+}
+
+impl std::fmt::Display for OtaStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.wire_name())
+    }
+}
+
+/// OTA 进度。下载阶段 `progress`/`total` 为字节数，`percentage` 0–100；
+/// 固件每满 5% 推一条 `OTA_WIFI_PROCESS`。
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct OtaProgress {
-    pub status: String,
+    pub status: OtaStatus,
     pub progress: u64,
     pub total: u64,
     pub percentage: u8,
@@ -393,5 +471,34 @@ mod recording_stamp_tests {
         assert_eq!(RecordingStamp::parse("059F19DF.APM"), None);
         assert_eq!(RecordingStamp::parse("synced_abc.apm"), None);
         assert_eq!(RecordingStamp::parse("recording.wav"), None);
+    }
+}
+
+#[cfg(test)]
+mod ota_status_tests {
+    use super::OtaStatus;
+
+    #[test]
+    fn parses_firmware_vocabulary_and_keeps_unknown_values() {
+        assert_eq!(OtaStatus::parse("DOWNLOADING"), OtaStatus::Downloading);
+        assert_eq!(
+            OtaStatus::parse("UPDATE_AVAILABLE"),
+            OtaStatus::UpdateAvailable
+        );
+        assert_eq!(
+            OtaStatus::parse("VERIFYING"),
+            OtaStatus::Other("VERIFYING".into())
+        );
+        assert!(OtaStatus::Success.is_terminal());
+        assert!(OtaStatus::Failed.is_terminal());
+        assert!(!OtaStatus::Downloading.is_terminal());
+        assert_eq!(
+            serde_json::from_str::<OtaStatus>("\"FAILED\"").unwrap(),
+            OtaStatus::Failed
+        );
+        assert_eq!(
+            serde_json::to_string(&OtaStatus::Checking).unwrap(),
+            "\"CHECKING\""
+        );
     }
 }

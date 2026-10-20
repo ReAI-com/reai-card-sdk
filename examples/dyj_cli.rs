@@ -90,7 +90,8 @@ fn usage() {
                                      action: none|record_start|record_stop|record_toggle|record_mark
   controls clear <input> | controls preset recorder | controls reset
   led on|off|toggle
-  ota check|start|status            ESP32 OTA
+  ota check|start|status            ESP32 OTA（需 STA 已连 + wifi_api_base_url 服务）
+  ota update [secs]                 check→update→跟进 OTA_WIFI_PROCESS 到 SUCCESS/FAILED（默认上限 600s）
   auth activate <deviceId> <name> <code> | auth clear
   restart | shutdown | dfu
   events                             挂机只打印主动上报事件（Ctrl-C 退出）
@@ -543,9 +544,24 @@ async fn controls(device: &DyjDevice, rest: &[String]) -> reai_card_sdk::Result<
 
 async fn ota(device: &DyjDevice, rest: &[String]) -> reai_card_sdk::Result<()> {
     match required(rest, 0, "ota subcommand")? {
-        "check" => print_json(device.check_wifi_ota().await?),
+        "check" => print_json(serde_json::to_value(device.check_wifi_ota().await?)?),
         "start" => print_json(serde_json::to_value(device.start_wifi_ota().await?)?),
         "status" => print_json(serde_json::to_value(device.wifi_ota_status().await?)?),
+        "update" => {
+            let secs = rest
+                .get(1)
+                .map(|value| value.parse::<u64>().expect("seconds must be a number"))
+                .unwrap_or(600);
+            let check = device.check_wifi_ota().await?;
+            if !check.update_available {
+                println!("no update available");
+                return Ok(());
+            }
+            let final_progress = device
+                .update_wifi_firmware(Duration::from_secs(secs))
+                .await?;
+            print_json(serde_json::to_value(final_progress)?)
+        }
         other => Err(reai_card_sdk::SdkError::InvalidCommand(other.into())),
     }
 }

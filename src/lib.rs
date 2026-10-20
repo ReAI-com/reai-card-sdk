@@ -21,7 +21,10 @@ pub use controls::{
     ButtonEvent, ButtonGesture, ControlAction, ControlBindings, ControlInput, SwitchPosition,
     ToggleSwitchEvent,
 };
-pub use device::{DyjDevice, RealtimeRecordingSession};
+pub use device::{
+    CONFIG_KEY_MAX_BYTES, CONFIG_VALUE_MAX_BYTES, DyjDevice, RealtimeRecordingSession,
+    config_key_routes_to_wifi_module,
+};
 pub use recording::{RecordingFileName, SavedRecording, WavFile, apm_to_wav, recording_file_name};
 pub use transport::{BleTransport, NotificationStream, SharedTransport};
 pub use types::*;

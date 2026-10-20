@@ -257,6 +257,8 @@ async fn prepare_ap(device: &DyjDevice) -> reai_card_sdk::Result<()> {
 - 电脑没加入热点时 HTTP 请求会在 5 秒内失败（建连超时），不会挂死。
 - 连路由器：`connect_wifi(ssid, password)`（最长约 12 秒）、`wifi_status()`（模块断电时直接返回 `status:"off"`）、`scan_wifi()`、`disconnect_wifi()`。热点激活时固件会跳过自动连路由器，两者互斥。
 - `start_access_point` / `stop_access_point` / `access_point_status` 需要带 `AP_` 透传的未来固件，v0.3.x 上调用会等到超时；当前固件用不到它们。
+- **ESP32 侧配置**（云上传 / OTA 用）：`set_sta_api_base_url` / `set_sta_websocket_base_url` / `set_sta_upload_path` / `set_wifi_ota_info_path` 及对应读取（`None` = 未配置）。这些键经 nRF 透传，要求模块已上电；通用的 `set_config` / `config_value` / `delete_config` 对键长（≤31 字节）值长（≤63 字节）做本地校验。
+- **WiFi 模块 OTA**：`check_wifi_ota()` 后 `update_wifi_firmware(wait)` 一步跟到 `Success`/`Failed`；需要 STA 已连且 `wifi_api_base_url` 服务可用（见[已知限制](#已知限制与路线图)）。主控进 DFU 用 `enter_dfu_mode()`。
 
 ## 错误速查
 

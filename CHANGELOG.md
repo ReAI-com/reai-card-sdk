@@ -15,12 +15,18 @@
 - `RecordStatus.reason: Option<String>` → `Option<RecordReason>`（`App/Button/Switch/Auto/Unknown/Other(String)`），新增 `error: Option<u32>`（录音出错推送携带）。
 - `set_led(&str)` → `set_led(LedState)`（`On/Off/Toggle`，实现 `FromStr`）。
 - `record_mark()` 返回 `RecordMark { filename, offset_secs }` 而非 `Value`。
+- `check_wifi_ota()` 返回 `WifiOtaCheck { update_available }` 而非 `Value`；`OtaProgress.status: String` → `OtaStatus`（`Idle/Checking/UpdateAvailable/Downloading/Success/Failed/Other(String)`，`is_terminal()`）。
+- `sta_upload_path()` / `sta_api_base_url()` / `sta_websocket_base_url()` 返回 `Option<String>`（`None` = 未配置，ESP32 用自身默认）。
 
 新增：
 
 - **按键 / 开关绑定 API**（`controls` 模块）：`control_action` / `set_control_action` / `clear_control_action` / `control_bindings` / `apply_control_bindings`，覆盖固件六个输入（`btn_single/btn_double/btn_long_press/btn_long_release/switch_on/switch_off`）与五个动作（`none/record_start/record_stop/record_toggle/record_mark`）。未配置读为 `ControlAction::None`，解绑幂等（固件 `not found` 视为成功），`ControlBindings::recorder()` 提供录音笔式预设。`ButtonGesture`/`SwitchPosition` 可直接传入（`Into<ControlInput>`）。
 - **电源事件** `DeviceEvent::Power(PowerEvent)`：`ShutdownImminent { seconds }`（`SHUTDOWN` 响应后紧跟）、`DeviceWakeup`、`StartupComplete`。固件现状是**协议格式偏离**（裸 JSON，见下方修复项）；SDK 同时接受未来固件按协议格式封装的 `POWER:{json}\r\n` 文本帧，两种来源映射为同一事件。固件侧正确修法（`power_mgmt_event_handler` 改走 `app_protocol_send_event("POWER", …)`）已记入 `docs/protocol-support.md`，固件冻结仅记录。
-- `config_value(key) -> Option<String>`：键不存在返回 `None` 而非错误。
+- `config_value(key) -> Option<String>`：键不存在返回 `None` 而非错误；对 ESP32 路由键（`wifi_` 前缀 / `_wifi` 后缀，规则暴露为 `config_key_routes_to_wifi_module`）把固件回的空字符串也归一为 `None`（ESP32 对缺键回 `value:""`，nRF 回 `code 3`，两边不一致）。
+- **配置快速失败**：`CONFIG_*` 对 ESP32 路由键先做模块上电预检（否则 UART 无人应答白等 10s）；键 > 31 字节 / 值 > 63 字节 / 空键在本地以 `InvalidCommand` 拒绝（超长会被 nRF 误报成 `missing key/value`），常量 `CONFIG_KEY_MAX_BYTES` / `CONFIG_VALUE_MAX_BYTES`。
+- `set_wifi_ota_info_path` / `wifi_ota_info_path`：ESP32 四个配置键里最后一个未封装的（OTA 版本信息相对路径，默认 `/ota/info?mod=wifi`）。
+- **WiFi OTA 编排** `update_wifi_firmware(wait)`：先订阅事件再发 `OTA_WIFI_UPDATE`，跟 `OTA_WIFI_PROCESS`（每 5% 一条）到 `Success`/`Failed` 返回最后一条进度，超时报 `Timeout{OTA_WIFI_PROCESS}`。需同一上电周期内先 `check_wifi_ota` 为 true；`Success` 后 ESP32 自重启、热点重启。真机验证与云上传同列延后（依赖 STA + `wifi_api_base_url` 服务）。
+- `dyj_cli` 新增 `ota update [secs]`。
 - `dyj_cli` 新增 `controls list|set|clear|preset recorder|reset`，事件打印改为可读文本；`dyj_web` 新增「08 按键 / 开关」分组（读绑定表 / 绑定 / 解绑 / 预设）与 `/api/controls*` 接口。
 
 修复：

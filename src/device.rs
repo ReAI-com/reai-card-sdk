@@ -27,7 +27,7 @@ use crate::{
     types::{
         AccessPointInfo, BatteryInfo, CommandResponse, DeviceEvent, DeviceInfo, DeviceState,
         FileEntry, LedState, ModuleCheck, OtaProgress, PowerEvent, RecordMark, RecordStatus,
-        StorageInfo, TakenFile, WifiNetwork, WifiStatus,
+        StorageInfo, TakenFile, WifiNetwork, WifiOtaCheck, WifiStatus,
     },
 };
 
@@ -653,18 +653,82 @@ impl DyjDevice {
         self.request_success("AUTH_CLEAR", None, NORMAL_TIMEOUT)
             .await
     }
-    pub async fn check_wifi_ota(&self) -> Result<Value> {
+    // ========== WiFi 模块 OTA ==========
+    //
+    // 需要 STA 已连上路由且能访问 `wifi_api_base_url` + `wifi_ota_info_path`
+    // （默认 `/ota/info?mod=wifi`，返回 `{version, versionCode, url}`）。没有该服务时
+    // ESP32 回 `code 1 "OTA检查更新失败"`；STA 未连接回 `code 1 "WiFi未连接…"`。
+
+    /// 检查 WiFi 模块是否有新固件。结果缓存在 ESP32 本次上电周期内，
+    /// [`Self::start_wifi_ota`] / [`Self::update_wifi_firmware`] 依赖它。
+    pub async fn check_wifi_ota(&self) -> Result<WifiOtaCheck> {
         self.require_wifi_module("OTA_WIFI_CHECK").await?;
-        self.request_value("OTA_WIFI_CHECK", None, NORMAL_TIMEOUT)
+        self.request_typed("OTA_WIFI_CHECK", None, NORMAL_TIMEOUT)
             .await
     }
+
+    /// 开始 WiFi 模块 OTA（仅发起；进度经 `DeviceEvent::WifiOtaProgress` 推送）。
+    /// 同一上电周期内未先 `check_wifi_ota` 或无可用更新时固件拒绝（`code 1`）。
     pub async fn start_wifi_ota(&self) -> Result<CommandResponse> {
         self.require_wifi_module("OTA_WIFI_UPDATE").await?;
         self.request_success("OTA_WIFI_UPDATE", None, NORMAL_TIMEOUT)
             .await
     }
 
+    /// 发起 WiFi 模块 OTA 并跟进到终态（`Success` / `Failed`），返回最后一条进度。
+    ///
+    /// 先订阅事件再发命令，不会漏掉首条进度；固件每 5% 推一条，整个过程通常
+    /// 数十秒到数分钟，`wait` 是总时长上限。`Success` 后 ESP32 会自行重启，
+    /// 热点随之重启——之后要用快传请重新等待 [`Self::wait_for_ap_ready`]。
+    /// 调用前需在同一上电周期内 [`Self::check_wifi_ota`] 得到 `update_available == true`。
+    pub async fn update_wifi_firmware(&self, wait: Duration) -> Result<OtaProgress> {
+        let mut events = self.subscribe_events();
+        self.start_wifi_ota().await?;
+        tracing::info!(target: "dyj.ota", "⬇️ WiFi 模块 OTA 已发起，跟进进度（上限 {}s）", wait.as_secs());
+        let deadline = tokio::time::Instant::now() + wait;
+        loop {
+            let event = match timeout(
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
+                events.recv(),
+            )
+            .await
+            {
+                Ok(Ok(event)) => event,
+                Ok(Err(broadcast::error::RecvError::Lagged(skipped))) => {
+                    tracing::warn!(target: "dyj.ota", "⚠️ OTA 进度事件积压丢弃 {skipped} 条");
+                    continue;
+                }
+                Ok(Err(broadcast::error::RecvError::Closed)) => return Err(SdkError::Disconnected),
+                Err(_) => {
+                    tracing::error!(target: "dyj.ota", "⏱️ OTA 未在 {}s 内结束", wait.as_secs());
+                    return Err(SdkError::Timeout {
+                        command: "OTA_WIFI_PROCESS".to_owned(),
+                        seconds: wait.as_secs(),
+                    });
+                }
+            };
+            if let DeviceEvent::WifiOtaProgress(progress) = event {
+                tracing::info!(target: "dyj.ota", "⬇️ OTA {} {}%（{}/{} 字节）", progress.status, progress.percentage, progress.progress, progress.total);
+                if progress.status.is_terminal() {
+                    return Ok(progress);
+                }
+            }
+        }
+    }
+
+    // ========== 设备 KV 配置 ==========
+    //
+    // 键以 `wifi_` 开头或以 `_wifi` 结尾时 nRF 不落本地 KV，而是透传给 ESP32
+    // （需模块已上电）；其余键存 nRF 的 16 槽 KV。两侧"键不存在"的表现不同：
+    // nRF 回 `code 3 "not found"`，ESP32 回 `value: ""`——[`Self::config_value`] 统一成 `None`。
+
+    /// 写入设备 KV 配置。键 ≤ [`CONFIG_KEY_MAX_BYTES`]、值 ≤ [`CONFIG_VALUE_MAX_BYTES`]
+    /// （nRF 解析缓冲；超长会被固件误报为 `missing key/value`，因此在本地先拒绝）。
     pub async fn set_config(&self, key: &str, value: &str) -> Result<CommandResponse> {
+        validate_config_key(key)?;
+        validate_config_value(value)?;
+        self.require_wifi_module_for_config_key("CONFIG_SET", key)
+            .await?;
         self.request_success(
             "CONFIG_SET",
             Some(json!({"key": key, "value": value})),
@@ -675,16 +739,13 @@ impl DyjDevice {
 
     /// Sets the ESP32's relative upload route, for example `/record`.
     pub async fn set_sta_upload_path(&self, path: &str) -> Result<CommandResponse> {
-        if !path.starts_with('/') {
-            return Err(SdkError::InvalidCommand(
-                "STA upload path must begin with `/`".into(),
-            ));
-        }
+        validate_relative_path(path, "STA upload path")?;
         self.set_config("wifi_file_upload_path", path).await
     }
 
-    pub async fn sta_upload_path(&self) -> Result<String> {
-        self.wifi_config_value("wifi_file_upload_path").await
+    /// `None` 表示未配置（ESP32 使用自身默认值）。
+    pub async fn sta_upload_path(&self) -> Result<Option<String>> {
+        self.config_value("wifi_file_upload_path").await
     }
 
     pub async fn set_sta_api_base_url(&self, url: &str) -> Result<CommandResponse> {
@@ -692,8 +753,8 @@ impl DyjDevice {
         self.set_config("wifi_api_base_url", url).await
     }
 
-    pub async fn sta_api_base_url(&self) -> Result<String> {
-        self.wifi_config_value("wifi_api_base_url").await
+    pub async fn sta_api_base_url(&self) -> Result<Option<String>> {
+        self.config_value("wifi_api_base_url").await
     }
 
     pub async fn set_sta_websocket_base_url(&self, url: &str) -> Result<CommandResponse> {
@@ -701,18 +762,37 @@ impl DyjDevice {
         self.set_config("wifi_ws_base_url", url).await
     }
 
-    pub async fn sta_websocket_base_url(&self) -> Result<String> {
-        self.wifi_config_value("wifi_ws_base_url").await
+    pub async fn sta_websocket_base_url(&self) -> Result<Option<String>> {
+        self.config_value("wifi_ws_base_url").await
     }
-    /// 原样返回 `CONFIG_GET` 响应；键不存在时固件回错误（`code 3`）。
+
+    /// ESP32 拉取 OTA 版本信息的相对路径（拼在 `wifi_api_base_url` 之后），
+    /// 例如 `/ota/info?mod=wifi`（未配置时的固件默认值）。
+    pub async fn set_wifi_ota_info_path(&self, path: &str) -> Result<CommandResponse> {
+        validate_relative_path(path, "WiFi OTA info path")?;
+        self.set_config("wifi_ota_info_path", path).await
+    }
+
+    pub async fn wifi_ota_info_path(&self) -> Result<Option<String>> {
+        self.config_value("wifi_ota_info_path").await
+    }
+
+    /// 原样返回 `CONFIG_GET` 响应；nRF 侧键不存在时固件回错误（`code 3`）。
     /// 只想拿值请用 [`Self::config_value`]。
     pub async fn get_config(&self, key: &str) -> Result<Value> {
+        validate_config_key(key)?;
+        self.require_wifi_module_for_config_key("CONFIG_GET", key)
+            .await?;
         self.request_value("CONFIG_GET", Some(json!({"key": key})), NORMAL_TIMEOUT)
             .await
     }
 
     /// 读取设备 KV 配置；键不存在返回 `Ok(None)` 而不是错误。
+    /// ESP32 路由的键把固件回的空字符串也视为 `None`（ESP32 对缺键就是这么回的）。
     pub async fn config_value(&self, key: &str) -> Result<Option<String>> {
+        validate_config_key(key)?;
+        self.require_wifi_module_for_config_key("CONFIG_GET", key)
+            .await?;
         let payload = self
             .request_payload("CONFIG_GET", Some(json!({"key": key})), NORMAL_TIMEOUT)
             .await?;
@@ -720,16 +800,31 @@ impl DyjDevice {
             return Ok(None);
         }
         ensure_success("CONFIG_GET", &payload)?;
-        payload
+        let value = payload
             .get("value")
             .and_then(Value::as_str)
-            .map(|value| Some(value.to_owned()))
             .ok_or_else(|| {
                 SdkError::InvalidFrame(format!("CONFIG_GET `{key}` omitted string value"))
-            })
+            })?;
+        if value.is_empty() && config_key_routes_to_wifi_module(key) {
+            return Ok(None);
+        }
+        Ok(Some(value.to_owned()))
     }
 
+    /// 透传给 ESP32 的配置键要求模块已上电，否则 UART 无人应答只能等超时。
+    async fn require_wifi_module_for_config_key(&self, command: &str, key: &str) -> Result<()> {
+        if config_key_routes_to_wifi_module(key) {
+            self.require_wifi_module(command).await?;
+        }
+        Ok(())
+    }
+
+    /// 删除设备 KV 配置；nRF 侧键不存在时固件回错误（`code 3`）。
     pub async fn delete_config(&self, key: &str) -> Result<CommandResponse> {
+        validate_config_key(key)?;
+        self.require_wifi_module_for_config_key("CONFIG_DEL", key)
+            .await?;
         self.request_success("CONFIG_DEL", Some(json!({"key": key})), NORMAL_TIMEOUT)
             .await
     }
@@ -948,17 +1043,6 @@ impl DyjDevice {
             }
         }
         Ok(())
-    }
-
-    async fn wifi_config_value(&self, key: &str) -> Result<String> {
-        self.get_config(key)
-            .await?
-            .get("value")
-            .and_then(Value::as_str)
-            .map(ToOwned::to_owned)
-            .ok_or_else(|| {
-                SdkError::InvalidFrame(format!("CONFIG_GET `{key}` omitted string value"))
-            })
     }
 }
 
@@ -1192,6 +1276,52 @@ fn required_u64(value: &Value, key: &str) -> Result<u64> {
         .ok_or_else(|| SdkError::InvalidFrame(format!("missing or invalid `{key}`")))
 }
 
+/// 设备 KV 配置键的最大字节数（nRF `handler_sys.c` 解析缓冲 `key[32]`）。
+pub const CONFIG_KEY_MAX_BYTES: usize = 31;
+/// 设备 KV 配置值的最大字节数（nRF `handler_sys.c` 解析缓冲 `value[64]`）。
+pub const CONFIG_VALUE_MAX_BYTES: usize = 63;
+
+/// 该配置键是否由 nRF 透传给 ESP32（`wifi_` 前缀或 `_wifi` 后缀，
+/// 与固件 `strip_wifi_key` 规则一致）。透传键需要 WiFi 模块已上电，
+/// 且 ESP32 对不存在的键回空字符串而不是错误。
+pub fn config_key_routes_to_wifi_module(key: &str) -> bool {
+    key.starts_with("wifi_") || key.ends_with("_wifi")
+}
+
+fn validate_config_key(key: &str) -> Result<()> {
+    if key.is_empty() {
+        return Err(SdkError::InvalidCommand(
+            "config key must not be empty".into(),
+        ));
+    }
+    if key.len() > CONFIG_KEY_MAX_BYTES {
+        return Err(SdkError::InvalidCommand(format!(
+            "config key `{key}` is {} bytes; the device accepts at most {CONFIG_KEY_MAX_BYTES}",
+            key.len()
+        )));
+    }
+    Ok(())
+}
+
+fn validate_config_value(value: &str) -> Result<()> {
+    if value.len() > CONFIG_VALUE_MAX_BYTES {
+        return Err(SdkError::InvalidCommand(format!(
+            "config value is {} bytes; the device accepts at most {CONFIG_VALUE_MAX_BYTES}",
+            value.len()
+        )));
+    }
+    Ok(())
+}
+
+fn validate_relative_path(path: &str, what: &str) -> Result<()> {
+    if !path.starts_with('/') {
+        return Err(SdkError::InvalidCommand(format!(
+            "{what} must begin with `/`"
+        )));
+    }
+    Ok(())
+}
+
 fn validate_url_scheme(value: &str, allowed_schemes: &[&str]) -> Result<()> {
     let url = reqwest::Url::parse(value)
         .map_err(|error| SdkError::InvalidCommand(format!("invalid URL: {error}")))?;
@@ -1336,8 +1466,20 @@ mod tests {
                         format!("CONFIG_GET:{{\"key\":\"{key}\",\"value\":\"{value}\"}}\r\n")
                             .as_bytes(),
                     ),
+                    // ESP32（wifi_ 路由键）对缺键回空字符串，nRF 回 code 3。
+                    None if config_key_routes_to_wifi_module(&key) => self.reply(
+                        format!("CONFIG_GET:{{\"key\":\"{key}\",\"value\":\"\"}}\r\n").as_bytes(),
+                    ),
                     None => self.reply(b"CONFIG_GET:{\"code\":3,\"message\":\"not found\"}\r\n"),
                 },
+                "OTA_WIFI_CHECK" => self.reply(b"OTA_WIFI_CHECK:{\"updateAvailable\":true}\r\n"),
+                "OTA_WIFI_STATUS" => self.reply(b"OTA_WIFI_STATUS:{\"status\":\"IDLE\",\"progress\":0,\"total\":0,\"percentage\":0}\r\n"),
+                "OTA_WIFI_UPDATE" => {
+                    self.reply(b"OTA_WIFI_UPDATE:{\"code\":0,\"message\":\"ota started\"}\r\n");
+                    self.reply(b"OTA_WIFI_PROCESS:{\"status\":\"DOWNLOADING\",\"progress\":0,\"total\":100,\"percentage\":0}\r\n");
+                    self.reply(b"OTA_WIFI_PROCESS:{\"status\":\"DOWNLOADING\",\"progress\":50,\"total\":100,\"percentage\":50}\r\n");
+                    self.reply(b"OTA_WIFI_PROCESS:{\"status\":\"SUCCESS\",\"progress\":100,\"total\":100,\"percentage\":100}\r\n");
+                }
                 "CONFIG_DEL" => match self.config.lock().unwrap().remove(&key) {
                     Some(_) => self.reply(b"CONFIG_DEL:{\"code\":0,\"message\":\"ok\"}\r\n"),
                     None => self.reply(b"CONFIG_DEL:{\"code\":3,\"message\":\"not found\"}\r\n"),
@@ -1831,6 +1973,115 @@ mod tests {
         let mark = device.record_mark().await.unwrap();
         assert_eq!(mark.filename, "059F19DF.APM");
         assert_eq!(mark.offset_secs, 53);
+    }
+
+    #[tokio::test]
+    async fn config_key_and_value_lengths_are_rejected_locally() {
+        let transport = Arc::new(MockTransport::new());
+        let device = DyjDevice::from_transport(transport.clone()).await.unwrap();
+        let long_key = "k".repeat(CONFIG_KEY_MAX_BYTES + 1);
+        let long_value = "v".repeat(CONFIG_VALUE_MAX_BYTES + 1);
+        assert!(matches!(
+            device.set_config(&long_key, "v").await,
+            Err(SdkError::InvalidCommand(_))
+        ));
+        assert!(matches!(
+            device.set_config("k", &long_value).await,
+            Err(SdkError::InvalidCommand(_))
+        ));
+        assert!(matches!(
+            device.set_config("", "v").await,
+            Err(SdkError::InvalidCommand(_))
+        ));
+        assert!(matches!(
+            device.config_value(&long_key).await,
+            Err(SdkError::InvalidCommand(_))
+        ));
+        // 边界值放行
+        device
+            .set_config(
+                &"k".repeat(CONFIG_KEY_MAX_BYTES),
+                &"v".repeat(CONFIG_VALUE_MAX_BYTES),
+            )
+            .await
+            .unwrap();
+        let commands = transport.commands.lock().await;
+        assert_eq!(commands.iter().filter(|c| *c == "CONFIG_SET").count(), 1);
+        assert!(!commands.contains(&"CONFIG_GET".to_owned()));
+    }
+
+    #[tokio::test]
+    async fn wifi_routed_config_keys_need_the_module_and_read_empty_as_none() {
+        let transport = Arc::new(MockTransport::new());
+        let device = DyjDevice::from_transport(transport.clone()).await.unwrap();
+        // 模块未上电：透传键快速失败，不上线
+        assert!(matches!(
+            device.sta_api_base_url().await,
+            Err(SdkError::WifiModulePoweredDown { .. })
+        ));
+        assert!(matches!(
+            device.set_wifi_ota_info_path("/ota/info").await,
+            Err(SdkError::WifiModulePoweredDown { .. })
+        ));
+        assert!(
+            !transport
+                .commands
+                .lock()
+                .await
+                .contains(&"CONFIG_GET".to_owned())
+        );
+
+        transport.wifi_open.store(true, Ordering::Relaxed);
+        // ESP32 对缺键回 value:""，SDK 归一为 None
+        assert_eq!(device.sta_api_base_url().await.unwrap(), None);
+        assert_eq!(device.wifi_ota_info_path().await.unwrap(), None);
+        device
+            .set_sta_api_base_url("https://api.example.com")
+            .await
+            .unwrap();
+        device
+            .set_wifi_ota_info_path("/ota/info?mod=wifi")
+            .await
+            .unwrap();
+        assert_eq!(
+            device.sta_api_base_url().await.unwrap().as_deref(),
+            Some("https://api.example.com")
+        );
+        assert_eq!(
+            device.wifi_ota_info_path().await.unwrap().as_deref(),
+            Some("/ota/info?mod=wifi")
+        );
+        assert!(matches!(
+            device.set_wifi_ota_info_path("ota/info").await,
+            Err(SdkError::InvalidCommand(_))
+        ));
+        // nRF 侧键缺失仍是 None，且空字符串不会被误归一
+        assert_eq!(device.config_value("btn_single").await.unwrap(), None);
+        device.set_config("app_note", "").await.unwrap();
+        assert_eq!(
+            device.config_value("app_note").await.unwrap().as_deref(),
+            Some("")
+        );
+    }
+
+    #[tokio::test]
+    async fn wifi_ota_check_is_typed_and_update_follows_progress_to_the_end() {
+        use crate::types::OtaStatus;
+
+        let transport = Arc::new(MockTransport::new());
+        transport.wifi_open.store(true, Ordering::Relaxed);
+        let device = DyjDevice::from_transport(transport.clone()).await.unwrap();
+        assert!(device.check_wifi_ota().await.unwrap().update_available);
+        let status = device.wifi_ota_status().await.unwrap();
+        assert_eq!(status.status, OtaStatus::Idle);
+
+        let final_progress = device
+            .update_wifi_firmware(Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(final_progress.status, OtaStatus::Success);
+        assert_eq!(final_progress.percentage, 100);
+        assert!(final_progress.status.is_terminal());
     }
 
     #[tokio::test]

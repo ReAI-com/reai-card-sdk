@@ -39,8 +39,8 @@ The wire protocol does not contain a request ID. The SDK consequently permits on
 | WiFi / AP control | `open_wifi`, `close_wifi`, `scan_wifi`, `connect_wifi`, `disconnect_wifi`, `wifi_status`, `start_access_point`, `stop_access_point`, `access_point_status` | `WIFI_*`, `AP_*` through nRF UART passthrough |
 | AP fast transfer | `AccessPointClient::{device_info,list_files,download_file_to,delete_file}` | ESP32 HTTP `GET /api/files`, `GET /api/files/download`, `DELETE /api/files/delete` |
 | STA upload/auth | `list_uploads`, `upload_file_via_sta`, `delete_upload`, `clear_uploads`, `activate`, `clear_activation` | `UPLOAD_*`, `AUTH_*` |
-| WiFi OTA | `check_wifi_ota`, `start_wifi_ota`, `wifi_ota_status` | `OTA_WIFI_*` |
-| Device config | `set_config`, `get_config`, `config_value`, `delete_config`, `set_led(LedState)`, `test_modules` | `CONFIG_*`, `LED`, `TEST_CHECK` |
+| WiFi OTA | `check_wifi_ota`, `start_wifi_ota`, `update_wifi_firmware`, `wifi_ota_status` | `OTA_WIFI_CHECK`, `OTA_WIFI_UPDATE` (+ `OTA_WIFI_PROCESS` pushes), `OTA_WIFI_STATUS` |
+| Device config | `set_config`, `get_config`, `config_value`, `delete_config`, `set_sta_*`/`sta_*`, `set_wifi_ota_info_path`/`wifi_ota_info_path`, `config_key_routes_to_wifi_module`, `set_led(LedState)`, `test_modules` | `CONFIG_*`, `LED`, `TEST_CHECK` |
 | Button / switch bindings | `control_action`, `set_control_action`, `clear_control_action`, `control_bindings`, `apply_control_bindings` | `CONFIG_GET/SET/DEL` on the six keys `btn_single`, `btn_double`, `btn_long_press`, `btn_long_release`, `switch_on`, `switch_off` |
 | Lifecycle | `restart`, `shutdown`, `enter_dfu_mode` | `RESTART`, `SHUTDOWN`, `OTA` |
 | Escape hatch | `raw_command` | validated arbitrary command with a same-name response |
@@ -89,15 +89,43 @@ AP mode is the firmware default: every `WIFI_OPEN` power-up auto-starts the Soft
 
 Recording names carry the capture time. Each `.apm` has a sibling `.txt` (`{"timestamp":<unix s>,"synced":<bool>}`); the firmware derives `synced_<unix>.apm` (clock was synced) or `nosync_<unix>.apm` (clock was not — the value is not wall-clock time) and surfaces that name both in the `FILE_UPLOAD` start frame (`name`) and in the AP download's `Content-Disposition` filename (`AccessPointDownloadedFile::suggested_name`). `RecordingStamp::parse` decodes either; when the `.txt` is missing the firmware falls back to the raw `XXXXXXXX.APM` name and parsing yields `None`. There is no need to download the `.txt` separately.
 
-### STA upload endpoint configuration
+### Device KV configuration
 
-These persistent ESP32 settings are routed by the nRF because their keys start with `wifi_`:
+`CONFIG_SET/GET/DEL` is one command family backed by two stores. The nRF parses the request first (`handler_sys.c`, buffers `key[32]` / `value[64]`) and then routes it: a key that **starts with `wifi_` or ends with `_wifi`** is forwarded unchanged over UART to the ESP32 (`Preferences`, prefix `cfg_`), anything else lands in the nRF's own `setting_kv` (16 slots shared with every key, 32-byte keys / 64-byte values). The SDK exposes the same rule as `config_key_routes_to_wifi_module(key)` and applies it in three places:
 
-| Rust method | ESP32 key | Expected value |
-| --- | --- | --- |
-| `set_sta_api_base_url` | `wifi_api_base_url` | `http://` or `https://` API base URL |
-| `set_sta_websocket_base_url` | `wifi_ws_base_url` | `ws://` or `wss://` WebSocket base URL |
-| `set_sta_upload_path` | `wifi_file_upload_path` | Relative route beginning with `/`, e.g. `/record` |
+- **Powered-module pre-check.** Routed keys need the ESP32 powered; otherwise the UART frame is never answered. `set_config`/`get_config`/`config_value`/`delete_config` fail fast with `WifiModulePoweredDown` for routed keys when `STATE_INFO.wifiOpen` is false.
+- **"Missing key" normalisation.** The two stores disagree: nRF answers `code 3 "not found"`, the ESP32 answers `{"key":…,"value":""}` (`Setting::getConfig(key, "")`). `config_value` returns `Ok(None)` for both (an empty string on a routed key counts as unset); `get_config` returns the raw response and therefore still errors on the nRF side.
+- **Length validation.** Keys longer than `CONFIG_KEY_MAX_BYTES` (31) or values longer than `CONFIG_VALUE_MAX_BYTES` (63) overflow the nRF's `mjson_get_string` buffers and come back as the misleading `code 2 "missing key"` / `code 3 "missing value"`; the SDK rejects them locally with `InvalidCommand`. Empty keys are rejected too.
+
+Error codes: `CONFIG_SET` → `1` missing json, `2` missing key, `3` missing value, `4` persist failed (slot table full or flash write error); `CONFIG_GET`/`CONFIG_DEL` → `1`/`2` as above, `3` not found. ESP32-side failures are always `code 1` with a message.
+
+Known keys on v0.3.x / WiFi v0.0.9:
+
+| Key | Store | Written by | Meaning |
+| --- | --- | --- | --- |
+| `btn_single`, `btn_double`, `btn_long_press`, `btn_long_release` | nRF | host (`set_control_action`) | button gesture → `ControlAction` |
+| `switch_on`, `switch_off` | nRF | host (`set_control_action`) | side switch position → `ControlAction` |
+| `low_power_mode` | nRF | firmware | deep-sleep flag used at boot; surfaced as `STATE_INFO.lowPowerMode`. Read-only for the host. |
+| `wifi_ver`, `wifi_ver_code` | nRF | firmware (`WIFI_SYNC`) | cached ESP32 version; surfaced as `BASE_INFO.wifiVersion/wifiVersionCode`. Despite the `wifi_` prefix these are stored on the nRF (the firmware writes them internally, bypassing the routing rule) — reading them from the host **is** routed to the ESP32 and returns `""`. |
+| `wifi_api_base_url` | ESP32 | host (`set_sta_api_base_url`) | `http://`/`https://` base URL for cloud upload, OTA info and auth |
+| `wifi_ws_base_url` | ESP32 | host (`set_sta_websocket_base_url`) | `ws://`/`wss://` base URL |
+| `wifi_file_upload_path` | ESP32 | host (`set_sta_upload_path`) | relative upload route, e.g. `/record` |
+| `wifi_ota_info_path` | ESP32 | host (`set_wifi_ota_info_path`) | relative OTA-info route; firmware default `/ota/info?mod=wifi` when unset |
+
+Slot budget on the nRF: 16 total, 3 used by firmware-internal keys, 6 by the control bindings → 7 free for application keys. ESP32 keys do not consume nRF slots.
+
+### WiFi module OTA
+
+The ESP32 updates itself over STA; the nRF is not involved beyond passthrough. Preconditions, all checked by the ESP32 and reported as `code 1` with a message: STA connected to a router (`"WiFi未连接…"`), and an HTTP service reachable at `wifi_api_base_url` + `wifi_ota_info_path` returning `{"version":…, "versionCode":…, "url":…}` (`"OTA检查更新失败"` otherwise). Flow:
+
+1. `check_wifi_ota()` → `OTA_WIFI_CHECK` → `WifiOtaCheck { update_available }`. The result is cached in the ESP32 **for the current power cycle only** (`_updateAvailable` is not persisted).
+2. `start_wifi_ota()` → `OTA_WIFI_UPDATE`; refused with `"没有可用的更新"` unless step 1 succeeded with `true` in the same power cycle. The ESP32 answers the command first, then downloads via `HTTPUpdate` and pushes `OTA_WIFI_PROCESS {status, progress, total, percentage}` on start, every further 5 %, and at the end.
+3. `update_wifi_firmware(wait)` wraps step 2: subscribes to events *before* sending the command, then returns the first progress whose `status.is_terminal()` (`Success` or `Failed`), or `Timeout { command: "OTA_WIFI_PROCESS" }` when `wait` elapses. Lagged event receivers are skipped, not treated as errors.
+4. On `Success` the ESP32 calls `ESP.restart()`. The module stays powered, so `wifiOpen` remains true, but the AP and HTTP server restart — wait for `WIFI_AP_START` (`wait_for_ap_ready`) before using `access_point_client()` again, and expect the version in `BASE_INFO.wifiVersion` to change only after the next `WIFI_SYNC`.
+
+Status vocabulary (`OtaStatus`): `IDLE`, `CHECKING`, `UPDATE_AVAILABLE`, `DOWNLOADING`, `SUCCESS`, `FAILED`; anything else is carried as `Other(String)`. `wifi_ota_status()` reads the same structure on demand.
+
+The nRF's own `OTA` command (`enter_dfu_mode`) is unrelated: it reboots the main controller into the Nordic Secure DFU bootloader (BLE link drops, the device re-advertises for the DFU protocol). Discovering and transferring the DFU package is a separate Nordic protocol and is deliberately outside this SDK.
 
 ## Events
 
