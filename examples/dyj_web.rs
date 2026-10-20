@@ -23,8 +23,9 @@ use futures::Stream;
 use tokio::sync::{Mutex, RwLock, broadcast};
 
 use reai_card_sdk::{
-    AP_DEFAULT_IP, AP_DEFAULT_PORT, AP_DEFAULT_SSID, AccessPointClient, DeviceEvent, DeviceManager,
-    DyjDevice, PcmChunk, RealtimeRecordingSession, SAMPLE_RATE_HZ, SavedRecording,
+    AP_DEFAULT_IP, AP_DEFAULT_PORT, AP_DEFAULT_SSID, AccessPointClient, ControlAction,
+    ControlBindings, ControlInput, DeviceEvent, DeviceManager, DyjDevice, PcmChunk,
+    RealtimeRecordingSession, SAMPLE_RATE_HZ, SavedRecording,
 };
 
 #[path = "common/mod.rs"]
@@ -113,6 +114,10 @@ async fn main() {
         .route("/api/record/realtime/stop", post(realtime_stop))
         .route("/api/audio", get(audio_ws))
         .route("/api/audio/demo", post(audio_demo))
+        .route("/api/controls", get(controls_list))
+        .route("/api/controls/set", post(controls_set))
+        .route("/api/controls/clear", post(controls_clear))
+        .route("/api/controls/preset", post(controls_preset))
         .with_state(state);
 
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
@@ -140,6 +145,12 @@ impl From<reai_card_sdk::SdkError> for ApiError {
 impl From<std::io::Error> for ApiError {
     fn from(error: std::io::Error) -> Self {
         Self(reai_card_sdk::SdkError::Io(error))
+    }
+}
+
+impl From<serde_json::Error> for ApiError {
+    fn from(error: serde_json::Error) -> Self {
+        Self(reai_card_sdk::SdkError::Json(error))
     }
 }
 
@@ -608,20 +619,111 @@ fn invalid_body(message: &str) -> ApiError {
     ApiError(reai_card_sdk::SdkError::InvalidFrame(message.to_owned()))
 }
 
+// ========== 按键 / 侧边开关绑定 ==========
+
+fn parse_control_input(body: &serde_json::Value) -> ApiResult<ControlInput> {
+    let text = body
+        .get("input")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| invalid_body("缺少 input 字段"))?;
+    ControlInput::from_config_key(text).ok_or_else(|| {
+        invalid_body(&format!(
+            "未知输入 {text}，应为 {}",
+            ControlInput::ALL
+                .iter()
+                .map(|input| input.config_key())
+                .collect::<Vec<_>>()
+                .join(" / ")
+        ))
+    })
+}
+
+/// 读六个输入的绑定表（六次 CONFIG_GET，未配置的项显示为 none）。
+async fn controls_list(State(state): State<Arc<AppState>>) -> ApiResult<Json<serde_json::Value>> {
+    let device = current_device(&state).await?;
+    Ok(Json(serde_json::to_value(
+        device.control_bindings().await?,
+    )?))
+}
+
+/// `{input, action}`：把某个输入绑定到动作，固件侧立刻生效并持久化。
+async fn controls_set(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<serde_json::Value>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let device = current_device(&state).await?;
+    let input = parse_control_input(&body)?;
+    let action = body
+        .get("action")
+        .and_then(serde_json::Value::as_str)
+        .map(ControlAction::parse)
+        .ok_or_else(|| invalid_body("缺少 action 字段"))?;
+    device.set_control_action(input, action.clone()).await?;
+    Ok(Json(serde_json::json!({
+        "input": input.config_key(),
+        "action": action.wire_name(),
+    })))
+}
+
+/// `{input}`：解除绑定（删配置键）。
+async fn controls_clear(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<serde_json::Value>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let device = current_device(&state).await?;
+    let input = parse_control_input(&body)?;
+    device.clear_control_action(input).await?;
+    Ok(Json(
+        serde_json::json!({ "input": input.config_key(), "action": "none" }),
+    ))
+}
+
+/// `{name}`：整表写入预设。`recorder` = 开关开/关录音、单击打点、双击切换；`factory` = 全部解绑。
+async fn controls_preset(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<serde_json::Value>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let device = current_device(&state).await?;
+    let name = body
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| invalid_body("缺少 name 字段"))?;
+    match name {
+        "recorder" => {
+            device
+                .apply_control_bindings(&ControlBindings::recorder())
+                .await?
+        }
+        "factory" => {
+            for input in ControlInput::ALL {
+                device.clear_control_action(input).await?;
+            }
+        }
+        other => return Err(invalid_body(&format!("未知预设 {other}"))),
+    }
+    Ok(Json(serde_json::to_value(
+        device.control_bindings().await?,
+    )?))
+}
+
 /// `DeviceEvent` → (命令名, payload)，前端据此渲染事件卡片。
 fn describe_event(event: DeviceEvent) -> (String, serde_json::Value) {
     fn value(item: impl serde::Serialize) -> serde_json::Value {
         serde_json::to_value(item).unwrap_or_default()
     }
     match event {
-        DeviceEvent::Button(payload) => ("BTN_CLICK".into(), payload),
-        DeviceEvent::ToggleSwitch(payload) => ("TOGGLE_SWITCH".into(), payload),
+        DeviceEvent::Button(event) => ("BTN_CLICK".into(), value(event)),
+        DeviceEvent::ToggleSwitch(event) => ("TOGGLE_SWITCH".into(), value(event)),
         DeviceEvent::RecordStatus(status) => ("RECORD_STATUS".into(), value(status)),
         DeviceEvent::WifiNetwork(network) => ("WIFI_LIST".into(), value(network)),
         DeviceEvent::WifiOff(response) => ("WIFI_OFF".into(), value(response)),
         DeviceEvent::UploadComplete(response) => ("UPLOAD_COMPLETE".into(), value(response)),
         DeviceEvent::WifiOtaProgress(progress) => ("OTA_WIFI_PROCESS".into(), value(progress)),
         DeviceEvent::AccessPointReady(response) => ("WIFI_AP_START".into(), value(response)),
+        DeviceEvent::Power(power) => ("POWER".into(), value(power)),
+        DeviceEvent::Unhandled { command, payload } if command.is_empty() => {
+            ("RAW".into(), payload)
+        }
         DeviceEvent::Unhandled { command, payload } => (command, payload),
     }
 }

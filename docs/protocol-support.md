@@ -40,7 +40,8 @@ The wire protocol does not contain a request ID. The SDK consequently permits on
 | AP fast transfer | `AccessPointClient::{device_info,list_files,download_file_to,delete_file}` | ESP32 HTTP `GET /api/files`, `GET /api/files/download`, `DELETE /api/files/delete` |
 | STA upload/auth | `list_uploads`, `upload_file_via_sta`, `delete_upload`, `clear_uploads`, `activate`, `clear_activation` | `UPLOAD_*`, `AUTH_*` |
 | WiFi OTA | `check_wifi_ota`, `start_wifi_ota`, `wifi_ota_status` | `OTA_WIFI_*` |
-| Device config | `set_config`, `get_config`, `delete_config`, `set_led`, `test_modules` | `CONFIG_*`, `LED`, `TEST_CHECK` |
+| Device config | `set_config`, `get_config`, `config_value`, `delete_config`, `set_led(LedState)`, `test_modules` | `CONFIG_*`, `LED`, `TEST_CHECK` |
+| Button / switch bindings | `control_action`, `set_control_action`, `clear_control_action`, `control_bindings`, `apply_control_bindings` | `CONFIG_GET/SET/DEL` on the six keys `btn_single`, `btn_double`, `btn_long_press`, `btn_long_release`, `switch_on`, `switch_off` |
 | Lifecycle | `restart`, `shutdown`, `enter_dfu_mode` | `RESTART`, `SHUTDOWN`, `OTA` |
 | Escape hatch | `raw_command` | validated arbitrary command with a same-name response |
 
@@ -51,6 +52,21 @@ The wire protocol does not contain a request ID. The SDK consequently permits on
 This powered-down short-circuit is not unique to `WIFI_STATUS`: every UART-passthrough command (`WIFI_SCAN`, `WIFI_CONNECT`, `WIFI_DISCONNECT`, `AP_*`, `UPLOAD_*`, `AUTH_*`, `OTA_WIFI_*`) is pre-checked against `STATE_INFO.wifiOpen` and fails fast with `WifiModulePoweredDown` instead of burning its timeout on an unanswered frame. Only `open_wifi`/`close_wifi` (handled locally by the nRF) skip the check.
 
 `TEST_CHECK` is special: the firmware returns exactly 11 module results without an `index: -1` terminator, so `test_modules` waits for all 11 rather than treating it as an indexed list.
+
+### Button and side-switch bindings
+
+The nRF stores one action per physical input in its KV settings (`setting_kv`, 16 slots shared with every other key, 32-byte keys / 64-byte values). When an input fires, `main.c` reads the key, reports the event **with the bound action** (`BTN_CLICK {"key","action"}` / `TOGGLE_SWITCH {"state","action"}`) and then performs the action itself on the device (deferred to the main loop because the button timer callback cannot touch the SD card or PDM). The host must not replay the action.
+
+| Input | KV key | Reported as |
+| --- | --- | --- |
+| button single click | `btn_single` | `BTN_CLICK key=single` |
+| button double click | `btn_double` | `BTN_CLICK key=double` |
+| button long press (threshold reached) | `btn_long_press` | `BTN_CLICK key=long_press` |
+| button released after a long press | `btn_long_release` | `BTN_CLICK key=long_release` (always paired with the preceding `long_press`) |
+| side switch moved to on | `switch_on` | `TOGGLE_SWITCH state=on` |
+| side switch moved to off | `switch_off` | `TOGGLE_SWITCH state=off` |
+
+Action vocabulary (`ControlAction`): `none`, `record_start`, `record_stop`, `record_toggle`, `record_mark`. A missing key is treated by the firmware as `none`; `CONFIG_GET`/`CONFIG_DEL` on a missing key answer `code 3 "not found"`, which `control_action` maps to `ControlAction::None` and `clear_control_action` treats as success. Any other string is stored and echoed verbatim but performs nothing on v0.3.x; the SDK carries it as `ControlAction::Other`. `record_mark` outside a recording is a no-op on the device. Actions bound this way surface in `RECORD_STATUS` pushes with `reason: "button"` / `"switch"`.
 
 ### AP and STA file retrieval
 
@@ -83,7 +99,13 @@ These persistent ESP32 settings are routed by the nRF because their keys start w
 
 ## Events
 
-The event receiver emits `BTN_CLICK`, `TOGGLE_SWITCH`, `RECORD_STATUS`, `WIFI_LIST`, `WIFI_OFF`, `UPLOAD_COMPLETE` and `OTA_WIFI_PROCESS` when the device sends them. `WIFI_LIST` may also be consumed by a currently running `scan_wifi` call; event observers still receive it.
+The event receiver emits typed `DeviceEvent`s for `BTN_CLICK` (`ButtonEvent { gesture, action }`), `TOGGLE_SWITCH` (`ToggleSwitchEvent { position, action }`), `RECORD_STATUS` (`RecordStatus` with `reason` and, on failure, `error`), `WIFI_LIST`, `WIFI_OFF`, `UPLOAD_COMPLETE`, `OTA_WIFI_PROCESS` and `WIFI_AP_START`. `WIFI_LIST` may also be consumed by a currently running `scan_wifi` call; event observers still receive it. A `BTN_CLICK`/`TOGGLE_SWITCH` whose `key`/`state` the SDK does not know (a future firmware gesture) is delivered as `DeviceEvent::Unhandled { command, payload }` rather than dropped.
+
+`RECORD_STATUS` pushes carry `reason` (`app`, `button`, `switch`, `auto` for the 10-minute auto-split, `unknown`) and, for `RECORD_EVT_ERROR`, an `error` code with `isRecording: false`. The same command name answers the `record_status()` query; that response has no `reason` and is also broadcast on the event channel.
+
+### Unframed power notifications
+
+`power_mgmt` in `main.c` writes three messages straight to `ble_uart_send` **without** the `COMMAND:` prefix and **without** a `\r\n` terminator: `{"type":"shutdown_imminent","seconds":5}` (right after the `SHUTDOWN` response, and before a low-battery/timer shutdown), `{"type":"device_wakeup"}` and `{"type":"startup_complete"}` (normally emitted before any BLE link exists, so rarely observed). A line-oriented parser would glue the first one to whatever frame follows and lose both. The SDK's `FrameDecoder` therefore treats a buffer that starts with `{` as a raw JSON object, cuts it at the JSON boundary as soon as it is complete (no newline needed), emits `DeviceEvent::Power(PowerEvent)`, and resumes normal line parsing on the remaining bytes. Raw JSON with an unknown `type` is delivered as `Unhandled` with an empty `command`; malformed raw JSON is dropped up to the next newline so the stream resynchronizes.
 
 Event availability caveat: with the current ESP32 firmware the `UPLOAD_COMPLETE` notification is only sent from the automatic-upload loop, which is disabled (`UploadManager::loop` returns immediately). The `UPLOAD_FILE` command therefore reports completion through its own (delayed) response, not through `UPLOAD_COMPLETE`; treat `DeviceEvent::UploadComplete` as reserved for future firmware. `WIFI_AP_START` is emitted by the ESP32 boot flow once its AP and HTTP server are both up.
 

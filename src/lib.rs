@@ -1,10 +1,14 @@
 //! Async Bluetooth Low Energy SDK for DYJ recording devices.
 //!
 //! `DyjDevice` serializes device requests because the wire protocol has no request ID.
-//! Subscribe to [`DyjDevice::subscribe_events`] for hardware-originated notifications.
+//! Subscribe to [`DyjDevice::subscribe_events`] for hardware-originated notifications
+//! (button gestures, side-switch moves, recording state changes, power notices) and to
+//! [`DyjDevice::subscribe_audio`] for decoded realtime PCM. Button/switch behaviour is
+//! configured on the device through [`DyjDevice::set_control_action`] and friends.
 
 pub mod access_point;
 pub mod audio;
+pub mod controls;
 mod device;
 mod protocol;
 pub mod recording;
@@ -13,6 +17,10 @@ pub mod types;
 
 pub use access_point::AccessPointClient;
 pub use audio::{AdpcmDecoder, CHANNELS, PcmChunk, SAMPLE_RATE_HZ, wav_bytes};
+pub use controls::{
+    ButtonEvent, ButtonGesture, ControlAction, ControlBindings, ControlInput, SwitchPosition,
+    ToggleSwitchEvent,
+};
 pub use device::{DyjDevice, RealtimeRecordingSession};
 pub use recording::{RecordingFileName, SavedRecording, WavFile, apm_to_wav, recording_file_name};
 pub use transport::{BleTransport, NotificationStream, SharedTransport};

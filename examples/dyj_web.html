@@ -283,14 +283,44 @@
         <button onclick="cfgDel()">删</button>
       </div>
     </div>
-    <div class="group"><h3><span class="no">08</span>OTA</h3>
+    <div class="group"><h3><span class="no">08</span>按键 / 开关</h3>
+      <div class="row">
+        <select id="ctlInput">
+          <option value="btn_single">按键·单击</option>
+          <option value="btn_double">按键·双击</option>
+          <option value="btn_long_press">按键·长按</option>
+          <option value="btn_long_release">按键·长按松开</option>
+          <option value="switch_on">开关·拨到 on</option>
+          <option value="switch_off">开关·拨到 off</option>
+        </select>
+        <select id="ctlAction">
+          <option value="none">none（不动作）</option>
+          <option value="record_start">record_start</option>
+          <option value="record_stop">record_stop</option>
+          <option value="record_toggle">record_toggle</option>
+          <option value="record_mark">record_mark</option>
+        </select>
+      </div>
+      <div class="row">
+        <button onclick="ctlList()">读绑定表</button>
+        <button onclick="ctlSet()">绑定</button>
+        <button onclick="ctlClear()">解绑</button>
+        <button onclick="ctlPreset('recorder')">预设·录音笔</button>
+        <button class="danger" onclick="ctlPreset('factory')">全部解绑</button>
+      </div>
+      <div class="row" style="color:var(--dim);font-size:11px;line-height:1.6">
+        动作在设备侧执行并持久化。按一下按键 / 拨开关，右侧「设备事件」应出现 BTN_CLICK / TOGGLE_SWITCH，
+        若绑定了录音动作还会跟一条 RECORD_STATUS（reason=button/switch）。
+      </div>
+    </div>
+    <div class="group"><h3><span class="no">09</span>OTA</h3>
       <div class="row">
         <button onclick="cmd('OTA_WIFI_CHECK')">检查</button>
         <button onclick="cmd('OTA_WIFI_UPDATE')">升级</button>
         <button onclick="cmd('OTA_WIFI_STATUS')">进度</button>
       </div>
     </div>
-    <div class="group"><h3><span class="no">09</span>LED 系统</h3>
+    <div class="group"><h3><span class="no">10</span>LED 系统</h3>
       <div class="row">
         <button onclick="cmd('LED',{state:'on'})">灯开</button>
         <button onclick="cmd('LED',{state:'off'})">灯关</button>
@@ -532,6 +562,28 @@ async function delUpload() {
 function cfgGet() { const k = $('cfgKey').value.trim(); if (k) cmd('CONFIG_GET', {key: k}); }
 function cfgSet() { const k = $('cfgKey').value.trim(); if (k) cmd('CONFIG_SET', {key: k, value: $('cfgVal').value}); }
 function cfgDel() { const k = $('cfgKey').value.trim(); if (k && confirm(`删除配置 ${k}？`)) cmd('CONFIG_DEL', {key: k}); }
+
+// ---------- 按键 / 开关绑定 ----------
+async function ctlList() {
+  setBusy(true);
+  try { await api('/api/controls', {method:'GET'}); } finally { setBusy(false); }
+}
+async function ctlSet() {
+  setBusy(true);
+  try { await api('/api/controls/set', {method:'POST', body:{input: $('ctlInput').value, action: $('ctlAction').value}}); }
+  finally { setBusy(false); }
+}
+async function ctlClear() {
+  setBusy(true);
+  try { await api('/api/controls/clear', {method:'POST', body:{input: $('ctlInput').value}}); }
+  finally { setBusy(false); }
+}
+async function ctlPreset(name) {
+  if (name === 'factory' && !confirm('解除全部六个输入的绑定？')) return;
+  setBusy(true, '写入中…');
+  try { await api('/api/controls/preset', {method:'POST', body:{name}}); }
+  finally { setBusy(false); }
+}
 
 // ---------- 状态卡片 ----------
 async function refreshCards() {

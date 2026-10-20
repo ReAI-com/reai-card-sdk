@@ -15,7 +15,9 @@
 
 use std::time::Duration;
 
-use reai_card_sdk::{DeviceEvent, DeviceManager, DyjDevice};
+use reai_card_sdk::{
+    ControlAction, ControlBindings, ControlInput, DeviceEvent, DeviceManager, DyjDevice, LedState,
+};
 use serde_json::Value;
 
 #[path = "common/mod.rs"]
@@ -83,6 +85,10 @@ fn usage() {
   ap start|stop|status              ESP32 热点与快传入口
   uploads list|upload <name>|delete <name>|clear
   config get <key> | config set <key> <value> | config del <key>
+  controls list                      读六个按键/开关输入的绑定表
+  controls set <input> <action>      input: btn_single|btn_double|btn_long_press|btn_long_release|switch_on|switch_off
+                                     action: none|record_start|record_stop|record_toggle|record_mark
+  controls clear <input> | controls preset recorder | controls reset
   led on|off|toggle
   ota check|start|status            ESP32 OTA
   auth activate <deviceId> <name> <code> | auth clear
@@ -141,8 +147,9 @@ async fn run(globals: &Globals, command: &[String]) -> reai_card_sdk::Result<()>
         "ap" => ap(&device, rest).await,
         "uploads" => uploads(&device, rest).await,
         "config" => config(&device, rest).await,
+        "controls" => controls(&device, rest).await,
         "led" => {
-            let state = required(rest, 0, "state (on/off/toggle)")?;
+            let state: LedState = required(rest, 0, "state (on/off/toggle)")?.parse()?;
             print_json(serde_json::to_value(device.set_led(state).await?)?)
         }
         "ota" => ota(&device, rest).await,
@@ -226,14 +233,20 @@ fn summarize(event: DeviceEvent) -> String {
         serde_json::to_string(&value).unwrap_or_default()
     }
     match event {
-        DeviceEvent::Button(payload) => json(payload),
-        DeviceEvent::ToggleSwitch(payload) => json(payload),
+        DeviceEvent::Button(event) => format!("button {} → {}", event.gesture, event.action),
+        DeviceEvent::ToggleSwitch(event) => {
+            format!("switch {} → {}", event.position, event.action)
+        }
         DeviceEvent::RecordStatus(status) => json(status),
         DeviceEvent::WifiNetwork(network) => json(network),
         DeviceEvent::WifiOff(response) => json(response),
         DeviceEvent::UploadComplete(response) => json(response),
         DeviceEvent::WifiOtaProgress(progress) => json(progress),
         DeviceEvent::AccessPointReady(response) => json(response),
+        DeviceEvent::Power(power) => format!("power {}", json(power)),
+        DeviceEvent::Unhandled { command, payload } if command.is_empty() => {
+            format!("raw:{payload}")
+        }
         DeviceEvent::Unhandled { command, payload } => format!("{command}:{payload}"),
     }
 }
@@ -279,7 +292,7 @@ async fn record(device: &DyjDevice, rest: &[String]) -> reai_card_sdk::Result<()
         "stop" => print_json(serde_json::to_value(device.stop_recording().await?)?),
         "toggle" => print_json(serde_json::to_value(device.toggle_recording().await?)?),
         "status" => print_json(serde_json::to_value(device.record_status().await?)?),
-        "mark" => print_json(device.record_mark().await?),
+        "mark" => print_json(serde_json::to_value(device.record_mark().await?)?),
         "realtime" => {
             let enabled = match required(rest, 1, "realtime on|off")? {
                 value if value.eq_ignore_ascii_case("on") => true,
@@ -474,6 +487,56 @@ async fn config(device: &DyjDevice, rest: &[String]) -> reai_card_sdk::Result<()
         "del" => print_json(serde_json::to_value(
             device.delete_config(required(rest, 1, "key")?).await?,
         )?),
+        other => Err(reai_card_sdk::SdkError::InvalidCommand(other.into())),
+    }
+}
+
+/// 按键 / 侧边开关绑定：固件在设备侧执行动作并上报事件，这里只改配置表。
+async fn controls(device: &DyjDevice, rest: &[String]) -> reai_card_sdk::Result<()> {
+    fn input(text: &str) -> reai_card_sdk::Result<ControlInput> {
+        ControlInput::from_config_key(text).ok_or_else(|| {
+            reai_card_sdk::SdkError::InvalidCommand(format!(
+                "unknown input `{text}`; expected one of {}",
+                ControlInput::ALL
+                    .iter()
+                    .map(|input| input.config_key())
+                    .collect::<Vec<_>>()
+                    .join("|")
+            ))
+        })
+    }
+    match required(rest, 0, "controls subcommand")? {
+        "list" => print_json(serde_json::to_value(device.control_bindings().await?)?),
+        "set" => {
+            let target = input(required(rest, 1, "input")?)?;
+            let action = ControlAction::parse(required(rest, 2, "action")?);
+            device.set_control_action(target, action.clone()).await?;
+            println!("{target} → {action}");
+            Ok(())
+        }
+        "clear" => {
+            let target = input(required(rest, 1, "input")?)?;
+            device.clear_control_action(target).await?;
+            println!("{target} cleared");
+            Ok(())
+        }
+        "preset" => match required(rest, 1, "preset name")? {
+            "recorder" => {
+                let bindings = ControlBindings::recorder();
+                device.apply_control_bindings(&bindings).await?;
+                print_json(serde_json::to_value(bindings)?)
+            }
+            other => Err(reai_card_sdk::SdkError::InvalidCommand(format!(
+                "unknown preset `{other}`"
+            ))),
+        },
+        "reset" => {
+            for target in ControlInput::ALL {
+                device.clear_control_action(target).await?;
+            }
+            println!("all six inputs cleared");
+            Ok(())
+        }
         other => Err(reai_card_sdk::SdkError::InvalidCommand(other.into())),
     }
 }

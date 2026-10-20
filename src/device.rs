@@ -19,18 +19,21 @@ use tokio::{
 use crate::{
     Result, SdkError,
     audio::{AdpcmDecoder, CHANNELS, PcmChunk, SAMPLE_RATE_HZ},
-    protocol::{FrameDecoder, TextFrame, encode_command},
+    controls::{ButtonEvent, ControlAction, ControlBindings, ControlInput, ToggleSwitchEvent},
+    protocol::{Frame, FrameDecoder, TextFrame, encode_command},
     recording,
     recording::SavedRecording,
     transport::SharedTransport,
     types::{
         AccessPointInfo, BatteryInfo, CommandResponse, DeviceEvent, DeviceInfo, DeviceState,
-        FileEntry, ModuleCheck, OtaProgress, RecordStatus, StorageInfo, TakenFile, WifiNetwork,
-        WifiStatus,
+        FileEntry, LedState, ModuleCheck, OtaProgress, PowerEvent, RecordMark, RecordStatus,
+        StorageInfo, TakenFile, WifiNetwork, WifiStatus,
     },
 };
 
 const NORMAL_TIMEOUT: Duration = Duration::from_secs(10);
+/// 固件 `CONFIG_GET` / `CONFIG_DEL` 对不存在的键统一回 `code 3 "not found"`。
+const CONFIG_CODE_NOT_FOUND: i64 = 3;
 // 固件兜底回滚恰好在 30s 时才回 `code:3`（handler_wifi.c WIFI_OPEN_TIMEOUT_MS），
 // 且其注释明确要求上位机超时必须大于 30s，否则上位机先超时、拿不到结构化错误。
 const WIFI_OPEN_TIMEOUT: Duration = Duration::from_secs(35);
@@ -247,10 +250,10 @@ impl DyjDevice {
         )
         .await
     }
-    /// 录音打点（写同名 `.mrk`，同样要求 SD 在 nRF 侧）。
-    pub async fn record_mark(&self) -> Result<Value> {
+    /// 录音打点（写同名 `.mrk`，同样要求 SD 在 nRF 侧）。未在录音时固件返回错误。
+    pub async fn record_mark(&self) -> Result<RecordMark> {
         self.require_sd_on_nrf("RECORD_MARK").await?;
-        self.request_value("RECORD_MARK", None, NORMAL_TIMEOUT)
+        self.request_typed("RECORD_MARK", None, NORMAL_TIMEOUT)
             .await
     }
 
@@ -701,17 +704,111 @@ impl DyjDevice {
     pub async fn sta_websocket_base_url(&self) -> Result<String> {
         self.wifi_config_value("wifi_ws_base_url").await
     }
+    /// 原样返回 `CONFIG_GET` 响应；键不存在时固件回错误（`code 3`）。
+    /// 只想拿值请用 [`Self::config_value`]。
     pub async fn get_config(&self, key: &str) -> Result<Value> {
         self.request_value("CONFIG_GET", Some(json!({"key": key})), NORMAL_TIMEOUT)
             .await
     }
+
+    /// 读取设备 KV 配置；键不存在返回 `Ok(None)` 而不是错误。
+    pub async fn config_value(&self, key: &str) -> Result<Option<String>> {
+        let payload = self
+            .request_payload("CONFIG_GET", Some(json!({"key": key})), NORMAL_TIMEOUT)
+            .await?;
+        if response_code(&payload) == Some(CONFIG_CODE_NOT_FOUND) {
+            return Ok(None);
+        }
+        ensure_success("CONFIG_GET", &payload)?;
+        payload
+            .get("value")
+            .and_then(Value::as_str)
+            .map(|value| Some(value.to_owned()))
+            .ok_or_else(|| {
+                SdkError::InvalidFrame(format!("CONFIG_GET `{key}` omitted string value"))
+            })
+    }
+
     pub async fn delete_config(&self, key: &str) -> Result<CommandResponse> {
         self.request_success("CONFIG_DEL", Some(json!({"key": key})), NORMAL_TIMEOUT)
             .await
     }
-    pub async fn set_led(&self, state: &str) -> Result<CommandResponse> {
-        self.request_success("LED", Some(json!({"state": state})), NORMAL_TIMEOUT)
+
+    // ========== 按键 / 侧边开关绑定 ==========
+    //
+    // 绑定存在设备 KV 里（16 槽，与其他设置共用），重启后保留；固件在输入触发时
+    // 自己执行绑定的动作并上报事件，上位机只需订阅 `DeviceEvent::Button` /
+    // `DeviceEvent::ToggleSwitch` / `DeviceEvent::RecordStatus`（reason=button/switch）。
+
+    /// 读取某个输入当前绑定的动作；设备上没配置过的输入返回 [`ControlAction::None`]
+    /// （与固件运行时的默认行为一致）。
+    pub async fn control_action(&self, input: impl Into<ControlInput>) -> Result<ControlAction> {
+        let input = input.into();
+        Ok(self
+            .config_value(input.config_key())
+            .await?
+            .map(|value| ControlAction::parse(&value))
+            .unwrap_or_default())
+    }
+
+    /// 把输入绑定到动作。[`ControlAction::None`] 也会显式写入 `none`。
+    pub async fn set_control_action(
+        &self,
+        input: impl Into<ControlInput>,
+        action: ControlAction,
+    ) -> Result<()> {
+        let input = input.into();
+        tracing::info!(target: "dyj.controls", "🎛️ 绑定 {input} → {action}");
+        self.set_config(input.config_key(), action.wire_name())
             .await
+            .map(|_| ())
+    }
+
+    /// 删除输入的绑定（回到未配置状态）；本就没有绑定时也视为成功。
+    pub async fn clear_control_action(&self, input: impl Into<ControlInput>) -> Result<()> {
+        let input = input.into();
+        let payload = self
+            .request_payload(
+                "CONFIG_DEL",
+                Some(json!({"key": input.config_key()})),
+                NORMAL_TIMEOUT,
+            )
+            .await?;
+        if response_code(&payload) == Some(CONFIG_CODE_NOT_FOUND) {
+            tracing::debug!(target: "dyj.controls", "🎛️ {input} 本就未绑定");
+            return Ok(());
+        }
+        ensure_success("CONFIG_DEL", &payload)?;
+        tracing::info!(target: "dyj.controls", "🎛️ 已解除绑定 {input}");
+        Ok(())
+    }
+
+    /// 一次读回六个输入的绑定表（六次 `CONFIG_GET`）。
+    pub async fn control_bindings(&self) -> Result<ControlBindings> {
+        let mut bindings = ControlBindings::default();
+        for input in ControlInput::ALL {
+            let action = self.control_action(input).await?;
+            bindings.set(input, action);
+        }
+        tracing::info!(target: "dyj.controls", "🎛️ 当前绑定表 {bindings:?}");
+        Ok(bindings)
+    }
+
+    /// 整表写入（六次 `CONFIG_SET`）。中途失败时已写入的项保留，不回滚。
+    pub async fn apply_control_bindings(&self, bindings: &ControlBindings) -> Result<()> {
+        for (input, action) in bindings.entries() {
+            self.set_control_action(input, action.clone()).await?;
+        }
+        Ok(())
+    }
+
+    pub async fn set_led(&self, state: LedState) -> Result<CommandResponse> {
+        self.request_success(
+            "LED",
+            Some(json!({"state": state.wire_name()})),
+            NORMAL_TIMEOUT,
+        )
+        .await
     }
     pub async fn test_modules(&self) -> Result<Vec<ModuleCheck>> {
         // Firmware sends exactly one response for each of its 11 registered modules and no sentinel.
@@ -756,6 +853,21 @@ impl DyjDevice {
     ) -> Result<Value> {
         let command = command.to_ascii_uppercase();
         let started = std::time::Instant::now();
+        let payload = self.request_payload(&command, payload, wait).await?;
+        ensure_success(&command, &payload)?;
+        tracing::info!(target: "dyj.proto", "📥 收到响应 cmd={command} code=0 耗时={}ms", started.elapsed().as_millis());
+        Ok(payload)
+    }
+
+    /// 发命令并取回同名响应的原始载荷，**不**检查 `code`——调用方要自己处理
+    /// 预期中的非零码（如 CONFIG 的 `not found`）。
+    async fn request_payload(
+        &self,
+        command: &str,
+        payload: Option<Value>,
+        wait: Duration,
+    ) -> Result<Value> {
+        let command = command.to_ascii_uppercase();
         let _command = self.core.command_gate.lock().await;
         let mut incoming = self.core.incoming.lock().await;
         self.write_command(&command, payload).await?;
@@ -763,8 +875,6 @@ impl DyjDevice {
             if let Inbound::Text(frame) = receive_next(&mut incoming, wait, &command).await?
                 && frame.command == command
             {
-                ensure_success(&frame.command, &frame.payload)?;
-                tracing::info!(target: "dyj.proto", "📥 收到响应 cmd={} code=0 耗时={}ms", frame.command, started.elapsed().as_millis());
                 tracing::debug!(target: "dyj.proto", "📥 响应内容 cmd={} body={}", frame.command, frame.payload);
                 return Ok(frame.payload);
             }
@@ -930,6 +1040,15 @@ fn spawn_notification_worker(
                     tracing::debug!(target: "dyj.proto", "📥 收到通知 {}字节", bytes.len());
                     let (frames, fault) = decoder.push(&bytes);
                     for frame in frames {
+                        let frame = match frame {
+                            Frame::Text(frame) => frame,
+                            Frame::Raw(value) => {
+                                // 裸 JSON 没有命令名，不会有请求在等它，只走事件广播。
+                                tracing::info!(target: "dyj.event", "🔋 电源通知 payload={value}");
+                                let _ = events.send(event_from_raw(value));
+                                continue;
+                            }
+                        };
                         // 快传入口就绪信号由单帧驱动：AP 随上电自动启动，AP_START 事件
                         // 置位；WIFI_OPEN/CLOSE（新上电周期/关电）与 WIFI_OFF 事件复位。
                         match frame.command.as_str() {
@@ -967,9 +1086,24 @@ fn spawn_notification_worker(
 }
 
 fn event_from_frame(frame: &TextFrame) -> Option<DeviceEvent> {
+    // 认得命令名却解析不了载荷时退化成 Unhandled，而不是悄悄丢掉。
+    let unhandled = || DeviceEvent::Unhandled {
+        command: frame.command.clone(),
+        payload: frame.payload.clone(),
+    };
     match frame.command.as_str() {
-        "BTN_CLICK" => Some(DeviceEvent::Button(frame.payload.clone())),
-        "TOGGLE_SWITCH" => Some(DeviceEvent::ToggleSwitch(frame.payload.clone())),
+        "BTN_CLICK" => Some(
+            ButtonEvent::from_payload(&frame.payload)
+                .map(DeviceEvent::Button)
+                .unwrap_or_else(unhandled),
+        ),
+        "TOGGLE_SWITCH" => Some(
+            ToggleSwitchEvent::from_payload(&frame.payload)
+                .map(DeviceEvent::ToggleSwitch)
+                .unwrap_or_else(unhandled),
+        ),
+        // RECORD_STATUS 也是查询响应：失败响应（只有 code/message）解析不出状态，
+        // 不是事件，直接忽略。
         "RECORD_STATUS" => serde_json::from_value(frame.payload.clone())
             .ok()
             .map(DeviceEvent::RecordStatus),
@@ -990,6 +1124,21 @@ fn event_from_frame(frame: &TextFrame) -> Option<DeviceEvent> {
             .map(DeviceEvent::AccessPointReady),
         _ => None,
     }
+}
+
+/// 无命令封装的裸 JSON：目前只有电源管理会这么发（`{"type":...}`）。
+fn event_from_raw(value: Value) -> DeviceEvent {
+    match serde_json::from_value::<PowerEvent>(value.clone()) {
+        Ok(power) => DeviceEvent::Power(power),
+        Err(_) => DeviceEvent::Unhandled {
+            command: String::new(),
+            payload: value,
+        },
+    }
+}
+
+fn response_code(value: &Value) -> Option<i64> {
+    value.get("code").and_then(Value::as_i64)
 }
 
 async fn receive_next(
@@ -1072,6 +1221,10 @@ mod tests {
         received: Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<Result<Vec<u8>>>>>,
         write_buffer: Mutex<Vec<u8>>,
         commands: Mutex<Vec<String>>,
+        /// 完整的发送行（含载荷），供断言 wire 格式。
+        lines: Mutex<Vec<String>>,
+        /// 模拟固件 setting_kv：CONFIG_SET/GET/DEL 的后备存储。
+        config: std::sync::Mutex<std::collections::HashMap<String, String>>,
         announced_file_size: AtomicU64,
         wifi_open: AtomicBool,
         silent: AtomicBool,
@@ -1085,6 +1238,8 @@ mod tests {
                 received: Mutex::new(Some(received)),
                 write_buffer: Mutex::new(Vec::new()),
                 commands: Mutex::new(Vec::new()),
+                lines: Mutex::new(Vec::new()),
+                config: std::sync::Mutex::new(Default::default()),
                 announced_file_size: AtomicU64::new(3),
                 wifi_open: AtomicBool::new(false),
                 silent: AtomicBool::new(false),
@@ -1113,10 +1268,18 @@ mod tests {
             let _ = self.sent.send(Ok(frame.to_vec()));
         }
 
-        fn handle_command(&self, command: &str) {
+        fn handle_command(&self, command: &str, payload: Option<&str>) {
             if self.silent.load(Ordering::Relaxed) {
                 return;
             }
+            let payload_json = payload
+                .and_then(|text| serde_json::from_str::<Value>(text).ok())
+                .unwrap_or(Value::Null);
+            let key = payload_json
+                .get("key")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned();
             match command {
                 "SYNC_TIME" => self.reply(b"SYNC_TIME:{\"code\":0}\r\n"),
                 "STATE_INFO" => {
@@ -1143,6 +1306,7 @@ mod tests {
                     self.reply(b"FILE_UPLOAD:{\"state\":\"end\"}\r\n");
                 }
                 "RECORD_START" => self.reply(b"RECORD_START:{\"code\":0}\r\n"),
+                "RECORD_MARK" => self.reply(b"RECORD_MARK:{\"code\":0,\"filename\":\"059F19DF.APM\",\"timestamp\":53}\r\n"),
                 "AP_START" => self.reply(b"AP_START:{\"code\":0,\"ip\":\"192.168.4.1\",\"webPort\":80}\r\n"),
                 "AP_STATUS" => self.reply(b"AP_STATUS:{\"status\":\"active\",\"active\":true,\"ip\":\"192.168.4.1\",\"webServerRunning\":true,\"webPort\":80}\r\n"),
                 "TEST_CHECK" => {
@@ -1150,6 +1314,27 @@ mod tests {
                         self.reply(format!("TEST_CHECK:{{\"key\":\"M{index}\",\"result\":true}}\r\n").as_bytes());
                     }
                 }
+                // 与固件 handler_sys.c 一致：缺键回 code 3 "not found"。
+                "CONFIG_SET" => {
+                    let value = payload_json
+                        .get("value")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned();
+                    self.config.lock().unwrap().insert(key, value);
+                    self.reply(b"CONFIG_SET:{\"code\":0,\"message\":\"ok\"}\r\n");
+                }
+                "CONFIG_GET" => match self.config.lock().unwrap().get(&key) {
+                    Some(value) => self.reply(
+                        format!("CONFIG_GET:{{\"key\":\"{key}\",\"value\":\"{value}\"}}\r\n")
+                            .as_bytes(),
+                    ),
+                    None => self.reply(b"CONFIG_GET:{\"code\":3,\"message\":\"not found\"}\r\n"),
+                },
+                "CONFIG_DEL" => match self.config.lock().unwrap().remove(&key) {
+                    Some(_) => self.reply(b"CONFIG_DEL:{\"code\":0,\"message\":\"ok\"}\r\n"),
+                    None => self.reply(b"CONFIG_DEL:{\"code\":3,\"message\":\"not found\"}\r\n"),
+                },
                 _ => self.reply(format!("{command}:{{\"code\":0}}\r\n").as_bytes()),
             }
         }
@@ -1163,9 +1348,13 @@ mod tests {
             while let Some(end) = buffer.iter().position(|byte| *byte == b'\n') {
                 let line: Vec<u8> = buffer.drain(..=end).collect();
                 let text = std::str::from_utf8(&line).unwrap().trim();
-                let command = text.split(':').next().unwrap().to_owned();
+                let (command, payload) = match text.split_once(':') {
+                    Some((command, payload)) => (command.to_owned(), Some(payload)),
+                    None => (text.to_owned(), None),
+                };
                 self.commands.lock().await.push(command.clone());
-                self.handle_command(&command);
+                self.lines.lock().await.push(text.to_owned());
+                self.handle_command(&command, payload);
             }
             Ok(())
         }
@@ -1438,6 +1627,195 @@ mod tests {
             events.recv().await.unwrap(),
             DeviceEvent::Button(_)
         ));
+    }
+
+    #[tokio::test]
+    async fn button_and_switch_events_are_typed() {
+        use crate::controls::{ButtonGesture, SwitchPosition};
+
+        let transport = Arc::new(MockTransport::new());
+        let device = DyjDevice::from_transport(transport.clone()).await.unwrap();
+        let mut events = device.subscribe_events();
+        transport.reply(b"BTN_CLICK:{\"key\":\"long_press\",\"action\":\"record_toggle\"}\r\n");
+        transport.reply(b"TOGGLE_SWITCH:{\"state\":\"off\",\"action\":\"record_stop\"}\r\n");
+        // 未来固件新增的手势：不丢，退化成 Unhandled 原样交给应用。
+        transport.reply(b"BTN_CLICK:{\"key\":\"triple\",\"action\":\"none\"}\r\n");
+
+        match events.recv().await.unwrap() {
+            DeviceEvent::Button(event) => {
+                assert_eq!(event.gesture, ButtonGesture::LongPress);
+                assert_eq!(event.action, ControlAction::RecordToggle);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        match events.recv().await.unwrap() {
+            DeviceEvent::ToggleSwitch(event) => {
+                assert_eq!(event.position, SwitchPosition::Off);
+                assert_eq!(event.action, ControlAction::RecordStop);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        match events.recv().await.unwrap() {
+            DeviceEvent::Unhandled { command, payload } => {
+                assert_eq!(command, "BTN_CLICK");
+                assert_eq!(payload["key"], "triple");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn record_status_push_carries_reason_and_error() {
+        use crate::types::RecordReason;
+
+        let transport = Arc::new(MockTransport::new());
+        let device = DyjDevice::from_transport(transport.clone()).await.unwrap();
+        let mut events = device.subscribe_events();
+        transport.reply(b"RECORD_STATUS:{\"isRecording\":true,\"realtimeEnabled\":true,\"reason\":\"switch\"}\r\n");
+        transport.reply(b"RECORD_STATUS:{\"isRecording\":false,\"realtimeEnabled\":true,\"reason\":\"auto\",\"error\":7}\r\n");
+
+        match events.recv().await.unwrap() {
+            DeviceEvent::RecordStatus(status) => {
+                assert!(status.is_recording);
+                assert_eq!(status.reason, Some(RecordReason::Switch));
+                assert_eq!(status.error, None);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        match events.recv().await.unwrap() {
+            DeviceEvent::RecordStatus(status) => {
+                assert!(!status.is_recording);
+                assert_eq!(status.reason, Some(RecordReason::Auto));
+                assert_eq!(status.error, Some(7));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn unframed_power_message_becomes_an_event_without_eating_the_next_response() {
+        let transport = Arc::new(MockTransport::new());
+        let device = DyjDevice::from_transport(transport.clone()).await.unwrap();
+        let mut events = device.subscribe_events();
+        // 固件电源管理直接写 BLE：无命令名、无换行。紧接着的 BASE_INFO 响应必须完好。
+        transport.reply(b"{\"type\":\"shutdown_imminent\",\"seconds\":5}");
+        let info = device.device_info().await.unwrap();
+        assert_eq!(info.device_id, "DYJ1");
+        assert!(matches!(
+            events.recv().await.unwrap(),
+            DeviceEvent::Power(PowerEvent::ShutdownImminent { seconds: 5 })
+        ));
+
+        transport.reply(b"{\"type\":\"device_wakeup\"}");
+        transport.reply(b"{\"type\":\"mystery\",\"x\":1}");
+        let _ = device.device_info().await.unwrap();
+        assert!(matches!(
+            events.recv().await.unwrap(),
+            DeviceEvent::Power(PowerEvent::DeviceWakeup)
+        ));
+        match events.recv().await.unwrap() {
+            DeviceEvent::Unhandled { command, payload } => {
+                assert!(command.is_empty());
+                assert_eq!(payload["type"], "mystery");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn control_bindings_round_trip_through_device_config() {
+        use crate::controls::{ButtonGesture, SwitchPosition};
+
+        let transport = Arc::new(MockTransport::new());
+        let device = DyjDevice::from_transport(transport.clone()).await.unwrap();
+
+        // 出厂：没有任何键，读到的全是 None，且不报错。
+        assert_eq!(
+            device.control_action(ButtonGesture::Single).await.unwrap(),
+            ControlAction::None
+        );
+        assert_eq!(
+            device.control_bindings().await.unwrap(),
+            ControlBindings::default()
+        );
+
+        device
+            .set_control_action(SwitchPosition::On, ControlAction::RecordStart)
+            .await
+            .unwrap();
+        device
+            .set_control_action(ButtonGesture::Double, ControlAction::Other("future".into()))
+            .await
+            .unwrap();
+        {
+            let config = transport.config.lock().unwrap();
+            assert_eq!(
+                config.get("switch_on").map(String::as_str),
+                Some("record_start")
+            );
+            assert_eq!(config.get("btn_double").map(String::as_str), Some("future"));
+        }
+        assert_eq!(
+            device.control_action(SwitchPosition::On).await.unwrap(),
+            ControlAction::RecordStart
+        );
+        assert_eq!(
+            device.control_action(ButtonGesture::Double).await.unwrap(),
+            ControlAction::Other("future".into())
+        );
+
+        let recorder = ControlBindings::recorder();
+        device.apply_control_bindings(&recorder).await.unwrap();
+        assert_eq!(device.control_bindings().await.unwrap(), recorder);
+        assert_eq!(
+            transport
+                .config
+                .lock()
+                .unwrap()
+                .get("btn_long_press")
+                .map(String::as_str),
+            Some("none"),
+            "None 也要显式落盘为 none"
+        );
+
+        // 解绑是幂等的：第二次删除同一键固件回 not found，SDK 不报错。
+        device
+            .clear_control_action(SwitchPosition::On)
+            .await
+            .unwrap();
+        device
+            .clear_control_action(SwitchPosition::On)
+            .await
+            .unwrap();
+        assert!(!transport.config.lock().unwrap().contains_key("switch_on"));
+        assert_eq!(
+            device.control_action(SwitchPosition::On).await.unwrap(),
+            ControlAction::None
+        );
+    }
+
+    #[tokio::test]
+    async fn record_mark_is_typed() {
+        let device = DyjDevice::from_transport(Arc::new(MockTransport::new()))
+            .await
+            .unwrap();
+        let mark = device.record_mark().await.unwrap();
+        assert_eq!(mark.filename, "059F19DF.APM");
+        assert_eq!(mark.offset_secs, 53);
+    }
+
+    #[tokio::test]
+    async fn led_state_goes_out_as_wire_name() {
+        let transport = Arc::new(MockTransport::new());
+        let device = DyjDevice::from_transport(transport.clone()).await.unwrap();
+        device.set_led(LedState::Toggle).await.unwrap();
+        assert!(
+            transport
+                .lines
+                .lock()
+                .await
+                .contains(&"LED:{\"state\":\"toggle\"}".to_owned())
+        );
     }
 
     #[tokio::test]

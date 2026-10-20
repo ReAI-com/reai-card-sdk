@@ -19,6 +19,7 @@ ReAI 录音卡（DYJ-HD v2）的异步 Rust SDK：通过 BLE 控制设备、接�
 - [五分钟上手](#五分钟上手)
 - [设备模型（必读）](#设备模型必读)
 - [实时音频](#实时音频)
+- [按键与侧边开关](#按键与侧边开关)
 - [录音文件：两条通道](#录音文件两条通道)
 - [WiFi 与热点](#wifi-与热点)
 - [错误速查](#错误速查)
@@ -35,7 +36,7 @@ reai-card-sdk = { git = "https://github.com/ReAI-com/reai-card-sdk.git", tag = "
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
 
-要求 Rust 1.93+（edition 2024）。
+要求 Rust 1.93+（edition 2024）。`main` 分支可能领先于最新 tag（未发布改动见 [CHANGELOG](CHANGELOG.md)），要用最新 API 可改成 `branch = "main"`。
 
 - **macOS**：首次运行会弹蓝牙授权，需在「系统设置 → 隐私与安全性 → 蓝牙」里允许终端/应用。
 - **Linux**：需要 BlueZ 开发头文件（`sudo apt-get install libdbus-1-dev pkg-config`）。
@@ -79,23 +80,43 @@ async fn main() -> reai_card_sdk::Result<()> {
 
 SDK 对两类命令都做**上电预检**（先读 `STATE_INFO.wifiOpen`），不满足时立刻返回结构化错误而不是等 10 秒超时。错误信息会直接告诉你该先调 `open_wifi` 还是 `close_wifi`。
 
-**3. 设备会主动说话。** 按键、拨杆、录音状态、热点就绪等以事件推送，用 `subscribe_events()` 订阅：
+**3. 设备会主动说话。** 按键、拨杆、录音状态、热点就绪、关机倒计时等以事件推送，用 `subscribe_events()` 订阅，所有事件都是类型化的：
 
 ```rust,no_run
-use reai_card_sdk::{DeviceEvent, DyjDevice};
+use reai_card_sdk::{ButtonGesture, DeviceEvent, DyjDevice, PowerEvent, RecordReason};
 
 async fn watch(device: &DyjDevice) {
     let mut events = device.subscribe_events();
     while let Ok(event) = events.recv().await {
         match event {
-            DeviceEvent::Button(payload) => println!("按键 {payload}"),
-            DeviceEvent::RecordStatus(status) => println!("录音中: {}", status.is_recording),
+            DeviceEvent::Button(e) if e.gesture == ButtonGesture::Double => {
+                println!("双击，设备执行了 {}", e.action)
+            }
+            DeviceEvent::ToggleSwitch(e) => println!("开关拨到 {}，动作 {}", e.position, e.action),
+            DeviceEvent::RecordStatus(s) if s.reason == Some(RecordReason::Switch) => {
+                println!("开关让录音变成 {}", s.is_recording)
+            }
+            DeviceEvent::Power(PowerEvent::ShutdownImminent { seconds }) => {
+                println!("设备 {seconds}s 后关机，连接即将断开")
+            }
             DeviceEvent::AccessPointReady(_) => println!("热点就绪，可以连 DYJ-HD-AP 了"),
             other => println!("{other:?}"),
         }
     }
 }
 ```
+
+| 事件 | 何时到达 | 载荷 |
+| --- | --- | --- |
+| `Button(ButtonEvent)` | 按键单击 / 双击 / 长按 / 长按松开 | `gesture`、设备随之执行的 `action` |
+| `ToggleSwitch(ToggleSwitchEvent)` | 侧边开关拨到 on / off | `position`、`action` |
+| `RecordStatus(RecordStatus)` | 录音开始 / 停止 / 出错 | `is_recording`、`reason`（app / button / switch / auto）、出错时的 `error` 码 |
+| `Power(PowerEvent)` | `SHUTDOWN` 之后、低电关机前 | `ShutdownImminent { seconds }`；另有 `DeviceWakeup` / `StartupComplete` |
+| `AccessPointReady` | ESP32 上电后 AP + HTTP 服务起好 | 见 [WiFi 与热点](#wifi-与热点) |
+| `WifiNetwork` / `WifiOff` / `UploadComplete` / `WifiOtaProgress` | WiFi 扫描结果、模块请求断电、上传完成、OTA 进度 | 对应结构体 |
+| `Unhandled { command, payload }` | 认得命令但载荷解析不了（如未来固件的新手势），或 `type` 未知的裸 JSON（此时 `command` 为空） | 原始 JSON |
+
+`record_status()` 主动查询的响应也会经事件通道广播一份，但没有 `reason`——想区分“谁改了录音状态”就看 `reason.is_some()`。
 
 ## 实时音频
 
@@ -121,6 +142,35 @@ async fn realtime(device: &DyjDevice) -> reai_card_sdk::Result<()> {
 - 消费过慢时 `recv()` 返回 `RecvError::Lagged(n)`，表示丢了 `n` 块，解码流会有短暂杂音后自行收敛。
 - 实时录音进行中 `take_file_to*` 会被拒绝（`RealtimeRecordingActive`）：BLE 二进制通道没有头部，音频和文件数据无法区分。
 - 实时录音同时也写 SD 卡 `.apm`，之后仍可整段取回。
+
+## 按键与侧边开关
+
+录音卡有一个按键和一个侧边拨杆开关。它们做什么**由设备自己决定**：六个输入（按键单击 / 双击 / 长按 / 长按松开、开关 on / off）各绑定一个动作，存在设备 KV 配置里，重启后保留。输入触发时固件先上报事件，再在设备侧执行绑定的动作——上位机只需要订阅事件，不要再替它执行一遍。
+
+```rust,no_run
+use reai_card_sdk::{ButtonGesture, ControlAction, ControlBindings, DyjDevice, SwitchPosition};
+
+async fn configure(device: &DyjDevice) -> reai_card_sdk::Result<()> {
+    // 单项绑定：开关拨到 on 开始录音、拨回 off 停止；单击在录音中打标记
+    device.set_control_action(SwitchPosition::On, ControlAction::RecordStart).await?;
+    device.set_control_action(SwitchPosition::Off, ControlAction::RecordStop).await?;
+    device.set_control_action(ButtonGesture::Single, ControlAction::RecordMark).await?;
+
+    // 读回整表（没配置过的输入是 None）
+    let bindings = device.control_bindings().await?;
+    println!("{bindings:?}");
+
+    // 或者一次写入预设（开关控制录音、单击打点、双击切换）
+    device.apply_control_bindings(&ControlBindings::recorder()).await?;
+    // 解绑：回到出厂的“什么都不做”
+    device.clear_control_action(ButtonGesture::Double).await?;
+    Ok(())
+}
+```
+
+可用动作：`None`（不动作，默认）、`RecordStart`、`RecordStop`、`RecordToggle`、`RecordMark`；`ControlAction::Other(String)` 用来无损携带未来固件新增的值。
+
+把录音卡当作语音采集外设时的典型做法：绑定开关到 `RecordStart/RecordStop`，然后同时订阅 `subscribe_events()` 和 `subscribe_audio()`——用户拨开关，`RecordStatus { reason: Switch }` 事件到达，若实时传输开着（`set_realtime_enabled(true)`，设备上持久化），PCM 块随即开始到达，不需要上位机发任何命令。
 
 ## 录音文件：两条通道
 
@@ -208,10 +258,13 @@ make cli ARGS=scan                      # 扫描
 make cli ARGS=check                     # 只读全流程验收（info/state/battery/storage/modules/files）
 make cli ARGS="realtime 30 rt.wav"      # 实时录音收流 30 秒并存 WAV
 make cli ARGS="decode in.apm out.wav"   # 离线解码（不需要设备）
+make cli ARGS="controls list"           # 读按键/开关绑定表
+make cli ARGS="controls preset recorder" # 一键写入录音笔预设
+make cli ARGS=events                    # 挂机打印事件（按按键、拨开关看上报）
 make web                                # 网页控制台 http://127.0.0.1:8787
 ```
 
-网页控制台包含：连接管理、状态卡片、全部命令按钮、**实时录音波形面板**（通道常开，数据驱动）、BLE 文件表格、**热点快传一键检查**（上电 → 探测是否已连热点 → 列出 AP 文件并逐行下载）、下载后自动转 WAV、SSE 实时日志与设备事件。仅绑定 `127.0.0.1`、无鉴权，请勿暴露到局域网。
+网页控制台包含：连接管理、状态卡片、全部命令按钮、**实时录音波形面板**（通道常开，数据驱动）、BLE 文件表格、**热点快传一键检查**（上电 → 探测是否已连热点 → 列出 AP 文件并逐行下载）、下载后自动转 WAV、**按键 / 开关绑定表**（读 / 绑定 / 解绑 / 预设）、SSE 实时日志与设备事件。仅绑定 `127.0.0.1`、无鉴权，请勿暴露到局域网。
 
 ## 已知限制与路线图
 

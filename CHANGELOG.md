@@ -3,6 +3,28 @@
 版本号独立于主控固件（nRF `v0.3.x` / WiFi `v0.0.x`）；SDK 与固件的协议对应关系见
 [`docs/protocol-support.md`](docs/protocol-support.md)。
 
+## 0.0.3（未发布）
+
+按键 / 侧边开关进入 SDK 一等公民，事件全部类型化，并修复一个会丢帧的解码器问题。
+
+**⚠️ 不兼容变更**（0.0.x 阶段、driver-v2 尚未接入，一次性收口）：
+
+- `DeviceEvent::Button(Value)` → `Button(ButtonEvent { gesture: ButtonGesture, action: ControlAction })`；`DeviceEvent::ToggleSwitch(Value)` → `ToggleSwitch(ToggleSwitchEvent { position: SwitchPosition, action })`。不认识的手势/位置不再丢弃，改为 `Unhandled { command, payload }`。
+- `RecordStatus.reason: Option<String>` → `Option<RecordReason>`（`App/Button/Switch/Auto/Unknown/Other(String)`），新增 `error: Option<u32>`（录音出错推送携带）。
+- `set_led(&str)` → `set_led(LedState)`（`On/Off/Toggle`，实现 `FromStr`）。
+- `record_mark()` 返回 `RecordMark { filename, offset_secs }` 而非 `Value`。
+
+新增：
+
+- **按键 / 开关绑定 API**（`controls` 模块）：`control_action` / `set_control_action` / `clear_control_action` / `control_bindings` / `apply_control_bindings`，覆盖固件六个输入（`btn_single/btn_double/btn_long_press/btn_long_release/switch_on/switch_off`）与五个动作（`none/record_start/record_stop/record_toggle/record_mark`）。未配置读为 `ControlAction::None`，解绑幂等（固件 `not found` 视为成功），`ControlBindings::recorder()` 提供录音笔式预设。`ButtonGesture`/`SwitchPosition` 可直接传入（`Into<ControlInput>`）。
+- **电源事件** `DeviceEvent::Power(PowerEvent)`：`ShutdownImminent { seconds }`（`SHUTDOWN` 响应后紧跟）、`DeviceWakeup`、`StartupComplete`。
+- `config_value(key) -> Option<String>`：键不存在返回 `None` 而非错误。
+- `dyj_cli` 新增 `controls list|set|clear|preset recorder|reset`，事件打印改为可读文本；`dyj_web` 新增「08 按键 / 开关」分组（读绑定表 / 绑定 / 解绑 / 预设）与 `/api/controls*` 接口。
+
+修复：
+
+- **解码器识别无封装裸 JSON**：固件电源管理直接 `ble_uart_send` 写出 `{"type":"shutdown_imminent",...}`，既无命令名也无 `\r\n`；原按行解析会把它和下一帧粘成一行、两帧全丢（关机前 5 秒内若有命令响应就会超时）。现在缓冲区以 `{` 开头即按 JSON 边界切出裸对象（无需换行），余下字节照常按行解析；坏 JSON 丢到下一换行重新同步。新增解码器与设备级回归测试。
+
 ## 0.0.2（2026-10-20）
 
 开源首发：源码迁至公开仓库 <https://github.com/ReAI-com/reai-card-sdk>（MIT），tag `v0.0.2`。AP 快传已真机验证通过（上电→连热点→列文件→下载→转 WAV）。

@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::controls::{ButtonEvent, ToggleSwitchEvent};
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct DiscoveredDevice {
     pub id: String,
@@ -47,6 +49,70 @@ pub struct StorageInfo {
     pub used: u32,
 }
 
+/// 录音状态变化的来源（`RECORD_STATUS` 推送的 `reason` 字段）。
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize, Serialize)]
+#[serde(from = "String", into = "String")]
+pub enum RecordReason {
+    /// 上位机命令（`RECORD_START/STOP/RECORD`）。
+    App,
+    /// 按键绑定的动作。
+    Button,
+    /// 侧边开关绑定的动作。
+    Switch,
+    /// 设备自动行为，例如录满 10 分钟自动分段。
+    Auto,
+    /// 固件未能归类。
+    Unknown,
+    /// 未来固件新增的来源，原字符串保留。
+    Other(String),
+}
+
+impl RecordReason {
+    pub fn wire_name(&self) -> &str {
+        match self {
+            Self::App => "app",
+            Self::Button => "button",
+            Self::Switch => "switch",
+            Self::Auto => "auto",
+            Self::Unknown => "unknown",
+            Self::Other(name) => name,
+        }
+    }
+
+    pub fn parse(text: &str) -> Self {
+        match text {
+            "app" => Self::App,
+            "button" => Self::Button,
+            "switch" => Self::Switch,
+            "auto" => Self::Auto,
+            "unknown" => Self::Unknown,
+            other => Self::Other(other.to_owned()),
+        }
+    }
+}
+
+impl From<String> for RecordReason {
+    fn from(text: String) -> Self {
+        Self::parse(&text)
+    }
+}
+
+impl From<RecordReason> for String {
+    fn from(reason: RecordReason) -> Self {
+        match reason {
+            RecordReason::Other(name) => name,
+            known => known.wire_name().to_owned(),
+        }
+    }
+}
+
+impl std::fmt::Display for RecordReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.wire_name())
+    }
+}
+
+/// 录音状态。既是 `RECORD_STATUS` 查询的响应，也是设备在录音开始/停止/出错时的推送。
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct RecordStatus {
@@ -54,7 +120,74 @@ pub struct RecordStatus {
     pub is_recording: bool,
     #[serde(rename = "realtimeEnabled")]
     pub realtime_enabled: bool,
-    pub reason: Option<String>,
+    /// 仅推送携带：这次状态变化是谁触发的。主动查询的响应里为 `None`。
+    pub reason: Option<RecordReason>,
+    /// 仅录音出错的推送携带：固件错误码（此时 `is_recording == false`）。
+    pub error: Option<u32>,
+}
+
+/// `RECORD_MARK` 的结果：在当前录音文件的第 `offset_secs` 秒打了一个标记。
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Default)]
+pub struct RecordMark {
+    /// 设备上正在写的录音文件名。
+    pub filename: String,
+    /// 标记相对录音开始的秒数（固件字段名 `timestamp`）。
+    #[serde(alias = "timestamp")]
+    pub offset_secs: u64,
+}
+
+/// `LED` 命令的目标状态。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LedState {
+    On,
+    Off,
+    Toggle,
+}
+
+impl LedState {
+    pub const fn wire_name(self) -> &'static str {
+        match self {
+            Self::On => "on",
+            Self::Off => "off",
+            Self::Toggle => "toggle",
+        }
+    }
+}
+
+impl std::fmt::Display for LedState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.wire_name())
+    }
+}
+
+impl std::str::FromStr for LedState {
+    type Err = crate::SdkError;
+
+    fn from_str(text: &str) -> std::result::Result<Self, Self::Err> {
+        match text {
+            "on" => Ok(Self::On),
+            "off" => Ok(Self::Off),
+            "toggle" => Ok(Self::Toggle),
+            other => Err(crate::SdkError::InvalidCommand(format!(
+                "LED state must be on/off/toggle, got `{other}`"
+            ))),
+        }
+    }
+}
+
+/// 电源管理通知。固件把它们当作**无命令封装**的裸 JSON 直接写到 BLE 上
+/// （`{"type":"shutdown_imminent","seconds":5}`），SDK 解码器会单独识别。
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum PowerEvent {
+    /// 设备将在 `seconds` 秒后关机——`SHUTDOWN` 命令响应之后紧跟着就是它，
+    /// 随后 BLE 会断开；应用据此展示"设备正在关机"而不是报连接错误。
+    ShutdownImminent { seconds: u32 },
+    /// 从深度睡眠唤醒。
+    DeviceWakeup,
+    /// 开机流程完成。
+    StartupComplete,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
@@ -179,17 +312,29 @@ pub struct TakenFile {
     pub bytes_written: u64,
 }
 
+/// 设备主动上报的事件，经 [`crate::DyjDevice::subscribe_events`] 广播。
 #[derive(Debug, Clone)]
 pub enum DeviceEvent {
-    Button(Value),
-    ToggleSwitch(Value),
+    /// 按键完成了一个手势（`BTN_CLICK`）。
+    Button(ButtonEvent),
+    /// 侧边开关被拨动（`TOGGLE_SWITCH`）。
+    ToggleSwitch(ToggleSwitchEvent),
+    /// 录音开始/停止/出错（`RECORD_STATUS` 推送，带 `reason`）。
+    /// 主动查询 `record_status()` 的响应同样会经此广播，但没有 `reason`。
     RecordStatus(RecordStatus),
     WifiNetwork(WifiNetwork),
     WifiOff(CommandResponse),
     UploadComplete(CommandResponse),
     WifiOtaProgress(OtaProgress),
     AccessPointReady(CommandResponse),
-    Unhandled { command: String, payload: Value },
+    /// 电源管理通知（关机倒计时等），见 [`PowerEvent`]。
+    Power(PowerEvent),
+    /// 认得命令名但载荷无法按已知结构解析（如未来固件新增的按键手势），
+    /// 或无命令封装且 `type` 未知的裸 JSON——后者 `command` 为空字符串。
+    Unhandled {
+        command: String,
+        payload: Value,
+    },
 }
 
 /// 固件按同名 `.txt` 的时间戳给录音起的名字：`synced_<unix秒>.apm` / `nosync_<unix秒>.apm`。

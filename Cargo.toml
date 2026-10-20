@@ -1,6 +1,6 @@
 [package]
 name = "reai-card-sdk"
-version = "0.0.2"
+version = "0.0.3"
 edition = "2024"
 rust-version = "1.93"
 description = "Async Rust SDK for ReAI recorder cards (DYJ): BLE control, realtime ADPCM audio, AP fast transfer"
