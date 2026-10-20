@@ -33,7 +33,7 @@ ReAI 录音卡（DYJ-HD v2）的异步 Rust SDK：通过 BLE 控制设备、接�
 
 ```toml
 [dependencies]
-reai-card-sdk = { git = "https://github.com/ReAI-com/reai-card-sdk.git", tag = "v0.0.2" }
+reai-card-sdk = { git = "https://github.com/ReAI-com/reai-card-sdk.git", tag = "v0.0.3" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
 
