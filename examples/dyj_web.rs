@@ -123,6 +123,7 @@ async fn main() {
         .route("/api/ap/ota/check", get(ap_ota_check))
         .route("/api/ap/ota/upload", post(ap_ota_upload))
         .route("/wifi-ota", get(wifi_ota_page))
+        .route("/api/wifi/defaults", get(wifi_defaults))
         .route("/api/wifi/open", post(wifi_open))
         .route("/api/wifi/connect", post(wifi_connect))
         .route(
@@ -642,6 +643,15 @@ async fn wifi_ota_page() -> Html<&'static str> {
     Html(include_str!("dyj_web_wifi_ota.html"))
 }
 
+/// 测试用默认路由器账号：来自环境变量 `REAI_CARD_WIFI_SSID` / `REAI_CARD_WIFI_PASSWORD`
+/// （私有 Makefile 从 git 忽略的 `.env.local` 注入），公开仓库不含任何凭据。
+async fn wifi_defaults() -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "ssid": std::env::var("REAI_CARD_WIFI_SSID").ok(),
+        "password": std::env::var("REAI_CARD_WIFI_PASSWORD").ok(),
+    }))
+}
+
 /// `WIFI_OPEN`：给 ESP32 上电。SDK `open_wifi` 幂等且带 35s 超时兜底。
 async fn wifi_open(State(state): State<Arc<AppState>>) -> ApiResult<Json<serde_json::Value>> {
     let device = current_device(&state).await?;
@@ -668,10 +678,35 @@ async fn wifi_connect(
         .and_then(serde_json::Value::as_str)
         .unwrap_or_default();
     let response = device.connect_wifi(ssid, password).await?;
+    // 真机观察：部分 WiFi 固件连上路由后 WIFI_STATUS 不再应答（主循环被网络操作占住），
+    // 但 OTA_WIFI_CHECK 仍可用；状态只作尽力读取，不让连接结果跟着失败。
+    let (status, status_error) = match device.wifi_status().await {
+        Ok(status) => (Some(status), None),
+        Err(error) => (None, Some(error.to_string())),
+    };
     Ok(Json(serde_json::json!({
         "response": response,
-        "status": device.wifi_status().await?,
+        "status": status,
+        "statusError": status_error,
     })))
+}
+
+/// 检查/升级前的联网预检：能读到状态且未连路由 → 明确提示；读不到状态（旧固件连上
+/// 路由后 WIFI_STATUS 可能超时）→ 放行，交给设备自己判断。
+async fn ensure_sta_connected_lenient(device: &DyjDevice) -> ApiResult<()> {
+    match device.wifi_status().await {
+        Ok(status) if !status.connected => Err(ApiError(reai_card_sdk::SdkError::InvalidCommand(
+            format!(
+                "WiFi 模块未连接路由器（WIFI_STATUS status={} connected=false），请先完成第 2 步 WIFI_CONNECT",
+                status.status
+            ),
+        ))),
+        Ok(_) => Ok(()),
+        Err(error) => {
+            tracing::warn!(target: "dyj.ota", "⚠️ WIFI_STATUS 不可用（{error}），跳过联网预检，交给设备判断");
+            Ok(())
+        }
+    }
 }
 
 /// 读设备的 OTA 服务器配置；`null` = 未配置（走固件内置默认，即 dyj2 服务）。
@@ -696,14 +731,14 @@ async fn wifi_ota_set_config(
     let device = current_device(&state).await?;
     if let Some(base) = body.get("apiBaseUrl").and_then(serde_json::Value::as_str) {
         if base.trim().is_empty() {
-            device.delete_config("wifi_api_base_url").await?;
+            device.clear_config("wifi_api_base_url").await?;
         } else {
             device.set_sta_api_base_url(base.trim()).await?;
         }
     }
     if let Some(path) = body.get("otaInfoPath").and_then(serde_json::Value::as_str) {
         if path.trim().is_empty() {
-            device.delete_config("wifi_ota_info_path").await?;
+            device.clear_config("wifi_ota_info_path").await?;
         } else {
             device.set_wifi_ota_info_path(path.trim()).await?;
         }
@@ -748,14 +783,23 @@ async fn wifi_ota_versions(
 /// 设备侧检查更新：模块版本（`BASE_INFO.wifiVersion`，旧主控可能没有）+ `OTA_WIFI_CHECK`。
 async fn wifi_ota_check(State(state): State<Arc<AppState>>) -> ApiResult<Json<serde_json::Value>> {
     let device = current_device(&state).await?;
+    ensure_sta_connected_lenient(&device).await?;
     let info = device.device_info().await?;
     let check = device.check_wifi_ota().await?;
+    let note = if check.update_available {
+        "服务器版本高于模块当前版本，可以升级"
+    } else if info.wifi_version_code.is_none() {
+        "模块回复无更新：其 versionCode 已 ≥ 服务器（当前 9）。主控 <0.3.5 不上报模块版本；要确认实际版本，可 WIFI_CLOSE→WIFI_OPEN 让热点重启后在主测试台「WiFi 当前版本」查看（需模块 ≥0.0.4）"
+    } else {
+        "模块已是最新"
+    };
     Ok(Json(serde_json::json!({
         "mainVersion": info.version,
         "mainVersionCode": info.version_code,
         "wifiVersion": info.wifi_version,
         "wifiVersionCode": info.wifi_version_code,
         "updateAvailable": check.update_available,
+        "note": note,
     })))
 }
 
@@ -766,6 +810,7 @@ async fn wifi_ota_update(
     Json(body): Json<serde_json::Value>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let device = current_device(&state).await?;
+    ensure_sta_connected_lenient(&device).await?;
     let wait = body
         .get("waitSecs")
         .and_then(serde_json::Value::as_u64)

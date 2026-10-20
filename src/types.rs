@@ -208,10 +208,14 @@ pub struct WifiNetwork {
     pub encryption: Option<String>,
 }
 
+/// `WIFI_STATUS`。三个必填字段加 `serde(default)`：旧 WiFi 固件的响应可能缺字段。
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct WifiStatus {
+    #[serde(default)]
     pub status: String,
+    #[serde(default)]
     pub enabled: bool,
+    #[serde(default)]
     pub connected: bool,
     pub mode: Option<String>,
     pub ssid: Option<String>,

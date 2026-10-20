@@ -100,7 +100,7 @@ Recording names carry the capture time. Each `.apm` has a sibling `.txt` (`{"tim
 - **"Missing key" normalisation.** The two stores disagree: nRF answers `code 3 "not found"`, the ESP32 answers `{"key":…,"value":""}` (`Setting::getConfig(key, "")`). `config_value` returns `Ok(None)` for both (an empty string on a routed key counts as unset); `get_config` returns the raw response and therefore still errors on the nRF side.
 - **Length validation.** Keys longer than `CONFIG_KEY_MAX_BYTES` (31) or values longer than `CONFIG_VALUE_MAX_BYTES` (63) overflow the nRF's `mjson_get_string` buffers and come back as the misleading `code 2 "missing key"` / `code 3 "missing value"`; the SDK rejects them locally with `InvalidCommand`. Empty keys are rejected too.
 
-Error codes: `CONFIG_SET` → `1` missing json, `2` missing key, `3` missing value, `4` persist failed (slot table full or flash write error); `CONFIG_GET`/`CONFIG_DEL` → `1`/`2` as above, `3` not found. ESP32-side failures are always `code 1` with a message.
+Error codes: `CONFIG_SET` → `1` missing json, `2` missing key, `3` missing value, `4` persist failed (slot table full or flash write error); `CONFIG_GET`/`CONFIG_DEL` → `1`/`2` as above, `3` not found. ESP32-side failures are always `code 1` with a message — including `CONFIG_DEL` of a key that does not exist (`Preferences::remove` returns false → `"配置删除失败"`), which is indistinguishable from a real failure. `clear_config` therefore reads routed keys first and returns `Ok(false)` instead of deleting; `delete_config` keeps the raw semantics.
 
 Known keys on v0.3.x / WiFi v0.0.9:
 
@@ -178,7 +178,9 @@ Verified against the repository history (commit-level):
 | `BASE_INFO.wifiVersion/wifiVersionCode` | main v0.3.5 | Older mains omit it; treat "unknown module version" as normal and let `OTA_WIFI_CHECK` decide. |
 | Partition table | — | Not recorded for field devices. The 0.0.9 app-only bin is 1,297,616 bytes; a default 1.25 MB slot leaves ~13 KB, a single-slot (huge_app) table cannot OTA at all → `FAILED`, device keeps running; USB re-flash recovers. |
 
-`DyjDevice::check_and_update_wifi_firmware(wait)` wraps CHECK → UPDATE for this flow and returns `WifiOnlineOtaOutcome::{UpToDate, Finished(OtaProgress)}`; progress arrives as `OTA_WIFI_PROCESS` events (every 5 %).
+`DyjDevice::check_and_update_wifi_firmware(wait)` wraps CHECK → UPDATE for this flow and returns `WifiOnlineOtaOutcome::{UpToDate, Finished(OtaProgress)}`; progress arrives as `OTA_WIFI_PROCESS` events (every 5 %). `OTA_WIFI_CHECK` gets a 30 s timeout: the ESP32 performs the HTTPS GET synchronously.
+
+Field observation (2026-10-20, main v0.3.3 + unknown WiFi firmware): after `WIFI_CONNECT` succeeded, `WIFI_STATUS` stopped answering (10 s timeout, repeatedly) while `OTA_WIFI_CHECK` answered normally and reached the server. Treat a missing `WIFI_STATUS` after STA connect as a firmware quirk, not as "not connected": the SDK's `WifiStatus` fields are `serde(default)`, and host flows should fall through to `OTA_WIFI_CHECK`, whose own `"WiFi未连接"` error is the authoritative connectivity check.
 
 ## Events
 

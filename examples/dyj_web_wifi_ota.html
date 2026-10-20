@@ -129,15 +129,22 @@ function addLog({level, line}) {
 function badge(id, text, cls) { const el = $(id); el.textContent = text; el.className = 'badge' + (cls ? ' ' + cls : ''); }
 function busy(stepId, text) { badge(stepId, text ?? '执行中…', 'busy'); }
 
+// 失败时返回 null 并把设备/服务端给的原因存进 lastError，供各步骤内联展示
+let lastError = '';
 async function api(path, opts = {}) {
   const init = {method: opts.method || 'GET', headers: {}};
   if (opts.body !== undefined) { init.headers['Content-Type'] = 'application/json'; init.body = JSON.stringify(opts.body); }
   try {
     const resp = await fetch(path, init);
     const data = await resp.json().catch(() => null);
-    if (!resp.ok) addLog({level: 'ERROR', line: `${now()} ❌ [HTTP] ${path} 请求失败: ${data?.error ?? resp.status}`});
-    return resp.ok ? data : null;
+    if (!resp.ok) {
+      lastError = data?.error ?? String(resp.status);
+      addLog({level: 'ERROR', line: `${now()} ❌ [HTTP] ${path} 请求失败: ${lastError}`});
+      return null;
+    }
+    return data;
   } catch (error) {
+    lastError = String(error);
     addLog({level: 'ERROR', line: `${now()} ❌ [HTTP] ${path} 网络异常: ${error}`});
     return null;
   }
@@ -235,8 +242,13 @@ async function wifiConnect() {
   $('btnConnect').disabled = true;
   const data = await api('/api/wifi/connect', {method: 'POST', body: {ssid, password: $('password').value}});
   $('btnConnect').disabled = false;
-  if (data) { badge('s2', '已连路由', 'on'); showStatus(data.status); }
-  else badge('s2', '连接失败', 'err');
+  if (!data) { badge('s2', '连接失败', 'err'); $('wifiStatus').textContent = lastError; return; }
+  if (data.status) { showStatus(data.status); if (data.status.connected) badge('s2', '已连路由', 'on'); }
+  else {
+    // 部分固件连上路由后 WIFI_STATUS 不再应答，但 OTA 命令仍可用
+    badge('s2', '连接命令成功（状态查询超时）', 'warn');
+    $('wifiStatus').textContent = `WIFI_CONNECT 已成功；WIFI_STATUS 查询失败：${data.statusError}。该固件连上路由后状态查询常超时，可直接做第 4 步。`;
+  }
 }
 
 // ---------- 3 OTA 服务器 ----------
@@ -272,15 +284,12 @@ async function serverInfo() {
 // ---------- 4 检查 ----------
 let updateAvailable = false;
 async function checkUpdate() {
-  busy('s4', '检查中…（设备访问服务器，最长约 15s）');
+  busy('s4', '检查中…（设备访问服务器，最长约 30s）');
   const data = await api('/api/wifi/ota/check');
-  if (!data) { badge('s4', '检查失败', 'err'); return; }
+  if (!data) { badge('s4', '检查失败', 'err'); $('checkResult').textContent = lastError; return; }
   refreshVersions();
-  if (data.wifiVersion != null || data.wifiVersionCode != null) {
-    $('checkResult').textContent = `设备模块 code ${data.wifiVersionCode ?? '?'}；updateAvailable=${data.updateAvailable}`;
-  } else {
-    $('checkResult').textContent = `设备模块版本未知（旧主控不上报）；updateAvailable=${data.updateAvailable}`;
-  }
+  const who = data.wifiVersionCode != null ? `设备模块 code ${data.wifiVersionCode}` : '设备模块版本未知（旧主控不上报）';
+  $('checkResult').textContent = `${who}；updateAvailable=${data.updateAvailable}。${data.note ?? ''}`;
   updateAvailable = !!data.updateAvailable;
   $('btnUpdate').disabled = !updateAvailable;
   badge('s4', data.updateAvailable ? '有更新，可升级' : '已是最新', data.updateAvailable ? 'warn' : 'on');
@@ -318,8 +327,13 @@ async function startUpdate() {
   }
 }
 
-// 初始化：若测试台已连接设备，直接刷新版本
-setTimeout(() => { if (true) refreshVersions(); }, 500);
+// 初始化：预填测试用路由器账号（来自 make web 注入的环境变量，公开仓库不含）；若测试台已连设备则刷新版本
+(async () => {
+  const defaults = await api('/api/wifi/defaults');
+  if (defaults?.ssid) $('ssid').value = defaults.ssid;
+  if (defaults?.password) $('password').value = defaults.password;
+  refreshVersions();
+})();
 </script>
 </body>
 </html>

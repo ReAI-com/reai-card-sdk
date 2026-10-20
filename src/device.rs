@@ -32,6 +32,9 @@ use crate::{
 };
 
 const NORMAL_TIMEOUT: Duration = Duration::from_secs(10);
+/// `OTA_WIFI_CHECK` 让 ESP32 现场发一次 HTTPS GET（TLS 握手 1–3s）；旧固件连上路由后
+/// 主循环还可能被其他阻塞网络操作占住，10s 不够。
+const OTA_CHECK_TIMEOUT: Duration = Duration::from_secs(30);
 /// 固件 `CONFIG_GET` / `CONFIG_DEL` 对不存在的键统一回 `code 3 "not found"`。
 const CONFIG_CODE_NOT_FOUND: i64 = 3;
 // 固件兜底回滚恰好在 30s 时才回 `code:3`（handler_wifi.c WIFI_OPEN_TIMEOUT_MS），
@@ -663,7 +666,7 @@ impl DyjDevice {
     /// [`Self::start_wifi_ota`] / [`Self::update_wifi_firmware`] 依赖它。
     pub async fn check_wifi_ota(&self) -> Result<WifiOtaCheck> {
         self.require_wifi_module("OTA_WIFI_CHECK").await?;
-        self.request_typed("OTA_WIFI_CHECK", None, NORMAL_TIMEOUT)
+        self.request_typed("OTA_WIFI_CHECK", None, OTA_CHECK_TIMEOUT)
             .await
     }
 
@@ -837,13 +840,42 @@ impl DyjDevice {
         Ok(())
     }
 
-    /// 删除设备 KV 配置；nRF 侧键不存在时固件回错误（`code 3`）。
+    /// 删除设备 KV 配置；键不存在时固件回错误（nRF `code 3 not found`，ESP32 `code 1 配置删除失败`）。
+    /// 想要"不存在也算成功"请用 [`Self::clear_config`]。
     pub async fn delete_config(&self, key: &str) -> Result<CommandResponse> {
         validate_config_key(key)?;
         self.require_wifi_module_for_config_key("CONFIG_DEL", key)
             .await?;
         self.request_success("CONFIG_DEL", Some(json!({"key": key})), NORMAL_TIMEOUT)
             .await
+    }
+
+    /// 幂等删除：键不存在返回 `Ok(false)`，删掉了返回 `Ok(true)`。
+    ///
+    /// nRF 侧按 `code 3` 识别"不存在"；ESP32 对不存在的键回 `code 1 "配置删除失败"`，
+    /// 与真实失败无法区分，因此路由键先读一次再决定删不删。
+    pub async fn clear_config(&self, key: &str) -> Result<bool> {
+        validate_config_key(key)?;
+        self.require_wifi_module_for_config_key("CONFIG_DEL", key)
+            .await?;
+        if config_key_routes_to_wifi_module(key) {
+            if self.config_value(key).await?.is_none() {
+                tracing::debug!(target: "dyj.device", "🧹 {key} 本就未配置");
+                return Ok(false);
+            }
+            self.request_success("CONFIG_DEL", Some(json!({"key": key})), NORMAL_TIMEOUT)
+                .await?;
+            return Ok(true);
+        }
+        let payload = self
+            .request_payload("CONFIG_DEL", Some(json!({"key": key})), NORMAL_TIMEOUT)
+            .await?;
+        if response_code(&payload) == Some(CONFIG_CODE_NOT_FOUND) {
+            tracing::debug!(target: "dyj.device", "🧹 {key} 本就未配置");
+            return Ok(false);
+        }
+        ensure_success("CONFIG_DEL", &payload)?;
+        Ok(true)
     }
 
     // ========== 按键 / 侧边开关绑定 ==========
@@ -879,19 +911,11 @@ impl DyjDevice {
     /// 删除输入的绑定（回到未配置状态）；本就没有绑定时也视为成功。
     pub async fn clear_control_action(&self, input: impl Into<ControlInput>) -> Result<()> {
         let input = input.into();
-        let payload = self
-            .request_payload(
-                "CONFIG_DEL",
-                Some(json!({"key": input.config_key()})),
-                NORMAL_TIMEOUT,
-            )
-            .await?;
-        if response_code(&payload) == Some(CONFIG_CODE_NOT_FOUND) {
+        if self.clear_config(input.config_key()).await? {
+            tracing::info!(target: "dyj.controls", "🎛️ 已解除绑定 {input}");
+        } else {
             tracing::debug!(target: "dyj.controls", "🎛️ {input} 本就未绑定");
-            return Ok(());
         }
-        ensure_success("CONFIG_DEL", &payload)?;
-        tracing::info!(target: "dyj.controls", "🎛️ 已解除绑定 {input}");
         Ok(())
     }
 
@@ -1046,10 +1070,7 @@ impl DyjDevice {
 
     async fn write_command(&self, command: &str, payload: Option<Value>) -> Result<()> {
         let bytes = encode_command(command, payload.as_ref())?;
-        let payload_text = payload
-            .as_ref()
-            .map(|payload| payload.to_string())
-            .unwrap_or_default();
+        let payload_text = payload.as_ref().map(redacted_payload).unwrap_or_default();
         tracing::info!(target: "dyj.proto", "📤 发送命令 cmd={command}{}", if payload_text.is_empty() { String::new() } else { format!(" payload={payload_text}") });
         let chunks = bytes.chunks(WRITE_CHUNK_SIZE).count();
         for (index, chunk) in bytes.chunks(WRITE_CHUNK_SIZE).enumerate() {
@@ -1247,6 +1268,24 @@ fn event_from_raw(value: Value) -> DeviceEvent {
 
 fn response_code(value: &Value) -> Option<i64> {
     value.get("code").and_then(Value::as_i64)
+}
+
+/// 日志里的命令载荷：路由器密码（`WIFI_CONNECT`）、激活码（`AUTH_ACTIVE`）打码。
+fn redacted_payload(payload: &Value) -> String {
+    match payload {
+        Value::Object(map) if map.contains_key("password") || map.contains_key("code") => {
+            let mut masked = map.clone();
+            for secret in ["password", "code"] {
+                if let Some(value) = masked.get_mut(secret)
+                    && value.is_string()
+                {
+                    *value = Value::String("***".into());
+                }
+            }
+            Value::Object(masked).to_string()
+        }
+        other => other.to_string(),
+    }
 }
 
 async fn receive_next(
@@ -1499,6 +1538,10 @@ mod tests {
                 }
                 "CONFIG_DEL" => match self.config.lock().unwrap().remove(&key) {
                     Some(_) => self.reply(b"CONFIG_DEL:{\"code\":0,\"message\":\"ok\"}\r\n"),
+                    // ESP32（wifi_ 路由键）对不存在的键回 code 1，nRF 回 code 3。
+                    None if config_key_routes_to_wifi_module(&key) => {
+                        self.reply(b"CONFIG_DEL:{\"code\":1,\"message\":\"delete failed\"}\r\n")
+                    }
                     None => self.reply(b"CONFIG_DEL:{\"code\":3,\"message\":\"not found\"}\r\n"),
                 },
                 _ => self.reply(format!("{command}:{{\"code\":0}}\r\n").as_bytes()),
@@ -2079,6 +2122,46 @@ mod tests {
             device.config_value("app_note").await.unwrap().as_deref(),
             Some("")
         );
+    }
+
+    #[tokio::test]
+    async fn clear_config_is_idempotent_on_both_stores() {
+        let transport = Arc::new(MockTransport::new());
+        transport.wifi_open.store(true, Ordering::Relaxed);
+        let device = DyjDevice::from_transport(transport.clone()).await.unwrap();
+        // nRF 键：缺失 → false（固件 code 3）
+        assert!(!device.clear_config("btn_single").await.unwrap());
+        device
+            .set_config("btn_single", "record_mark")
+            .await
+            .unwrap();
+        assert!(device.clear_config("btn_single").await.unwrap());
+        // ESP32 键：缺失时固件回 code 1，直接 delete_config 会报错，clear_config 先读再删
+        assert!(matches!(
+            device.delete_config("wifi_api_base_url").await,
+            Err(SdkError::Device { code: 1, .. })
+        ));
+        assert!(!device.clear_config("wifi_api_base_url").await.unwrap());
+        device
+            .set_sta_api_base_url("https://dyj2.dev.reai.com/api")
+            .await
+            .unwrap();
+        assert!(device.clear_config("wifi_api_base_url").await.unwrap());
+        assert_eq!(device.sta_api_base_url().await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn command_log_redacts_passwords() {
+        assert_eq!(
+            redacted_payload(&json!({"ssid":"home","password":"secret"})),
+            r#"{"password":"***","ssid":"home"}"#
+        );
+        assert_eq!(
+            redacted_payload(&json!({"deviceId":"D1","deviceName":"n","code":"ABCD"})),
+            r#"{"code":"***","deviceId":"D1","deviceName":"n"}"#
+        );
+        // 数值型 code（响应里的错误码）不属于密钥，不打码
+        assert_eq!(redacted_payload(&json!({"code":3})), r#"{"code":3}"#);
     }
 
     #[tokio::test]
