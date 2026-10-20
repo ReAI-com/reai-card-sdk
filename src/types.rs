@@ -213,10 +213,8 @@ impl RecordingStamp {
             .unwrap_or(stem);
         let (synced, digits) = if let Some(rest) = stem.strip_prefix("synced_") {
             (true, rest)
-        } else if let Some(rest) = stem.strip_prefix("nosync_") {
-            (false, rest)
         } else {
-            return None;
+            (false, stem.strip_prefix("nosync_")?)
         };
         let timestamp = digits.parse::<i64>().ok()?;
         Some(Self { timestamp, synced })

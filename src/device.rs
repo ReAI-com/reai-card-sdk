@@ -354,7 +354,7 @@ impl DyjDevice {
                     if written >= next_milestone {
                         next_milestone += FILE_PROGRESS_STEP;
                         let total = expected_size.unwrap_or(0);
-                        let percent = if total > 0 { written * 100 / total } else { 0 };
+                        let percent = (written * 100).checked_div(total).unwrap_or(0);
                         tracing::info!(target: "dyj.file", "📄 传输进度 name={result_name} 已传={written}/{total}字节 ({percent}%)");
                     }
                 }
