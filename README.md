@@ -302,7 +302,7 @@ async fn upgrade_wifi_locally(device: &DyjDevice, firmware: Vec<u8>) -> reai_car
 ```
 
 - 主控升级中途失败时设备停在 DFU 模式继续广播，用 `scan_dfu_targets()` + `connect_dfu()` + `DfuTarget::upload()` 可直接续传（bootloader 记得已收到的偏移），不必再发 `OTA`。
-- `DfuOptions::default()` 走 20 字节包 + 每 10 包一次回执，约 1–2 分钟传完 170 KB，稳妥优先；确认链路 MTU 后可把 `packet_size` 调到 244 提速。
+- `DfuOptions::default()` 走 20 字节包 + 每 4 包一次回执（bootloader 只有 8 个接收缓冲，macOS 会把排队的写一次塞进同一个连接事件，真机实测 10 包一批会丢一半），约 35–65 秒传完 170 KB；丢掉尾部包时 SDK 从 bootloader 的偏移续写而不是重建对象。`DfuReport::rewinds` 为 0 时可以把 `prn` 调大、确认链路 MTU 后把 `packet_size` 调到 244 提速。
 - 升级失败不会变砖：bootloader 校验不过保留旧应用；ESP32 写入失败留在旧分区。
 - `DfuPackage` 只接受应用镜像包；SoftDevice / bootloader 组合包不支持。
 

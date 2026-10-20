@@ -47,6 +47,10 @@ const OP_RESPONSE: u8 = 0x60;
 const OBJECT_COMMAND: u8 = 0x01;
 const OBJECT_DATA: u8 = 0x02;
 
+/// Create 因 flash 擦除忙（bootloader 还在写上一批数据）被拒时的重试次数与间隔。
+const CREATE_BUSY_RETRIES: u32 = 8;
+const FLASH_DRAIN_DELAY: Duration = Duration::from_millis(250);
+
 const RESULT_SUCCESS: u8 = 0x01;
 const RESULT_INVALID_OBJECT: u8 = 0x05;
 const RESULT_OPERATION_NOT_PERMITTED: u8 = 0x08;
@@ -171,8 +175,10 @@ pub struct DfuOptions {
     /// 每个 Packet 写的字节数。20 是 ATT 默认 MTU（23）下的安全值；若确认链路协商了
     /// 更大的 MTU（bootloader 上限 247 → 244 字节），可以调大换速度。
     pub packet_size: usize,
-    /// Packet Receipt Notification：每写 `prn` 个包让 bootloader 回一次 CRC，既做流控
-    /// （限制在途数据，避免无响应写被底层静默丢弃）也能尽早发现丢包。0 = 关闭。
+    /// Packet Receipt Notification：每写 `prn` 个包让 bootloader 回一次 CRC，兼做流控。
+    /// bootloader 只有 `NRF_DFU_BLE_BUFFERS = 8` 个接收缓冲（flash 写完才释放），而 macOS
+    /// 会把排队的无响应写塞进同一个连接事件；真机实测 10 个包一批会丢一半，4 留了一倍
+    /// 余量。调大换速度前先确认重传统计（`DfuReport::rewinds`）为 0。0 = 关闭。
     pub prn: u16,
     /// 单个对象 CRC 不符时的重建次数。
     pub object_retries: u32,
@@ -184,7 +190,7 @@ impl Default for DfuOptions {
     fn default() -> Self {
         Self {
             packet_size: 20,
-            prn: 10,
+            prn: 4,
             object_retries: 3,
             response_timeout: Duration::from_secs(10),
         }
@@ -223,8 +229,10 @@ pub struct DfuReport {
     pub resumed_from: usize,
     /// 本次提交（Execute）的数据对象个数。
     pub objects: u32,
-    /// 因 CRC 不符重建对象的次数。
+    /// 因内容不符重建对象的次数。
     pub retries: u32,
+    /// bootloader 丢了尾部若干包、从它报告的偏移续写（不重建对象）的次数。
+    pub rewinds: u32,
     pub elapsed: Duration,
 }
 
@@ -280,21 +288,14 @@ impl DfuTarget {
         };
         tracing::info!(target: "dyj.dfu", "⬆️ 开始 Secure DFU 上传 init={}字节 固件={}字节 packet={} prn={}", package.init_packet.len(), package.firmware.len(), options.packet_size, options.prn);
 
-        self.request(
-            &mut stream,
-            OP_SET_PRN,
-            &options.prn.to_le_bytes(),
-            "set PRN",
-            options,
-        )
-        .await?;
+        self.set_prn(&mut stream, options).await?;
         self.send_init_packet(&mut stream, package, options, &mut progress, &mut report)
             .await?;
         self.send_firmware(&mut stream, package, options, &mut progress, &mut report)
             .await?;
 
         report.elapsed = started.elapsed();
-        tracing::info!(target: "dyj.dfu", "✅ DFU 上传完成 {}字节 对象={} 重试={} 耗时={:.1}s，bootloader 校验后自行重启", report.firmware_bytes, report.objects, report.retries, report.elapsed.as_secs_f64());
+        tracing::info!(target: "dyj.dfu", "✅ DFU 上传完成 {}字节 对象={} 丢包续写={} 重建={} 耗时={:.1}s，bootloader 校验后自行重启", report.firmware_bytes, report.objects, report.rewinds, report.retries, report.elapsed.as_secs_f64());
         Ok(report)
     }
 
@@ -329,6 +330,7 @@ impl DfuTarget {
             loop {
                 self.create(stream, OBJECT_COMMAND, init.len() as u32, options)
                     .await?;
+                self.set_prn(stream, options).await?;
                 let mut hasher = crc32fast::Hasher::new();
                 let written = self
                     .write_data(stream, init, 0, &mut hasher, options, &mut |sent| {
@@ -432,6 +434,8 @@ impl DfuTarget {
             }
         }
 
+        // 从对象中途续传时 bootloader 的 PRN 计数停在未知位置，先对齐再写。
+        let mut realign_prn = done > 0 && !done.is_multiple_of(max);
         while done < firmware.len() {
             let object_start = (done / max) * max;
             let object_end = (object_start + max).min(firmware.len());
@@ -447,6 +451,13 @@ impl DfuTarget {
                     .await?;
                     hasher = crc32fast::Hasher::new();
                     hasher.update(&firmware[..object_start]);
+                    realign_prn = true;
+                }
+                if realign_prn {
+                    // bootloader 的 PRN 计数按到达包数走且不随 Create 复位，每段写入前重设一次，
+                    // 保证它的回执恰好落在我们等待的位置。
+                    self.set_prn(stream, options).await?;
+                    realign_prn = false;
                 }
                 let total = firmware.len();
                 let written = self
@@ -465,23 +476,12 @@ impl DfuTarget {
                         },
                     )
                     .await?;
-                let verified = match written {
-                    Written::Complete => {
-                        let (offset, crc) = self.calculate_crc(stream, options).await?;
-                        let expected = hasher.clone().finalize();
-                        if offset as usize == object_end && crc == expected {
-                            true
-                        } else {
-                            tracing::warn!(target: "dyj.dfu", "⚠️ 对象 CRC 不符 offset={offset}/{object_end} crc={crc:08x}/{expected:08x}");
-                            false
-                        }
-                    }
-                    Written::Mismatch { offset, crc } => {
-                        tracing::warn!(target: "dyj.dfu", "⚠️ PRN 校验不符 offset={offset} crc={crc:08x}");
-                        false
-                    }
+                let (offset, crc) = match written {
+                    Written::Complete => self.calculate_crc(stream, options).await?,
+                    Written::Mismatch { offset, crc } => (offset, crc),
                 };
-                if verified {
+                let offset = offset as usize;
+                if offset == object_end && crc == hasher.clone().finalize() {
                     self.request(stream, OP_EXECUTE, &[], "execute data object", options)
                         .await?;
                     done = object_end;
@@ -489,6 +489,21 @@ impl DfuTarget {
                     tracing::debug!(target: "dyj.dfu", "📦 对象已提交 {done}/{}", firmware.len());
                     break;
                 }
+                // bootloader 少收了尾部几个包（接收缓冲溢出），但已有的前缀是对的：
+                // 从它的偏移续写即可，不必重建对象（重建还会撞上未排空的 flash 队列）。
+                if offset > object_start
+                    && offset < object_end
+                    && crc == crc32fast::hash(&firmware[..offset])
+                {
+                    report.rewinds += 1;
+                    tracing::warn!(target: "dyj.dfu", "↩️ bootloader 只收到 {offset} 字节（接收缓冲溢出丢了尾部包），从该偏移续写");
+                    done = offset;
+                    hasher = crc32fast::Hasher::new();
+                    hasher.update(&firmware[..offset]);
+                    realign_prn = true;
+                    continue;
+                }
+                tracing::warn!(target: "dyj.dfu", "⚠️ 对象内容不符 offset={offset}/{object_end} crc={crc:08x}");
                 attempts += 1;
                 report.retries += 1;
                 if attempts > options.object_retries {
@@ -500,6 +515,8 @@ impl DfuTarget {
                     ));
                 }
                 tracing::warn!(target: "dyj.dfu", "🔁 重建对象 {object_start}..{object_end}（第 {attempts} 次）");
+                // 让 bootloader 把排队的 flash 写做完，否则 Create 的擦除会被拒。
+                tokio::time::sleep(FLASH_DRAIN_DELAY).await;
                 done = object_start;
             }
         }
@@ -587,6 +604,8 @@ impl DfuTarget {
         })
     }
 
+    /// Create 对象。bootloader 在 Create 时擦除目标页；若上一批数据的 flash 写还在队列里，
+    /// 擦除失败会回 `invalid object`（0x05）——等它排空后重试。
     async fn create(
         &self,
         stream: &mut NotificationStream,
@@ -596,8 +615,35 @@ impl DfuTarget {
     ) -> Result<()> {
         let mut payload = vec![object_type];
         payload.extend_from_slice(&size.to_le_bytes());
-        self.request(stream, OP_CREATE, &payload, "create object", options)
-            .await?;
+        let mut attempt = 0;
+        loop {
+            match self
+                .request(stream, OP_CREATE, &payload, "create object", options)
+                .await
+            {
+                Ok(_) => return Ok(()),
+                Err(SdkError::Dfu {
+                    result: RESULT_INVALID_OBJECT,
+                    ..
+                }) if attempt < CREATE_BUSY_RETRIES => {
+                    attempt += 1;
+                    tracing::warn!(target: "dyj.dfu", "⏳ Create 被拒（flash 忙），{}ms 后重试（第 {attempt} 次）", FLASH_DRAIN_DELAY.as_millis());
+                    tokio::time::sleep(FLASH_DRAIN_DELAY).await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    async fn set_prn(&self, stream: &mut NotificationStream, options: &DfuOptions) -> Result<()> {
+        self.request(
+            stream,
+            OP_SET_PRN,
+            &options.prn.to_le_bytes(),
+            "set PRN",
+            options,
+        )
+        .await?;
         Ok(())
     }
 
@@ -797,8 +843,8 @@ mod tests {
         notify_rx: Mutex<Option<mpsc::UnboundedReceiver<Result<Vec<u8>>>>>,
         state: StdMutex<State>,
         max_data_object: usize,
-        /// 丢掉第 N 个数据包（一次），模拟无响应写被底层吞掉。
-        drop_data_packet: Option<usize>,
+        /// 丢掉这些序号的数据包（按到达顺序计数，含被丢的），模拟接收缓冲溢出。
+        drop_data_packets: Vec<usize>,
         /// 让 init packet 的 Execute 以扩展错误码失败。
         init_execute_ext_error: Option<u8>,
     }
@@ -816,7 +862,9 @@ mod tests {
         pending_created: Option<usize>,
         creates: u32,
         data_packets: usize,
-        dropped: bool,
+        /// 前 N 次数据对象 Create 以 invalid object 拒绝（模拟 flash 擦除忙）。
+        create_rejections_left: u32,
+        create_rejected: u32,
     }
 
     impl MockBootloader {
@@ -827,8 +875,24 @@ mod tests {
                 notify_rx: Mutex::new(Some(notify_rx)),
                 state: StdMutex::new(State::default()),
                 max_data_object,
-                drop_data_packet: None,
+                drop_data_packets: Vec::new(),
                 init_execute_ext_error: None,
+            })
+        }
+
+        fn with(
+            max_data_object: usize,
+            drop_data_packets: Vec<usize>,
+            init_execute_ext_error: Option<u8>,
+        ) -> Arc<Self> {
+            let (notify_tx, notify_rx) = mpsc::unbounded_channel();
+            Arc::new(Self {
+                notify_tx,
+                notify_rx: Mutex::new(Some(notify_rx)),
+                state: StdMutex::new(State::default()),
+                max_data_object,
+                drop_data_packets,
+                init_execute_ext_error,
             })
         }
 
@@ -876,6 +940,12 @@ mod tests {
                 OP_CREATE => {
                     let size =
                         u32::from_le_bytes([bytes[2], bytes[3], bytes[4], bytes[5]]) as usize;
+                    if bytes[1] == OBJECT_DATA && state.create_rejections_left > 0 {
+                        state.create_rejections_left -= 1;
+                        state.create_rejected += 1;
+                        self.respond(OP_CREATE, RESULT_INVALID_OBJECT, &[]);
+                        return Ok(());
+                    }
                     state.current = Some(bytes[1]);
                     state.prn_count = 0;
                     state.creates += 1;
@@ -940,9 +1010,7 @@ mod tests {
                 _ => {
                     let index = state.data_packets;
                     state.data_packets += 1;
-                    if self.drop_data_packet == Some(index) && !state.dropped {
-                        state.dropped = true;
-                    } else {
+                    if !self.drop_data_packets.contains(&index) {
                         state.pending.extend_from_slice(bytes);
                     }
                 }
@@ -1071,36 +1139,50 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn retries_an_object_after_a_dropped_packet() {
-        let (notify_tx, notify_rx) = mpsc::unbounded_channel();
-        let bootloader = Arc::new(MockBootloader {
-            notify_tx,
-            notify_rx: Mutex::new(Some(notify_rx)),
-            state: StdMutex::new(State::default()),
-            max_data_object: 256,
-            drop_data_packet: Some(5),
-            init_execute_ext_error: None,
-        });
+    async fn rewinds_to_the_bootloader_offset_after_tail_packets_are_dropped() {
+        // 真机现象：一批 10 包里后 5 个因接收缓冲溢出被丢，bootloader 手里是正确的前缀。
+        let bootloader = MockBootloader::with(256, vec![5, 6, 7, 8, 9], None);
+        let target = DfuTarget::new(bootloader.clone()).await.unwrap();
+        let package = sample_package();
+        let report = target.upload(&package, &options(), |_| {}).await.unwrap();
+        let state = bootloader.state.lock().unwrap();
+        assert_eq!(state.committed, package.firmware);
+        assert_eq!(report.rewinds, 1, "前缀正确 → 续写而不是重建");
+        assert_eq!(report.retries, 0);
+        assert_eq!(report.objects, 4);
+        assert_eq!(state.creates, 1 + 4, "没有多余的 Create");
+    }
+
+    #[tokio::test]
+    async fn rebuilds_the_object_after_a_dropped_middle_packet() {
+        // 中间丢一个包：后续数据前移，bootloader 的内容不再是本包前缀，只能重建对象。
+        let bootloader = MockBootloader::with(256, vec![5], None);
         let target = DfuTarget::new(bootloader.clone()).await.unwrap();
         let package = sample_package();
         let report = target.upload(&package, &options(), |_| {}).await.unwrap();
         let state = bootloader.state.lock().unwrap();
         assert_eq!(state.committed, package.firmware);
         assert_eq!(report.retries, 1);
+        assert_eq!(report.rewinds, 0);
         assert_eq!(report.objects, 4);
     }
 
     #[tokio::test]
+    async fn create_retries_while_the_bootloader_flash_is_busy() {
+        let bootloader = MockBootloader::new(256);
+        bootloader.state.lock().unwrap().create_rejections_left = 2;
+        let target = DfuTarget::new(bootloader.clone()).await.unwrap();
+        let package = sample_package();
+        let report = target.upload(&package, &options(), |_| {}).await.unwrap();
+        let state = bootloader.state.lock().unwrap();
+        assert_eq!(state.committed, package.firmware);
+        assert_eq!(state.create_rejected, 2);
+        assert_eq!(report.retries, 0);
+    }
+
+    #[tokio::test]
     async fn init_packet_rejection_surfaces_the_extended_error() {
-        let (notify_tx, notify_rx) = mpsc::unbounded_channel();
-        let bootloader = Arc::new(MockBootloader {
-            notify_tx,
-            notify_rx: Mutex::new(Some(notify_rx)),
-            state: StdMutex::new(State::default()),
-            max_data_object: 256,
-            drop_data_packet: None,
-            init_execute_ext_error: Some(0x05),
-        });
+        let bootloader = MockBootloader::with(256, Vec::new(), Some(0x05));
         let target = DfuTarget::new(bootloader.clone()).await.unwrap();
         let error = target
             .upload(&sample_package(), &options(), |_| {})

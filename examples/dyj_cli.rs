@@ -97,9 +97,9 @@ fn usage() {
   ota update [secs]                 check→update→跟进 OTA_WIFI_PROCESS 到 SUCCESS/FAILED（默认上限 600s）
   ota info <api_base_url> main|wifi 查服务器最新版本（不需要设备）
   dfu                               仅让主控进 DFU 模式（之后广播 DFU_DYJ）
-  dfu <package.zip> [packet_size]   主控完整升级：OTA 进 DFU → 扫 DFU_DYJ → Secure DFU 推包
+  dfu <package.zip> [packet_size] [prn]   主控完整升级：OTA 进 DFU → 扫 DFU_DYJ → Secure DFU 推包（默认 20 字节包、每 4 包回执）
   dfu-scan                          扫描已在 DFU 模式的主控（不需要先连设备）
-  dfu-resume <package.zip> [packet_size]  对已在 DFU 模式的主控直接推包/续传
+  dfu-resume <package.zip> [packet_size] [prn]  对已在 DFU 模式的主控直接推包/续传
   auth activate <deviceId> <name> <code> | auth clear
   restart | shutdown | dfu
   events                             挂机只打印主动上报事件（Ctrl-C 退出）
@@ -147,7 +147,7 @@ async fn run(globals: &Globals, command: &[String]) -> reai_card_sdk::Result<()>
     }
     if first == "dfu-resume" {
         let package = DfuPackage::from_zip_path(required(&command[1..], 0, "package.zip")?)?;
-        let options = dfu_options(command.get(2))?;
+        let options = dfu_options(command.get(2), command.get(3))?;
         let target = manager
             .scan_dfu_targets(Duration::from_secs(globals.scan_secs))
             .await?
@@ -208,7 +208,7 @@ async fn run(globals: &Globals, command: &[String]) -> reai_card_sdk::Result<()>
             None => print_json(serde_json::to_value(device.enter_dfu_mode().await?)?),
             Some(path) => {
                 let package = DfuPackage::from_zip_path(path)?;
-                let options = dfu_options(rest.get(1))?;
+                let options = dfu_options(rest.get(1), rest.get(2))?;
                 println!(
                     "updating main firmware: init {} B, image {} B, packet {} B, prn {}",
                     package.init_packet.len(),
@@ -545,12 +545,20 @@ async fn ap(device: &DyjDevice, rest: &[String]) -> reai_card_sdk::Result<()> {
     }
 }
 
-fn dfu_options(packet_size: Option<&String>) -> reai_card_sdk::Result<DfuOptions> {
+fn dfu_options(
+    packet_size: Option<&String>,
+    prn: Option<&String>,
+) -> reai_card_sdk::Result<DfuOptions> {
     let mut options = DfuOptions::default();
     if let Some(size) = packet_size {
         options.packet_size = size.parse().map_err(|_| {
             reai_card_sdk::SdkError::InvalidCommand(format!("invalid packet size `{size}`"))
         })?;
+    }
+    if let Some(prn) = prn {
+        options.prn = prn
+            .parse()
+            .map_err(|_| reai_card_sdk::SdkError::InvalidCommand(format!("invalid prn `{prn}`")))?;
     }
     Ok(options)
 }
@@ -578,10 +586,11 @@ fn dfu_progress_printer() -> impl FnMut(DfuProgress) + Send {
 
 fn print_dfu_report(report: &reai_card_sdk::DfuReport) -> reai_card_sdk::Result<()> {
     println!(
-        "dfu done: {} bytes in {:.1}s, {} objects, {} retries{}; bootloader validates and reboots into the new app",
+        "dfu done: {} bytes in {:.1}s, {} objects, {} rewinds (dropped tail packets), {} rebuilds{}; bootloader validates and reboots into the new app",
         report.firmware_bytes,
         report.elapsed.as_secs_f64(),
         report.objects,
+        report.rewinds,
         report.retries,
         if report.resumed_from > 0 {
             format!(", resumed from {}", report.resumed_from)

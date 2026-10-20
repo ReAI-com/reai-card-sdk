@@ -674,8 +674,14 @@ async fn dfu_update(
     {
         options.packet_size = size;
     }
+    if let Some(prn) = fields
+        .get("prn")
+        .and_then(|value| value.trim().parse::<u16>().ok())
+    {
+        options.prn = prn;
+    }
     let device = current_device(&state).await?;
-    tracing::info!(target: "dyj.dfu", "⬆️ 网页发起主控升级 {file_name}：init {} 字节，固件 {} 字节，packet {}", package.init_packet.len(), package.firmware.len(), options.packet_size);
+    tracing::info!(target: "dyj.dfu", "⬆️ 网页发起主控升级 {file_name}：init {} 字节，固件 {} 字节，packet {}，prn {}", package.init_packet.len(), package.firmware.len(), options.packet_size, options.prn);
 
     // 录音会话在设备复位前收尾，避免后台还在尝试停录
     if let Some(session) = state.recording.lock().await.take() {
@@ -704,8 +710,11 @@ async fn dfu_update(
         "initPacketBytes": report.init_packet_bytes,
         "firmwareBytes": report.firmware_bytes,
         "objects": report.objects,
+        "rewinds": report.rewinds,
         "retries": report.retries,
         "resumedFrom": report.resumed_from,
+        "packetSize": options.packet_size,
+        "prn": options.prn,
         "elapsedSecs": report.elapsed.as_secs_f64(),
         "hint": "bootloader 正在校验并重启进新固件，请稍后重新扫描连接；BASE_INFO 的 version 应为新版本",
     })))

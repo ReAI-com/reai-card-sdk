@@ -326,6 +326,10 @@
         <button onclick="dfuUpload()">主控 DFU 升级</button>
       </div>
       <div class="row">
+        <input id="dfuPacket" placeholder="包大小 20" style="width:90px" title="每个无响应写的字节数；确认链路 MTU 后可试 244">
+        <input id="dfuPrn" placeholder="PRN 4" style="width:80px" title="每几个包等一次 bootloader 回执（流控）；结果 rewinds 为 0 时可适当调大">
+      </div>
+      <div class="row">
         <input type="file" id="wifiBin" accept=".bin" style="max-width:180px">
         <button onclick="apOtaUpload()">WiFi 本地升级</button>
         <button onclick="apOtaCheck()">WiFi 当前版本</button>
@@ -598,6 +602,8 @@ async function dfuUpload() {
   if (!confirm(`用 ${file.name} 升级主控？设备会重启进 DFU 模式并推送固件（约 1–2 分钟），期间请勿断电。`)) return;
   const form = new FormData();
   form.append('package', file);
+  if ($('dfuPacket').value.trim()) form.append('packet_size', $('dfuPacket').value.trim());
+  if ($('dfuPrn').value.trim()) form.append('prn', $('dfuPrn').value.trim());
   const data = await uploadForm('/api/dfu', form, 'DFU 升级中…');
   // 无论成败设备都已离开应用固件，连接作废
   connected = false;
