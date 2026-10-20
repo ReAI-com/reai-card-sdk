@@ -25,7 +25,8 @@ use tokio::sync::{Mutex, RwLock, broadcast};
 use reai_card_sdk::{
     AP_DEFAULT_IP, AP_DEFAULT_PORT, AP_DEFAULT_SSID, AccessPointClient, ControlAction,
     ControlBindings, ControlInput, DeviceEvent, DeviceManager, DfuOptions, DfuPackage, DfuStage,
-    DyjDevice, PcmChunk, RealtimeRecordingSession, SAMPLE_RATE_HZ, SavedRecording,
+    DyjDevice, OTA_DEFAULT_API_BASE_URL, OTA_DEFAULT_INFO_PATH, OtaInfo, PcmChunk,
+    RealtimeRecordingSession, SAMPLE_RATE_HZ, SavedRecording, WifiOnlineOtaOutcome,
 };
 
 #[path = "common/mod.rs"]
@@ -121,6 +122,17 @@ async fn main() {
         .route("/api/dfu", post(dfu_update))
         .route("/api/ap/ota/check", get(ap_ota_check))
         .route("/api/ap/ota/upload", post(ap_ota_upload))
+        .route("/wifi-ota", get(wifi_ota_page))
+        .route("/api/wifi/open", post(wifi_open))
+        .route("/api/wifi/connect", post(wifi_connect))
+        .route(
+            "/api/wifi/ota/config",
+            get(wifi_ota_config).post(wifi_ota_set_config),
+        )
+        .route("/api/wifi/ota/server", get(wifi_ota_server))
+        .route("/api/wifi/ota/versions", get(wifi_ota_versions))
+        .route("/api/wifi/ota/check", get(wifi_ota_check))
+        .route("/api/wifi/ota/update", post(wifi_ota_update))
         // 固件上传：ESP32 .bin 约 1.3MB，nrfutil .zip 约 170KB；默认 2MB 限制不够
         .layer(DefaultBodyLimit::max(16 * 1024 * 1024))
         .with_state(state);
@@ -622,6 +634,164 @@ async fn current_device(state: &AppState) -> ApiResult<DyjDevice> {
 
 fn invalid_body(message: &str) -> ApiError {
     ApiError(reai_card_sdk::SdkError::InvalidFrame(message.to_owned()))
+}
+
+// ========== WiFi 模块在线升级专页（旧固件设备） ==========
+
+async fn wifi_ota_page() -> Html<&'static str> {
+    Html(include_str!("dyj_web_wifi_ota.html"))
+}
+
+/// `WIFI_OPEN`：给 ESP32 上电。SDK `open_wifi` 幂等且带 35s 超时兜底。
+async fn wifi_open(State(state): State<Arc<AppState>>) -> ApiResult<Json<serde_json::Value>> {
+    let device = current_device(&state).await?;
+    let response = device.open_wifi().await?;
+    Ok(Json(serde_json::json!({
+        "response": response,
+        "status": device.wifi_status().await?,
+    })))
+}
+
+/// `{ssid, password}`：`WIFI_CONNECT` 连路由（固件同步阻塞最长约 12s，SDK 超时 20s）。
+/// 注意：固件会把模块切到纯 STA 模式，热点随之关闭；升级完成后模块重启，热点自恢复。
+async fn wifi_connect(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<serde_json::Value>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let device = current_device(&state).await?;
+    let ssid = body
+        .get("ssid")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| invalid_body("缺少 ssid 字段"))?;
+    let password = body
+        .get("password")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let response = device.connect_wifi(ssid, password).await?;
+    Ok(Json(serde_json::json!({
+        "response": response,
+        "status": device.wifi_status().await?,
+    })))
+}
+
+/// 读设备的 OTA 服务器配置；`null` = 未配置（走固件内置默认，即 dyj2 服务）。
+async fn wifi_ota_config(State(state): State<Arc<AppState>>) -> ApiResult<Json<serde_json::Value>> {
+    let device = current_device(&state).await?;
+    Ok(Json(serde_json::json!({
+        "apiBaseUrl": device.sta_api_base_url().await?,
+        "otaInfoPath": device.wifi_ota_info_path().await?,
+        "firmwareDefaults": {
+            "apiBaseUrl": OTA_DEFAULT_API_BASE_URL,
+            "otaInfoPath": OTA_DEFAULT_INFO_PATH,
+        },
+        "hint": "所有 WiFi 固件版本的内置默认都指向 dyj2 服务，旧固件无需改配置；仅当设备被改过配置时才需要写回",
+    })))
+}
+
+/// `{apiBaseUrl?, otaInfoPath?}` 写入设备；空字符串 = 删除该项恢复固件默认。
+async fn wifi_ota_set_config(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<serde_json::Value>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let device = current_device(&state).await?;
+    if let Some(base) = body.get("apiBaseUrl").and_then(serde_json::Value::as_str) {
+        if base.trim().is_empty() {
+            device.delete_config("wifi_api_base_url").await?;
+        } else {
+            device.set_sta_api_base_url(base.trim()).await?;
+        }
+    }
+    if let Some(path) = body.get("otaInfoPath").and_then(serde_json::Value::as_str) {
+        if path.trim().is_empty() {
+            device.delete_config("wifi_ota_info_path").await?;
+        } else {
+            device.set_wifi_ota_info_path(path.trim()).await?;
+        }
+    }
+    wifi_ota_config(State(state)).await
+}
+
+/// 主机侧查服务器最新版本：`?base=&path=`（缺省用固件内置默认）。
+async fn wifi_ota_server(
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let base = params
+        .get("base")
+        .filter(|base| !base.trim().is_empty())
+        .map(String::as_str)
+        .unwrap_or(OTA_DEFAULT_API_BASE_URL);
+    let path = params
+        .get("path")
+        .filter(|path| !path.trim().is_empty())
+        .map(String::as_str)
+        .unwrap_or(OTA_DEFAULT_INFO_PATH);
+    let info = OtaInfo::fetch_with_path(base, path).await?;
+    Ok(Json(
+        serde_json::json!({"base": base, "path": path, "info": info}),
+    ))
+}
+
+/// 主控与 WiFi 模块的当前版本（`wifiVersion` 需主控 ≥0.3.5，旧主控为 null）。
+async fn wifi_ota_versions(
+    State(state): State<Arc<AppState>>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let device = current_device(&state).await?;
+    let info = device.device_info().await?;
+    Ok(Json(serde_json::json!({
+        "mainVersion": info.version,
+        "mainVersionCode": info.version_code,
+        "wifiVersion": info.wifi_version,
+        "wifiVersionCode": info.wifi_version_code,
+    })))
+}
+
+/// 设备侧检查更新：模块版本（`BASE_INFO.wifiVersion`，旧主控可能没有）+ `OTA_WIFI_CHECK`。
+async fn wifi_ota_check(State(state): State<Arc<AppState>>) -> ApiResult<Json<serde_json::Value>> {
+    let device = current_device(&state).await?;
+    let info = device.device_info().await?;
+    let check = device.check_wifi_ota().await?;
+    Ok(Json(serde_json::json!({
+        "mainVersion": info.version,
+        "mainVersionCode": info.version_code,
+        "wifiVersion": info.wifi_version,
+        "wifiVersionCode": info.wifi_version_code,
+        "updateAvailable": check.update_available,
+    })))
+}
+
+/// `{waitSecs?}`：同一上电周期内 检查→升级，直到 `SUCCESS`/`FAILED`。
+/// 同步执行（默认上限 900s），进度经 `/api/stream` 的 `OTA_WIFI_PROCESS` 事件实时可见。
+async fn wifi_ota_update(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<serde_json::Value>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let device = current_device(&state).await?;
+    let wait = body
+        .get("waitSecs")
+        .and_then(serde_json::Value::as_u64)
+        .filter(|secs| *secs > 0)
+        .unwrap_or(900);
+    tracing::info!(target: "dyj.ota", "⬆️ 网页发起 WiFi 模块在线升级（上限 {wait}s）");
+    match device
+        .check_and_update_wifi_firmware(Duration::from_secs(wait))
+        .await?
+    {
+        WifiOnlineOtaOutcome::UpToDate => Ok(Json(
+            serde_json::json!({"outcome": "upToDate", "hint": "设备已是最新（服务器 versionCode 不高于设备），未发起升级"}),
+        )),
+        WifiOnlineOtaOutcome::Finished(progress) => {
+            let hint = if progress.status == reai_card_sdk::OtaStatus::Success {
+                "ESP32 正在校验并重启进新固件，热点稍后自动恢复；BASE_INFO 的 wifiVersion 在下一次模块版本同步后更新"
+            } else {
+                "升级失败：检查设备联网与信号后可重试；ESP32 未重启、旧固件仍在运行。老设备若反复 FAILED，可能是出厂分区表放不下新固件（需 USB 重刷恢复）"
+            };
+            Ok(Json(serde_json::json!({
+                "outcome": "finished",
+                "progress": progress,
+                "hint": hint,
+            })))
+        }
+    }
 }
 
 // ========== 固件升级 ==========

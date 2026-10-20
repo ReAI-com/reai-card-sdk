@@ -31,7 +31,7 @@ pub use dfu::{
     DFU_ADVERTISED_NAME, DFU_CONTROL_POINT_UUID, DFU_PACKET_UUID, DFU_SERVICE_UUID, DfuOptions,
     DfuPackage, DfuProgress, DfuReport, DfuStage, DfuTarget, DfuTransport, SharedDfuTransport,
 };
-pub use ota::{OtaInfo, OtaModule};
+pub use ota::{OTA_DEFAULT_API_BASE_URL, OTA_DEFAULT_INFO_PATH, OtaInfo, OtaModule};
 pub use recording::{RecordingFileName, SavedRecording, WavFile, apm_to_wav, recording_file_name};
 pub use transport::{BleTransport, NotificationStream, SharedTransport};
 pub use types::*;

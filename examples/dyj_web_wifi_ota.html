@@ -1,0 +1,325 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DYJ · WiFi 模块在线升级</title>
+<style>
+  :root {
+    --bg: #0b0f0d; --panel: #101613; --line: #1d2b24; --fg: #e6f2ec; --dim: #7d9a8c;
+    --sig: #3ddc97; --warn: #ffb454; --err: #ff6b6b; --mono: ui-monospace, Menlo, monospace;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg); font: 14px/1.6 system-ui, sans-serif; }
+  header { display: flex; align-items: center; gap: 10px; padding: 10px 16px; border-bottom: 1px solid var(--line); }
+  .brand { display: flex; align-items: center; gap: 10px; font-weight: 600; }
+  .hint-link { margin-left: auto; color: var(--dim); font-size: 12px; text-decoration: none; }
+  .hint-link:hover { color: var(--sig); }
+  main { max-width: 900px; margin: 0 auto; padding: 14px; display: grid; gap: 12px; }
+  .step { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; }
+  .step h3 { margin: 0 0 8px; display: flex; align-items: center; gap: 8px; font-size: 14px; }
+  .no { display: inline-flex; width: 20px; height: 20px; border-radius: 50%; background: var(--line); color: var(--dim); align-items: center; justify-content: center; font: 11px var(--mono); }
+  .badge { margin-left: auto; font: 11px var(--mono); color: var(--dim); border: 1px solid var(--line); border-radius: 999px; padding: 1px 9px; }
+  .badge.on { color: var(--sig); border-color: var(--sig); }
+  .badge.warn { color: var(--warn); border-color: var(--warn); }
+  .badge.err { color: var(--err); border-color: var(--err); }
+  .badge.busy { color: var(--fg); border-color: var(--fg); }
+  .row { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 6px; align-items: center; }
+  button { background: transparent; color: var(--fg); border: 1px solid var(--line2, #2b3d34); border-radius: 6px; padding: 5px 11px; cursor: pointer; font-size: 13px; }
+  button:hover:not(:disabled) { border-color: var(--sig); color: var(--sig); }
+  button:disabled { opacity: .4; cursor: not-allowed; }
+  button.danger { color: var(--warn); }
+  select, input { background: var(--bg); color: var(--fg); border: 1px solid var(--line); border-radius: 6px; padding: 5px 8px; font-size: 13px; }
+  .kv { display: grid; grid-template-columns: 150px 1fr; gap: 2px 10px; font: 12px var(--mono); color: var(--dim); }
+  .kv b { color: var(--fg); font-weight: 500; word-break: break-all; }
+  .note { color: var(--dim); font-size: 11px; line-height: 1.7; }
+  .bar { height: 10px; border: 1px solid var(--line); border-radius: 999px; overflow: hidden; margin: 6px 0; }
+  .bar > div { height: 100%; width: 0; background: var(--sig); transition: width .4s; }
+  pre#log { height: 200px; overflow: auto; margin: 0; padding: 8px; background: var(--bg); border: 1px solid var(--line); border-radius: 8px; font: 11px var(--mono); white-space: pre-wrap; word-break: break-all; color: var(--dim); }
+</style>
+</head>
+<body>
+<header>
+  <span class="brand"><b>DYJ</b><small>WiFi 模块在线升级（旧固件设备专用）</small></span>
+  <a class="hint-link" href="/">← 返回测试台</a>
+</header>
+<main>
+  <div class="step"><h3><span class="no">0</span>说明</h3>
+    <div class="note">
+      本页给<strong>跑着旧 WiFi 固件的设备</strong>在线升级到服务器最新版：设备经路由器（STA）自行从
+      <code>https://dyj2.dev.reai.com/api</code> 拉固件，电脑只需蓝牙可达。<code>OTA_WIFI_*</code> 协议从
+      0.0.1 起未变，所有旧版本都适用；固件内置默认服务器就是 dyj2，通常无需改配置。
+      连路由期间<strong>设备热点会关闭</strong>（快传不可用），升级成功后模块重启、热点恢复。
+    </div>
+  </div>
+
+  <div class="step"><h3><span class="no">1</span>连接设备 <span id="s1" class="badge">未连接</span></h3>
+    <div class="row">
+      <button onclick="doScan()">扫描</button>
+      <select id="devices" style="min-width:220px"><option value="">— 先扫描 —</option></select>
+      <button onclick="doConnect()">连接</button>
+      <button onclick="doDisconnect()">断开</button>
+    </div>
+    <div class="kv">
+      <span>主控版本</span><b id="mainVersion">-</b>
+      <span>WiFi 模块版本</span><b id="wifiVersion">-</b>
+    </div>
+    <div class="note" id="wifiVersionNote"></div>
+  </div>
+
+  <div class="step"><h3><span class="no">2</span>WiFi 模块上电并连路由 <span id="s2" class="badge">待操作</span></h3>
+    <div class="row">
+      <button id="btnOpen" onclick="wifiOpen()">模块上电 WIFI_OPEN</button>
+      <button onclick="wifiStatus()">查状态</button>
+    </div>
+    <div class="row">
+      <input id="ssid" placeholder="路由器 SSID" style="width:170px">
+      <button onclick="wifiScanFill()">扫描周边</button>
+      <input id="password" type="password" placeholder="密码（开放网络可留空）" style="width:180px">
+      <button id="btnConnect" onclick="wifiConnect()">连接 WIFI_CONNECT</button>
+    </div>
+    <div class="kv">
+      <span>WIFI_STATUS</span><b id="wifiStatus">未上电</b>
+    </div>
+    <div class="note">连上路由后模块进入纯 STA，设备热点关闭；升级完成后模块重启，热点自动恢复。</div>
+  </div>
+
+  <div class="step"><h3><span class="no">3</span>OTA 服务器（通常无需改动） <span id="s3" class="badge">默认 dyj2</span></h3>
+    <div class="row"><button onclick="readOtaConfig()">读当前配置</button><button onclick="serverInfo()">查服务器最新版本</button></div>
+    <div class="row">
+      <input id="cfgBase" placeholder="https://dyj2.dev.reai.com/api" style="width:260px" title="wifi_api_base_url">
+      <input id="cfgPath" placeholder="/ota/info?mod=wifi" style="width:180px" title="wifi_ota_info_path">
+      <button class="danger" onclick="writeOtaConfig(false)">写入设备</button>
+      <button class="danger" onclick="writeOtaConfig(true)">恢复固件默认（删除配置）</button>
+    </div>
+    <div class="kv"><span>设备当前配置</span><b id="cfgNow">未读取</b></div>
+    <div class="kv"><span>服务器最新版本</span><b id="serverInfo">未查询</b></div>
+  </div>
+
+  <div class="step"><h3><span class="no">4</span>检查更新 <span id="s4" class="badge">未检查</span></h3>
+    <div class="row"><button onclick="checkUpdate()">检查更新 OTA_WIFI_CHECK</button></div>
+    <div class="kv"><span>结果</span><b id="checkResult">未检查</b></div>
+  </div>
+
+  <div class="step"><h3><span class="no">5</span>升级 <span id="s5" class="badge">待检查</span></h3>
+    <div class="row">
+      <input id="waitSecs" placeholder="上限秒数 900" style="width:110px" title="下载+写 flash 的总时长上限">
+      <button id="btnUpdate" onclick="startUpdate()" disabled>开始升级</button>
+    </div>
+    <div class="bar"><div id="barFill"></div></div>
+    <div class="kv"><span>状态</span><b id="otaState">—</b></div>
+    <div class="note" id="otaHint">升级期间勿断电、勿离开路由器信号范围。失败不会变砖：ESP32 写入失败会留在旧固件并继续运行。</div>
+  </div>
+
+  <div class="step"><h3><span class="no">6</span>日志</h3>
+    <pre id="log"></pre>
+  </div>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+const now = () => new Date().toLocaleTimeString('zh-CN', {hour12: false});
+
+function addLog({level, line}) {
+  const el = $('log');
+  const color = level === 'ERROR' ? 'var(--err)' : level === 'WARN' ? 'var(--warn)' : 'inherit';
+  el.innerHTML += `<span style="color:${color}">${line}</span>\n`;
+  el.scrollTop = el.scrollHeight;
+}
+function badge(id, text, cls) { const el = $(id); el.textContent = text; el.className = 'badge' + (cls ? ' ' + cls : ''); }
+function busy(stepId, text) { badge(stepId, text ?? '执行中…', 'busy'); }
+
+async function api(path, opts = {}) {
+  const init = {method: opts.method || 'GET', headers: {}};
+  if (opts.body !== undefined) { init.headers['Content-Type'] = 'application/json'; init.body = JSON.stringify(opts.body); }
+  try {
+    const resp = await fetch(path, init);
+    const data = await resp.json().catch(() => null);
+    if (!resp.ok) addLog({level: 'ERROR', line: `${now()} ❌ [HTTP] ${path} 请求失败: ${data?.error ?? resp.status}`});
+    return resp.ok ? data : null;
+  } catch (error) {
+    addLog({level: 'ERROR', line: `${now()} ❌ [HTTP] ${path} 网络异常: ${error}`});
+    return null;
+  }
+}
+
+// ---------- SSE：进度 / 模块重启 / 日志 ----------
+const es = new EventSource('/api/stream');
+es.addEventListener('log', e => addLog(JSON.parse(e.data)));
+es.addEventListener('device', e => {
+  const {command, payload} = JSON.parse(e.data);
+  if (command === 'OTA_WIFI_PROCESS') {
+    const pct = payload.percentage ?? 0;
+    $('barFill').style.width = pct + '%';
+    $('otaState').textContent = `${payload.status} ${pct}%（${payload.progress ?? 0}/${payload.total ?? 0} 字节）`;
+    badge('s5', `升级中 ${payload.status} ${pct}%`, 'busy');
+  } else if (command === 'WIFI_AP_START' && updating) {
+    badge('s5', '模块已重启，确认版本…', 'busy');
+    addLog({level: 'INFO', line: `${now()} 🔔 WIFI_AP_START：模块新固件已启动，重新读取版本`});
+    setTimeout(refreshVersions, 4000);
+    updating = false;
+  } else if (command === 'WIFI_OFF') {
+    addLog({level: 'WARN', line: `${now()} 🔔 WIFI_OFF：模块请求断电/重启中`});
+  }
+});
+let updating = false;
+
+// ---------- 1 连接设备 ----------
+async function doScan() {
+  const devices = await api('/api/scan');
+  const sel = $('devices');
+  sel.innerHTML = '';
+  (devices || []).forEach(d => {
+    const opt = document.createElement('option');
+    opt.value = d.id;
+    opt.textContent = `${d.name}（${d.rssi ?? '-'} dBm）`;
+    sel.appendChild(opt);
+  });
+  if (!devices || !devices.length) sel.innerHTML = '<option value="">未发现设备</option>';
+}
+async function doConnect() {
+  const id = $('devices').value;
+  if (!id) return alert('请先扫描并选择设备');
+  busy('s1', '连接中…');
+  const ok = await api('/api/connect', {method: 'POST', body: {id}});
+  if (ok) { badge('s1', '已连接', 'on'); refreshVersions(); }
+  else badge('s1', '连接失败', 'err');
+}
+async function doDisconnect() {
+  await api('/api/disconnect', {method: 'POST', body: {}});
+  badge('s1', '未连接');
+}
+
+async function refreshVersions() {
+  const info = await api('/api/wifi/ota/versions');
+  if (!info) return;
+  $('mainVersion').textContent = `${info.mainVersion} (code ${info.mainVersionCode})`;
+  if (info.wifiVersion || info.wifiVersionCode != null) {
+    $('wifiVersion').textContent = `${info.wifiVersion ?? '?'} (code ${info.wifiVersionCode ?? '?'})`;
+    $('wifiVersionNote').textContent = '';
+  } else {
+    $('wifiVersion').textContent = '未知';
+    $('wifiVersionNote').textContent = '主控固件 < 0.3.5 不上报模块版本（wifiVersion）；模块实际版本以第 4 步检查结果为准。';
+  }
+}
+
+// ---------- 2 联网 ----------
+async function wifiOpen() {
+  busy('s2', '模块上电中…（最长 35s）');
+  $('btnOpen').disabled = true;
+  const data = await api('/api/wifi/open', {method: 'POST', body: {}});
+  $('btnOpen').disabled = false;
+  if (data) { badge('s2', '模块已上电', 'on'); showStatus(data.status); }
+  else badge('s2', '上电失败', 'err');
+}
+async function wifiStatus() {
+  const data = await api('/api/wifi/status');
+  if (data) showStatus(data);
+}
+function showStatus(status) {
+  if (!status) return;
+  $('wifiStatus').textContent = JSON.stringify(status);
+  badge('s2', status.connected ? '已连路由' : status.enabled ? '已上电未连' : '未上电', status.connected ? 'on' : status.enabled ? 'warn' : '');
+}
+async function wifiScanFill() {
+  const networks = await api('/api/wifi/scan');
+  if (!networks || !networks.length) return;
+  const ssid = prompt('发现以下网络：\n' + networks.map(n => n.ssid ?? '?').join('\n') + '\n\n输入要连接的 SSID：');
+  if (ssid) $('ssid').value = ssid;
+}
+async function wifiConnect() {
+  const ssid = $('ssid').value.trim();
+  if (!ssid) return alert('请输入 SSID');
+  if (!confirm(`连接 ${ssid}？设备热点会随之关闭。`)) return;
+  busy('s2', '连接路由中…（最长约 12s）');
+  $('btnConnect').disabled = true;
+  const data = await api('/api/wifi/connect', {method: 'POST', body: {ssid, password: $('password').value}});
+  $('btnConnect').disabled = false;
+  if (data) { badge('s2', '已连路由', 'on'); showStatus(data.status); }
+  else badge('s2', '连接失败', 'err');
+}
+
+// ---------- 3 OTA 服务器 ----------
+async function readOtaConfig() {
+  const cfg = await api('/api/wifi/ota/config');
+  if (!cfg) return;
+  $('cfgNow').textContent = JSON.stringify({apiBaseUrl: cfg.apiBaseUrl, otaInfoPath: cfg.otaInfoPath});
+  $('cfgBase').placeholder = cfg.firmwareDefaults.apiBaseUrl;
+  $('cfgPath').placeholder = cfg.firmwareDefaults.otaInfoPath;
+  badge('s3', cfg.apiBaseUrl == null && cfg.otaInfoPath == null ? '未配置→固件默认(dyj2)' : '已配置(覆盖默认)', cfg.apiBaseUrl == null && cfg.otaInfoPath == null ? 'on' : 'warn');
+}
+async function writeOtaConfig(reset) {
+  if (!reset && !confirm('把输入框中的服务器地址写入设备？仅当设备被改过配置时才需要。')) return;
+  if (reset && !confirm('删除设备上的服务器地址配置，恢复固件内置默认（dyj2）？')) return;
+  busy('s3', '写入中…');
+  const body = reset ? {apiBaseUrl: '', otaInfoPath: ''} : {
+    apiBaseUrl: $('cfgBase').value.trim(),
+    otaInfoPath: $('cfgPath').value.trim(),
+  };
+  const cfg = await api('/api/wifi/ota/config', {method: 'POST', body});
+  if (cfg) { badge('s3', '已写入', 'on'); readOtaConfig(); }
+}
+async function serverInfo() {
+  busy('s3', '查询中…');
+  const base = $('cfgBase').value.trim(), path = $('cfgPath').value.trim();
+  const params = new URLSearchParams();
+  if (base) params.set('base', base);
+  if (path) params.set('path', path);
+  const data = await api('/api/wifi/ota/server?' + params.toString());
+  if (data) $('serverInfo').textContent = `${data.info.version} (code ${data.info.versionCode}) ${data.info.url}`;
+}
+
+// ---------- 4 检查 ----------
+let updateAvailable = false;
+async function checkUpdate() {
+  busy('s4', '检查中…（设备访问服务器，最长约 15s）');
+  const data = await api('/api/wifi/ota/check');
+  if (!data) { badge('s4', '检查失败', 'err'); return; }
+  refreshVersions();
+  if (data.wifiVersion != null || data.wifiVersionCode != null) {
+    $('checkResult').textContent = `设备模块 code ${data.wifiVersionCode ?? '?'}；updateAvailable=${data.updateAvailable}`;
+  } else {
+    $('checkResult').textContent = `设备模块版本未知（旧主控不上报）；updateAvailable=${data.updateAvailable}`;
+  }
+  updateAvailable = !!data.updateAvailable;
+  $('btnUpdate').disabled = !updateAvailable;
+  badge('s4', data.updateAvailable ? '有更新，可升级' : '已是最新', data.updateAvailable ? 'warn' : 'on');
+  badge('s5', data.updateAvailable ? '可升级' : '无需升级', data.updateAvailable ? 'warn' : 'on');
+}
+
+// ---------- 5 升级 ----------
+async function startUpdate() {
+  if (!confirm('开始升级 WiFi 模块固件？期间勿断电，全程约 1–5 分钟（取决于路由器速度）。')) return;
+  updating = true;
+  busy('s5', '升级中…（进度见下方，每 5% 一条）');
+  $('btnUpdate').disabled = true;
+  $('otaState').textContent = '检查并发起升级…';
+  const wait = parseInt($('waitSecs').value, 10) || 900;
+  const data = await api('/api/wifi/ota/update', {method: 'POST', body: {waitSecs: wait}});
+  $('btnUpdate').disabled = false;
+  if (!data) { badge('s5', '升级失败（连接中断？）', 'err'); $('otaState').textContent = '—'; updating = false; return; }
+  if (data.outcome === 'upToDate') {
+    badge('s5', '已是最新', 'on');
+    $('otaState').textContent = '设备已是最新，未发起升级';
+    updating = false;
+    return;
+  }
+  const p = data.progress;
+  if (p.status === 'SUCCESS') {
+    $('barFill').style.width = '100%';
+    badge('s5', '下载完成，等待模块重启', 'on');
+    $('otaState').textContent = `${p.status} ${p.percentage}%。${data.hint}`;
+    addLog({level: 'INFO', line: `${now()} ✅ 固件下载并写入成功，等待 ESP32 重启（若 2 分钟内无 WIFI_AP_START，请重新上电设备）`});
+  } else {
+    badge('s5', `失败 ${p.status}`, 'err');
+    $('otaState').textContent = `${p.status}：${data.hint}`;
+    addLog({level: 'ERROR', line: `${now()} ❌ WiFi OTA ${p.status}：${data.hint}`});
+    updating = false;
+  }
+}
+
+// 初始化：若测试台已连接设备，直接刷新版本
+setTimeout(() => { if (true) refreshVersions(); }, 500);
+</script>
+</body>
+</html>

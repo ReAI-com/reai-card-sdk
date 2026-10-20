@@ -27,7 +27,7 @@ use crate::{
     types::{
         AccessPointInfo, BatteryInfo, CommandResponse, DeviceEvent, DeviceInfo, DeviceState,
         FileEntry, LedState, ModuleCheck, OtaProgress, PowerEvent, RecordMark, RecordStatus,
-        StorageInfo, TakenFile, WifiNetwork, WifiOtaCheck, WifiStatus,
+        StorageInfo, TakenFile, WifiNetwork, WifiOnlineOtaOutcome, WifiOtaCheck, WifiStatus,
     },
 };
 
@@ -673,6 +673,23 @@ impl DyjDevice {
         self.require_wifi_module("OTA_WIFI_UPDATE").await?;
         self.request_success("OTA_WIFI_UPDATE", None, NORMAL_TIMEOUT)
             .await
+    }
+
+    /// 在线升级 WiFi 模块固件的一步封装：先 `check_wifi_ota`，有更新再
+    /// [`Self::update_wifi_firmware`]（固件要求两者在同一上电周期内先后执行）。
+    /// 无更新返回 [`WifiOnlineOtaOutcome::UpToDate`]，否则返回终态进度。
+    pub async fn check_and_update_wifi_firmware(
+        &self,
+        wait: Duration,
+    ) -> Result<WifiOnlineOtaOutcome> {
+        let check = self.check_wifi_ota().await?;
+        if !check.update_available {
+            tracing::info!(target: "dyj.ota", "✅ WiFi 模块已是最新，未发起升级");
+            return Ok(WifiOnlineOtaOutcome::UpToDate);
+        }
+        Ok(WifiOnlineOtaOutcome::Finished(
+            self.update_wifi_firmware(wait).await?,
+        ))
     }
 
     /// 发起 WiFi 模块 OTA 并跟进到终态（`Success` / `Failed`），返回最后一条进度。

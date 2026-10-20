@@ -320,6 +320,15 @@ pub struct WifiOtaCheck {
     pub update_available: bool,
 }
 
+/// [`crate::DyjDevice::check_and_update_wifi_firmware`] 的结果。
+#[derive(Debug, Clone)]
+pub enum WifiOnlineOtaOutcome {
+    /// 设备已是最新（服务器 versionCode 不高于设备），未发起升级。
+    UpToDate,
+    /// 升级已走到终态：`Success` 后 ESP32 自行重启进新固件。
+    Finished(OtaProgress),
+}
+
 /// WiFi 模块 OTA 状态机（`OTA_WIFI_STATUS` 响应与 `OTA_WIFI_PROCESS` 推送共用）。
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize, Serialize, Default)]
 #[serde(from = "String", into = "String")]

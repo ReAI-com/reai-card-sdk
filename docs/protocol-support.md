@@ -163,7 +163,22 @@ Known platform caveat: entering the bootloader via `GPREGRET` keeps the BLE addr
 
 ### OTA info API
 
-The product API server publishes `GET <api_base>/api/ota/info?mod=main` and `?mod=wifi` (no auth) → `{"version":"0.3.7","versionCode":307,"url":"https://…/app_update_v307.zip"}`. `OtaInfo::fetch` / `download` wrap the two HTTP calls and `is_newer_than(installed_version_code)` compares **only** `versionCode` (the `url` file name may lag behind `version`). For the main controller the comparison is the host's job (`BASE_INFO.versionCode`); for the WiFi module the ESP32 compares on its own during `OTA_WIFI_CHECK`, so hosts only need `OtaInfo` for the AP-mode path or for display.
+The product OTA service (`https://dyj2.dev.reai.com`, static nginx, live since 2026-10) publishes `GET {api_base}/ota/info?mod=main|wifi` (no auth) → `{"version":"…","versionCode":N,"url":"https://…"}`; a missing/invalid `mod` answers 400. `api_base` is exactly the device KV value `wifi_api_base_url` — every WiFi firmware build ships with `OTA_DEFAULT_API_BASE_URL = "https://dyj2.dev.reai.com/api"` and `OTA_DEFAULT_INFO_PATH = "/ota/info?mod=wifi"`, so old devices find the service without any configuration. `OtaInfo::fetch_with_path(base, path)` / `fetch(base, module)` mirror the firmware's URL building, `download` fetches `url`, and `is_newer_than(installed_version_code)` compares **only** `versionCode` (the `url` file name may lag behind `version`). For the main controller the comparison is the host's job (`BASE_INFO.versionCode`); for the WiFi module the ESP32 compares on its own during `OTA_WIFI_CHECK`, so hosts call `OtaInfo` only for display or the AP-mode comparison.
+
+### WiFi online OTA compatibility (old firmware → 0.0.9)
+
+Verified against the repository history (commit-level):
+
+| Concern | Since | Note |
+| --- | --- | --- |
+| `OTA_WIFI_CHECK/UPDATE/STATUS` + `OTA_WIFI_PROCESS` | WiFi 0.0.1 | Response formats are byte-identical through 0.0.9; `updateAvailable = server versionCode > local` (strict). `startUpdate` requires a successful CHECK in the same power cycle. |
+| `wifi_api_base_url` runtime override | WiFi 0.0.1 (key `wifi_api_base_url` since 0.0.3-era) | Arbitrary `CONFIG_SET` keys are stored; defaults always pointed at `dyj2.dev.reai.com/api` — the old `hdd.dev.reai.com` domain only ever existed in docs and the legacy Android app. |
+| nRF passthrough of `OTA_WIFI_*` and `wifi_*` config | main v0.1.5 (2025-08) | Every shipped main firmware qualifies. |
+| AP-mode local upload (`/api/ota/upload`) | WiFi 0.0.4 (2026-03) | Older devices can only be upgraded online — which is the point of the dedicated flow. |
+| `BASE_INFO.wifiVersion/wifiVersionCode` | main v0.3.5 | Older mains omit it; treat "unknown module version" as normal and let `OTA_WIFI_CHECK` decide. |
+| Partition table | — | Not recorded for field devices. The 0.0.9 app-only bin is 1,297,616 bytes; a default 1.25 MB slot leaves ~13 KB, a single-slot (huge_app) table cannot OTA at all → `FAILED`, device keeps running; USB re-flash recovers. |
+
+`DyjDevice::check_and_update_wifi_firmware(wait)` wraps CHECK → UPDATE for this flow and returns `WifiOnlineOtaOutcome::{UpToDate, Finished(OtaProgress)}`; progress arrives as `OTA_WIFI_PROCESS` events (every 5 %).
 
 ## Events
 

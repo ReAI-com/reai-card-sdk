@@ -269,7 +269,7 @@ async fn prepare_ap(device: &DyjDevice) -> reai_card_sdk::Result<()> {
 | --- | --- | --- |
 | **主控 nRF52840** | `OTA` 命令让设备重启进 Nordic Secure Bootloader（广播 `DFU_DYJ`），SDK 内置 Secure DFU 客户端把 nrfutil `.zip` 包推过去 | 一个 `.zip` 包；版本号不低于已装版本（防降级，等版本可重刷） |
 | **WiFi 模块 ESP32**（热点本地） | 连上设备热点后 `POST /api/ota/upload` 上传 `.bin`，ESP32 写完 3 秒自重启 | 电脑连 `DYJ-HD-AP`；一个 `.bin` |
-| WiFi 模块（在线） | `check_wifi_ota()` → `update_wifi_firmware()`，设备自己从服务器下载 | STA 已连 + `wifi_api_base_url` 服务（见[已知限制](#已知限制与路线图)） |
+| WiFi 模块（在线，**旧固件设备的主路径**） | `check_and_update_wifi_firmware()`，设备自己经路由器从 OTA 服务下载 | STA 已连路由（固件内置默认服务器 `OTA_DEFAULT_API_BASE_URL`，无需配置） |
 
 ```rust,no_run
 use std::time::Duration;
@@ -278,7 +278,7 @@ use reai_card_sdk::{DeviceManager, DfuOptions, DfuPackage, DyjDevice, OtaInfo, O
 async fn upgrade_main(manager: &DeviceManager, device: &DyjDevice) -> reai_card_sdk::Result<()> {
     // 要不要升级由你决定：服务器版本 vs BASE_INFO.versionCode
     let installed = device.device_info().await?.version_code;
-    let latest = OtaInfo::fetch("https://hdd.dev.reai.com", OtaModule::Main).await?;
+    let latest = OtaInfo::fetch(reai_card_sdk::OTA_DEFAULT_API_BASE_URL, OtaModule::Main).await?;
     if !latest.is_newer_than(installed) {
         return Ok(());
     }
@@ -290,6 +290,20 @@ async fn upgrade_main(manager: &DeviceManager, device: &DyjDevice) -> reai_card_
         })
         .await?;
     println!("{} 字节，{:.0}s", report.firmware_bytes, report.elapsed.as_secs_f64());
+    Ok(())
+}
+
+async fn upgrade_wifi_online(device: &DyjDevice) -> reai_card_sdk::Result<()> {
+    // 1. 让模块连上路由（会把热点关掉）；旧固件内置服务器就是 dyj2，无需改配置
+    device.open_wifi().await?;
+    device.connect_wifi("路由器 SSID", "密码").await?;
+    // 2. 检查 → 有更新则升级到终态（固件要求 CHECK/UPDATE 在同一上电周期内先后执行）
+    match device.check_and_update_wifi_firmware(Duration::from_secs(900)).await? {
+        reai_card_sdk::WifiOnlineOtaOutcome::UpToDate => println!("已是最新"),
+        reai_card_sdk::WifiOnlineOtaOutcome::Finished(progress) => {
+            println!("{} {}%", progress.status, progress.percentage); // SUCCESS 后 ESP32 自重启
+        }
+    }
     Ok(())
 }
 
@@ -305,6 +319,7 @@ async fn upgrade_wifi_locally(device: &DyjDevice, firmware: Vec<u8>) -> reai_car
 - `DfuOptions::default()` 走 20 字节包 + 每 4 包一次回执（bootloader 只有 8 个接收缓冲，macOS 会把排队的写一次塞进同一个连接事件，真机实测 10 包一批会丢一半），约 35–65 秒传完 170 KB；丢掉尾部包时 SDK 从 bootloader 的偏移续写而不是重建对象。`DfuReport::rewinds` 为 0 时可以把 `prn` 调大、确认链路 MTU 后把 `packet_size` 调到 244 提速。
 - 升级失败不会变砖：bootloader 校验不过保留旧应用；ESP32 写入失败留在旧分区。
 - `DfuPackage` 只接受应用镜像包；SoftDevice / bootloader 组合包不支持。
+- **给旧 WiFi 固件设备在线升级**：`OTA_WIFI_CHECK/UPDATE/PROCESS` 协议从 0.0.1 到 0.0.9 完全一致，所有旧版本都可用；固件内置默认服务器自始就是 `https://dyj2.dev.reai.com/api`（`OTA_DEFAULT_API_BASE_URL`），无需配置。注意：连路由会把热点关掉（STA 与 AP 互斥）；`BASE_INFO.wifiVersion` 需要主控 ≥ 0.3.5 才上报；个别出厂分区表放不下新固件时会升级失败，需 USB 重刷。
 
 ## 错误速查
 
@@ -334,7 +349,7 @@ make cli ARGS=events                    # 挂机打印事件（按按键、拨�
 make web                                # 网页控制台 http://127.0.0.1:8787
 ```
 
-网页控制台包含：连接管理、状态卡片、全部命令按钮、**实时录音波形面板**（通道常开，数据驱动）、BLE 文件表格、**热点快传一键检查**（上电 → 探测是否已连热点 → 列出 AP 文件并逐行下载）、下载后自动转 WAV、**按键 / 开关绑定表**（读 / 绑定 / 解绑 / 预设）、SSE 实时日志与设备事件。仅绑定 `127.0.0.1`、无鉴权，请勿暴露到局域网。
+网页控制台包含：连接管理、状态卡片、全部命令按钮、**实时录音波形面板**（通道常开，数据驱动）、BLE 文件表格、**热点快传一键检查**（上电 → 探测是否已连热点 → 列出 AP 文件并逐行下载）、下载后自动转 WAV、**按键 / 开关绑定表**（读 / 绑定 / 解绑 / 预设）、SSE 实时日志与设备事件。 另有 **WiFi 在线升级专页** `http://127.0.0.1:8787/wifi-ota`（右上角入口）：给旧 WiFi 固件设备做"连设备 → 连路由 → 检查 → 升级 → 重启确认"的向导，进度条由 `OTA_WIFI_PROCESS` 事件驱动。仅绑定 `127.0.0.1`、无鉴权，请勿暴露到局域网。
 
 ## 已知限制与路线图
 

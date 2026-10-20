@@ -1,8 +1,13 @@
-//! OTA 版本信息接口（`GET <api_base>/api/ota/info?mod=main|wifi`）。
+//! OTA 版本信息接口。
 //!
-//! 产品 API 服务器用同一个接口发布两个模块的最新固件：主控（nRF52840）的版本比较
-//! 由**上位机**负责——设备端不检查，拿到 `.zip` 后用 [`crate::dfu`] 推送；WiFi 模块
-//! 的比较由 ESP32 自己完成（`DyjDevice::check_wifi_ota`），上位机不需要调这里。
+//! 产品 OTA 服务（`https://dyj2.dev.reai.com`，nginx 静态托管）用
+//! `{api_base}/ota/info?mod=main|wifi` 发布两个模块的最新固件，`api_base` 就是设备
+//! KV 里的 `wifi_api_base_url`（所有固件版本内置默认即 [`OTA_DEFAULT_API_BASE_URL`]，
+//! 拼上 [`OTA_DEFAULT_INFO_PATH`] 即设备实际请求的地址）。
+//!
+//! 主控（nRF52840）的版本比较由**上位机**负责——设备端不检查，拿到 `.zip` 后用
+//! [`crate::dfu`] 推送；WiFi 模块的比较由 ESP32 自己完成
+//! （`DyjDevice::check_wifi_ota`），上位机调这里只是为了展示服务器侧版本。
 //! 本模块只提供类型与两次 HTTP 调用，"要不要升级、何时提示"由应用决定。
 
 use std::time::Duration;
@@ -10,6 +15,11 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::{Result, SdkError};
+
+/// 所有 WiFi 固件版本内置的 `wifi_api_base_url` 默认值（dyj2 OTA 服务，nginx 静态托管）。
+pub const OTA_DEFAULT_API_BASE_URL: &str = "https://dyj2.dev.reai.com/api";
+/// 固件内置的 `wifi_ota_info_path` 默认值，拼在 API base 之后。
+pub const OTA_DEFAULT_INFO_PATH: &str = "/ota/info?mod=wifi";
 
 /// `mod` 查询参数：主控或 WiFi 模块。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -47,12 +57,17 @@ pub struct OtaInfo {
 }
 
 impl OtaInfo {
-    /// 拉取 `<api_base_url>/api/ota/info?mod=<module>`（接口无鉴权）。
-    pub async fn fetch(api_base_url: &str, module: OtaModule) -> Result<Self> {
+    /// 拉取 `{api_base_url}{info_path}`（默认 `/ota/info?mod=<module>`，与固件
+    /// `buildUrl` 的拼接方式一致；接口无鉴权）。
+    pub async fn fetch_with_path(api_base_url: &str, info_path: &str) -> Result<Self> {
         let url = format!(
-            "{}/api/ota/info?mod={}",
+            "{}{}",
             api_base_url.trim_end_matches('/'),
-            module.query_value()
+            if info_path.starts_with('/') {
+                info_path.to_owned()
+            } else {
+                format!("/{info_path}")
+            }
         );
         reqwest::Url::parse(&url)
             .map_err(|error| SdkError::InvalidCommand(format!("invalid API base URL: {error}")))?;
@@ -64,8 +79,17 @@ impl OtaInfo {
             .error_for_status()?
             .json()
             .await?;
-        tracing::info!(target: "dyj.ota", "🌐 {module} 最新 {} (code {}) {}", info.version, info.version_code, info.url);
+        tracing::info!(target: "dyj.ota", "🌐 服务器最新 {} (code {}) {}", info.version, info.version_code, info.url);
         Ok(info)
+    }
+
+    /// 按固件默认路径拉取 `{api_base_url}/ota/info?mod=<module>`。
+    pub async fn fetch(api_base_url: &str, module: OtaModule) -> Result<Self> {
+        Self::fetch_with_path(
+            api_base_url,
+            &format!("/ota/info?mod={}", module.query_value()),
+        )
+        .await
     }
 
     /// 服务器版本是否比设备上装的新（只比较 `versionCode`）。
@@ -132,7 +156,7 @@ mod tests {
             "application/json",
             br#"{"version":"0.3.7","versionCode":307,"url":"https://cdn.example.com/app_update_v307.zip"}"#.to_vec(),
         );
-        let info = OtaInfo::fetch(&format!("http://127.0.0.1:{port}/"), OtaModule::Main)
+        let info = OtaInfo::fetch(&format!("http://127.0.0.1:{port}/api"), OtaModule::Main)
             .await
             .unwrap();
         assert_eq!(info.version, "0.3.7");
@@ -154,6 +178,22 @@ mod tests {
             url: format!("http://127.0.0.1:{port}/fw/wifi_0.0.9.bin"),
         };
         assert_eq!(info.download().await.unwrap(), vec![0xE9, 1, 2, 3]);
+    }
+
+    #[tokio::test]
+    async fn custom_info_path_follows_the_device_config() {
+        let port = serve_once(
+            "GET /api/v2/ota/wifi.json HTTP/1.1",
+            "application/json",
+            br#"{"version":"0.0.9","versionCode":9,"url":"https://dyj2.dev.reai.com/ota/fw_wifi/esp32c3wifi.ino.bin"}"#.to_vec(),
+        );
+        let info =
+            OtaInfo::fetch_with_path(&format!("http://127.0.0.1:{port}/api"), "/v2/ota/wifi.json")
+                .await
+                .unwrap();
+        assert_eq!(info.version_code, 9);
+        assert_eq!(OTA_DEFAULT_API_BASE_URL, "https://dyj2.dev.reai.com/api");
+        assert_eq!(OTA_DEFAULT_INFO_PATH, "/ota/info?mod=wifi");
     }
 
     #[test]
