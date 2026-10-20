@@ -292,6 +292,7 @@ make web                                # 网页控制台 http://127.0.0.1:8787
 
 - **Windows 未验证**：btleplug 支持 Windows，但本 SDK 未在 Windows 上跑过真机。
 - **云上传（STA 模式上传到服务器）暂未启用**：`upload_file_via_sta` 等 API 已实现，但需要 STA 模式 + 接收服务器，当前固件默认热点模式，后续版本再启用。
+- **WiFi 模块 OTA 与云上传同源**：`check_wifi_ota` / `start_wifi_ota` 要求 STA 已连接，且从 `wifi_api_base_url` + `wifi_ota_info_path`（默认 `/ota/info?mod=wifi`）拉取 `{version, versionCode, url}`；没有该服务时无法真机验证，API 已实现、与云上传一并延后。主控 `enter_dfu_mode()` 不依赖服务器，但固件包传输本身不在 SDK 范围。
 - **AP_\* 透传**：当前固件 v0.3.x 不透传 `AP_START/AP_STOP/AP_STATUS`，相关 API 保留给未来固件。
 - **BLE 取走大文件**：固件以 200 B/25 ms 发送，MB 级文件请走热点快传。
 - **crates.io**：暂以 git tag 方式分发，发布到 crates.io 待定。
@@ -307,6 +308,17 @@ make web                                # 网页控制台 http://127.0.0.1:8787
 make verify      # fmt --check + check + test + clippy -D warnings（CI 同款）
 make test
 ```
+
+### 设计原则
+
+给 SDK 加能力前先分清"这是设备事实还是业务策略"：
+
+1. **只透出设备事实，不做业务策略。** 事件类型化传出、配置类型化透传、协议编排（串行化、预检、就绪等待）都属于 SDK；"按键该绑什么动作""录音该不该自动开始"这类决策归调用方，SDK 不预设默认值，文档只给示例不给推荐。
+2. **固件偏离协议时在 SDK 兼容，不改固件。** 同时接受现状形态与修正后的形态，映射成同一个事件/结果；偏离本身与固件侧修法记入 `docs/protocol-support.md`。
+3. **快速失败优于等超时。** 能从 `STATE_INFO` 等本地事实预判必然失败的调用（模块未上电、SD 卡不在本侧），直接返回结构化错误并说明该先做什么。
+4. **固件不认识的值不丢。** 枚举带 `Other(String)` 兜底，认得命令但解析不了的事件走 `Unhandled`，让调用方自己决定。
+
+### 约定
 
 - 改动涉及协议行为时请同步更新 [docs/protocol-support.md](docs/protocol-support.md)，并在 [CHANGELOG.md](CHANGELOG.md) 记录。
 - 单测用 mock 传输覆盖协议层；真机相关结论请在 PR 里注明固件版本。
