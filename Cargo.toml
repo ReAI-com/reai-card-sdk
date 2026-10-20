@@ -1,0 +1,33 @@
+[package]
+name = "reai-card-sdk"
+version = "0.0.2"
+edition = "2024"
+rust-version = "1.93"
+description = "Async Rust SDK for ReAI recorder cards (DYJ): BLE control, realtime ADPCM audio, AP fast transfer"
+license = "MIT"
+repository = "https://github.com/ReAI-com/reai-card-sdk"
+readme = "README.md"
+keywords = ["ble", "bluetooth", "recorder", "adpcm", "sdk"]
+categories = ["hardware-support", "api-bindings"]
+
+[features]
+default = ["btleplug"]
+btleplug = []
+
+[dependencies]
+async-trait = "0.1"
+btleplug = "0.12"
+chrono = "0.4"
+futures = "0.3"
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt", "sync", "time", "io-util", "fs"] }
+tracing = "0.1"
+uuid = "1"
+
+[dev-dependencies]
+axum = { version = "0.8", features = ["ws"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "io-util", "fs", "test-util"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "registry"] }

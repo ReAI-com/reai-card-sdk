@@ -1,0 +1,836 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DYJ 设备测试台</title>
+<style>
+  /* ============ 仪器台主题：暗色基底 + 工程网格 + 磷光绿信号色 ============ */
+  :root {
+    --bg:#0a0d11; --panel:#10141a; --panel2:#141922; --line:#202836; --line2:#2b3547;
+    --fg:#d7dee9; --dim:#7b8699; --faint:#525c6e;
+    --sig:#3ddc97; --sig-ink:#06251a; --sig-dim:rgba(61,220,151,.12);
+    --warn:#ffb454; --err:#ff5c6e; --info:#5da9ff;
+    --mono:ui-monospace,"SF Mono","Cascadia Mono",Menlo,Consolas,"Liberation Mono",monospace;
+    --sans:"PingFang SC","Hiragino Sans GB","Microsoft YaHei",system-ui,sans-serif;
+  }
+  * { box-sizing:border-box; }
+  ::selection { background:var(--sig-dim); }
+  ::-webkit-scrollbar { width:10px; height:10px; }
+  ::-webkit-scrollbar-thumb { background:#232d3c; border-radius:6px; border:2px solid var(--bg); }
+  ::-webkit-scrollbar-track { background:transparent; }
+
+  body {
+    margin:0; font:14px/1.55 var(--sans); color:var(--fg); min-height:100vh;
+    background:
+      radial-gradient(1100px 480px at 72% -8%, rgba(61,220,151,.055), transparent 62%),
+      linear-gradient(rgba(125,150,180,.042) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(125,150,180,.042) 1px, transparent 1px),
+      var(--bg);
+    background-size:auto, 30px 30px, 30px 30px, auto;
+    background-attachment:fixed;
+  }
+  /* 极淡扫描线，CRT 质感 */
+  body::after {
+    content:""; position:fixed; inset:0; pointer-events:none; z-index:99;
+    background:repeating-linear-gradient(0deg, rgba(255,255,255,.013) 0 1px, transparent 1px 3px);
+  }
+
+  @keyframes pulse { 50% { opacity:.45; } }
+  @keyframes rise { from { opacity:0; transform:translateY(9px); } }
+  @keyframes slidein { from { opacity:0; transform:translateX(-5px); } }
+  @keyframes spin { to { transform:rotate(360deg); } }
+  .spin { display:inline-block; animation:spin 1s linear infinite; }
+
+  /* ============ 顶栏 ============ */
+  header {
+    position:sticky; top:0; z-index:10; display:flex; align-items:center; gap:10px;
+    padding:11px 20px; border-bottom:1px solid var(--line);
+    background:rgba(10,13,17,.85); backdrop-filter:blur(10px);
+  }
+  .brand { display:flex; align-items:center; gap:10px; margin-right:12px; user-select:none; }
+  .led { width:9px; height:9px; border-radius:50%; background:var(--sig);
+         box-shadow:0 0 9px rgba(61,220,151,.85); animation:pulse 2.6s ease-in-out infinite; }
+  .brand b { font:700 15px/1 var(--mono); letter-spacing:.14em; }
+  .brand small { color:var(--dim); font-size:12px; letter-spacing:.05em; }
+  .hint { margin-left:auto; color:var(--faint); font:11px var(--mono); letter-spacing:.06em; }
+
+  /* ============ 控件 ============ */
+  button {
+    font:500 12.5px var(--sans); color:var(--fg); background:var(--panel2);
+    border:1px solid var(--line2); border-radius:6px; padding:6px 12px; cursor:pointer;
+    transition:border-color .15s, color .15s, background .15s, transform .06s;
+  }
+  button:hover { border-color:rgba(61,220,151,.55); color:var(--sig); }
+  button:active { transform:translateY(1px); }
+  button.primary { background:var(--sig); border-color:var(--sig); color:var(--sig-ink); font-weight:600; }
+  button.primary:hover { filter:brightness(1.08); color:var(--sig-ink); }
+  button.dim { background:transparent; color:var(--dim); }
+  button.dim:hover { color:var(--fg); border-color:var(--line2); }
+  button.danger { background:rgba(255,92,110,.1); border-color:rgba(255,92,110,.4); color:var(--err); }
+  button.danger:hover { background:rgba(255,92,110,.2); border-color:var(--err); color:var(--err); }
+  button:disabled { opacity:.4; cursor:not-allowed; }
+
+  select, input[type="text"], input:not([type]) {
+    background:#0c1015; color:var(--fg); border:1px solid var(--line2);
+    border-radius:6px; padding:6px 10px; font:13px var(--mono);
+  }
+  select:focus, input:focus { outline:1px solid rgba(61,220,151,.55); outline-offset:1px; }
+  input { width:132px; }
+  input[type="checkbox"] { width:14px; height:14px; accent-color:var(--sig); margin:0; }
+
+  .badge {
+    display:inline-flex; align-items:center; gap:7px; padding:4px 12px;
+    border-radius:99px; font:500 12px var(--mono); border:1px solid transparent; white-space:nowrap;
+  }
+  .badge::before { content:""; width:7px; height:7px; border-radius:50%; background:currentColor; flex:none; }
+  .badge.on   { color:var(--sig);  background:var(--sig-dim);           border-color:rgba(61,220,151,.35); }
+  .badge.off  { color:#98a3b5;     background:rgba(152,163,181,.07);    border-color:rgba(152,163,181,.25); }
+  .badge.busy { color:var(--warn); background:rgba(255,180,84,.09);     border-color:rgba(255,180,84,.35); }
+  .badge.busy::before { animation:pulse 1s infinite; }
+
+  /* ============ 布局 ============ */
+  main { display:grid; grid-template-columns:256px minmax(0,1fr); gap:16px;
+         max-width:1760px; margin:0 auto; padding:16px 20px 44px; }
+
+  #nav { display:flex; flex-direction:column; gap:12px; position:sticky; top:66px;
+         max-height:calc(100vh - 82px); overflow:auto; padding-right:2px; }
+  .group { background:var(--panel); border:1px solid var(--line); border-radius:10px;
+           padding:10px 12px; animation:rise .45s cubic-bezier(.2,.7,.3,1) backwards; }
+  .group:nth-child(1) { animation-delay:.03s } .group:nth-child(2) { animation-delay:.06s }
+  .group:nth-child(3) { animation-delay:.09s } .group:nth-child(4) { animation-delay:.12s }
+  .group:nth-child(5) { animation-delay:.15s } .group:nth-child(6) { animation-delay:.18s }
+  .group:nth-child(7) { animation-delay:.21s } .group:nth-child(8) { animation-delay:.24s }
+  .group:nth-child(9) { animation-delay:.27s }
+  .group h3 { margin:0 0 8px; font:600 11px var(--mono); letter-spacing:.16em; color:var(--faint);
+              display:flex; align-items:center; gap:8px; }
+  .group h3::before { content:""; width:5px; height:5px; background:var(--sig); border-radius:1px; flex:none; }
+  .group h3 .no { color:var(--sig); opacity:.65; }
+  .group .row { display:flex; flex-wrap:wrap; gap:6px; margin-bottom:6px; }
+  .group .row:last-child { margin-bottom:0; }
+
+  /* ============ 仪表卡片 ============ */
+  .cards { display:grid; grid-template-columns:repeat(auto-fit, minmax(150px, 1fr));
+           gap:10px; margin-bottom:14px; }
+  .card { position:relative; background:var(--panel); border:1px solid var(--line);
+          border-radius:10px; padding:12px 14px; }
+  .card::before, .card::after { content:""; position:absolute; width:9px; height:9px;
+                                pointer-events:none; opacity:.55; }
+  .card::before { top:-1px; left:-1px; border-top:2px solid var(--sig);
+                  border-left:2px solid var(--sig); border-top-left-radius:10px; }
+  .card::after { bottom:-1px; right:-1px; border-bottom:2px solid var(--sig);
+                 border-right:2px solid var(--sig); border-bottom-right-radius:10px; }
+  .card .k { color:var(--faint); font:500 10.5px var(--mono); letter-spacing:.14em; margin-bottom:4px; }
+  .card .v { font:600 17px var(--mono); letter-spacing:.02em; }
+
+  /* ============ 面板 ============ */
+  section > * { animation:rise .45s cubic-bezier(.2,.7,.3,1) backwards; }
+  section > *:nth-child(1) { animation-delay:.05s } section > *:nth-child(2) { animation-delay:.09s }
+  section > *:nth-child(3) { animation-delay:.13s } section > *:nth-child(4) { animation-delay:.17s }
+  section > *:nth-child(5) { animation-delay:.21s } section > *:nth-child(6) { animation-delay:.25s }
+  .panel { background:var(--panel); border:1px solid var(--line); border-radius:10px;
+           margin-bottom:14px; overflow:hidden; }
+  .panel > h3 { margin:0; padding:9px 14px; font:600 12.5px var(--sans); color:var(--dim);
+                border-bottom:1px solid var(--line); background:var(--panel2);
+                display:flex; align-items:center; gap:8px; }
+  .panel > h3::before { content:""; width:6px; height:6px; border-radius:50%;
+                        background:var(--sig); box-shadow:0 0 6px rgba(61,220,151,.55); flex:none; }
+  .panel .body { padding:10px 14px; overflow:auto; }
+
+  #resultOut { margin:0; white-space:pre-wrap; word-break:break-all; max-height:220px;
+               font:12px/1.65 var(--mono); color:#b9c4d4; }
+
+  /* 实时录音波形 */
+  #waveCanvas { background:#0b0f14; border:1px solid var(--line); border-radius:8px;
+                width:100%; height:220px; display:block; }
+  .stats { display:flex; flex-wrap:wrap; gap:6px 20px; margin-top:8px;
+           font:11.5px var(--mono); color:var(--dim); }
+  .stats b { color:var(--sig); font-weight:600; }
+  .stats .gap { color:var(--warn); }
+
+  table { border-collapse:collapse; width:100%; font:12.5px var(--mono); }
+  th { color:var(--faint); font-weight:500; text-align:left; padding:6px 10px;
+       border-bottom:1px solid var(--line2); font-size:11px; letter-spacing:.1em; }
+  td { padding:6px 10px; border-bottom:1px solid var(--line); }
+  table tr:hover td { background:rgba(125,150,180,.045); }
+  td button { padding:3px 9px; font-size:11.5px; margin-right:4px; }
+
+  #eventList { max-height:180px; }
+  .evt { padding:5px 0 5px 10px; border-bottom:1px dashed var(--line);
+         border-left:2px solid transparent; font:12px var(--mono);
+         animation:slidein .25s ease; }
+  .evt:hover { border-left-color:var(--sig); }
+  .evt .cmd { color:var(--sig); }
+
+  #logList { max-height:320px; font:11.5px/1.8 var(--mono); }
+  #logList.paused { overflow:hidden; }
+  .log-line { white-space:pre-wrap; word-break:break-all; padding:1px 0 1px 10px;
+              border-left:2px solid transparent; animation:slidein .18s ease; }
+  .lv-ERROR { color:var(--err); border-left-color:rgba(255,92,110,.55); }
+  .lv-WARN  { color:var(--warn); border-left-color:rgba(255,180,84,.5); }
+  .lv-INFO  { color:#aeb9c9; }
+  .lv-DEBUG { color:var(--dim); }
+  .lv-TRACE { color:var(--faint); }
+
+  .toolbar { display:flex; align-items:center; flex-wrap:wrap; gap:4px 14px;
+             padding:7px 14px; border-bottom:1px solid var(--line); background:var(--panel2); }
+  .toolbar label { display:inline-flex; align-items:center; gap:5px; font-size:12px;
+                   color:var(--dim); cursor:pointer; white-space:nowrap; }
+  .toolbar label:hover { color:var(--fg); }
+  .toolbar .pause { margin-left:auto; color:var(--fg); }
+
+  @media (max-width:900px) {
+    main { grid-template-columns:1fr; }
+    #nav { position:static; max-height:none; }
+    .hint { display:none; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <span class="brand"><span class="led"></span><b>DYJ</b><small>录音设备 · 测试台</small></span>
+  <button class="primary" onclick="doScan()">🔍 扫描</button>
+  <select id="devices" style="min-width:230px"><option value="">— 先扫描 —</option></select>
+  <button class="primary" onclick="doConnect()">🔗 连接</button>
+  <button class="dim" onclick="doDisconnect()">🔌 断开</button>
+  <span id="connState" class="badge off">未连接</span>
+  <span class="hint">NUS 6E400001 · SSE 实时推送 · 仅本机访问</span>
+</header>
+
+<main>
+  <nav id="nav">
+    <div class="group"><h3><span class="no">01</span>信息</h3>
+      <div class="row">
+        <button onclick="cmd('BASE_INFO')">设备信息</button>
+        <button onclick="cmd('STATE_INFO')">状态</button>
+        <button onclick="cmd('BATTERY')">电池</button>
+        <button onclick="cmd('STORAGE')">存储</button>
+      </div>
+    </div>
+    <div class="group"><h3><span class="no">02</span>录音</h3>
+      <div class="row">
+        <button onclick="cmd('RECORD_START')">开始</button>
+        <button onclick="cmd('RECORD_STOP')">停止</button>
+        <button onclick="cmd('RECORD')">切换</button>
+        <button onclick="cmd('RECORD_STATUS')">状态</button>
+        <button onclick="cmd('RECORD_MARK')">打标</button>
+      </div>
+      <div class="row">
+        <button onclick="cmd('RECORD_REALTIME_ENABLE',{enabled:true})">实时开</button>
+        <button onclick="cmd('RECORD_REALTIME_ENABLE',{enabled:false})">实时关</button>
+      </div>
+    </div>
+    <div class="group"><h3><span class="no">03</span>文件 BLE</h3>
+      <div class="row">
+        <button onclick="listFiles()">列表</button>
+        <button class="danger" onclick="clearFiles()">清空全部</button>
+      </div>
+      <div class="row">
+        <input id="delName" placeholder="文件名">
+        <button class="danger" onclick="delFile()">删除</button>
+      </div>
+    </div>
+    <div class="group"><h3><span class="no">04</span>WiFi</h3>
+      <div class="row">
+        <button onclick="cmd('WIFI_OPEN')">开</button>
+        <button onclick="cmd('WIFI_CLOSE')">关</button>
+        <button onclick="wifiStatus()">状态</button>
+        <button onclick="wifiScan()">扫描网络</button>
+      </div>
+      <div class="row">
+        <input id="ssid" placeholder="SSID"><input id="pwd" placeholder="密码">
+        <button onclick="wifiConnect()">连接</button>
+        <button onclick="cmd('WIFI_DISCONNECT')">断开</button>
+      </div>
+    </div>
+    <div class="group"><h3><span class="no">05</span>热点快传</h3>
+      <div class="row">
+        <button class="primary" onclick="apStatus()">快传状态 / 列文件</button>
+      </div>
+      <div class="row">
+        <input id="apPath" placeholder="文件名，如 059F19DF.APM">
+        <button onclick="apDownload()">HTTP 下载</button>
+      </div>
+      <div class="row">
+        <label style="display:inline-flex;align-items:center;gap:5px;font-size:12px;color:var(--dim)">
+          <input type="checkbox" id="saveWav" checked>落盘后转 WAV（BLE 取走 / AP 下载共用）
+        </label>
+      </div>
+      <div class="row" style="color:var(--faint);font-size:11px;line-height:1.5">
+        一键检查：模块上电？→ 电脑已连热点？→ 已连则列出 AP 文件可直接下载；文件按录音时间命名存到 downloads/
+      </div>
+    </div>
+    <div class="group"><h3><span class="no">06</span>云上传</h3>
+      <div class="row">
+        <button onclick="listUploads()">待传列表</button>
+      </div>
+      <div class="row">
+        <input id="upName" placeholder="文件名">
+        <button class="danger" onclick="runUpload()">上传阻塞</button>
+        <button class="danger" onclick="delUpload()">删除</button>
+      </div>
+      <div class="row" style="color:var(--faint);font-size:11px;line-height:1.5">
+        需要 STA 模式 + 已配置接收服务器；当前固件默认 AP，此组暂不可测（延后）
+      </div>
+    </div>
+    <div class="group"><h3><span class="no">07</span>配置</h3>
+      <div class="row">
+        <input id="cfgKey" placeholder="key"><input id="cfgVal" placeholder="value">
+      </div>
+      <div class="row">
+        <button onclick="cfgGet()">读</button>
+        <button onclick="cfgSet()">写</button>
+        <button onclick="cfgDel()">删</button>
+      </div>
+    </div>
+    <div class="group"><h3><span class="no">08</span>OTA</h3>
+      <div class="row">
+        <button onclick="cmd('OTA_WIFI_CHECK')">检查</button>
+        <button onclick="cmd('OTA_WIFI_UPDATE')">升级</button>
+        <button onclick="cmd('OTA_WIFI_STATUS')">进度</button>
+      </div>
+    </div>
+    <div class="group"><h3><span class="no">09</span>LED 系统</h3>
+      <div class="row">
+        <button onclick="cmd('LED',{state:'on'})">灯开</button>
+        <button onclick="cmd('LED',{state:'off'})">灯关</button>
+        <button onclick="cmd('LED',{state:'toggle'})">切换</button>
+      </div>
+      <div class="row">
+        <button class="danger" onclick="sysDanger('RESTART','重启设备？')">重启</button>
+        <button class="danger" onclick="sysDanger('SHUTDOWN','关机？')">关机</button>
+        <button class="danger" onclick="sysDanger('OTA','进入 DFU 模式？连接会断开。')">DFU</button>
+      </div>
+    </div>
+  </nav>
+
+  <section>
+    <div class="cards">
+      <div class="card"><div class="k">🔋 BATTERY</div><div class="v" id="cBattery">-</div></div>
+      <div class="card"><div class="k">💾 STORAGE MB</div><div class="v" id="cStorage">-</div></div>
+      <div class="card"><div class="k">🎙️ RECORDER</div><div class="v" id="cRecord">-</div></div>
+      <div class="card"><div class="k">📶 WIFI</div><div class="v" id="cWifi">-</div></div>
+      <button class="dim" onclick="refreshCards()">🔄 刷新状态</button>
+    </div>
+
+    <div class="panel">
+      <h3>🎙️ 实时录音 <span id="audioState" class="badge off" style="margin-left:6px">空闲</span></h3>
+      <div class="toolbar">
+        <button id="btnAudioStart" class="primary" onclick="audioStart()">▶ 开始实时录音</button>
+        <button id="btnAudioStop" onclick="audioStop()" disabled>■ 停止</button>
+        <button class="dim" onclick="audioDemo()" title="无真机时注入 6 秒测试信号；波形本身始终跟随实际数据，无需点击">〰 演示波形</button>
+        <label><input type="checkbox" id="audioWav">停止时保存 WAV</label>
+        <span style="margin-left:auto;color:var(--faint);font:11px var(--mono)">16 kHz · 单声道 · ADPCM→PCM</span>
+      </div>
+      <div class="body">
+        <canvas id="waveCanvas" width="1200" height="220"></canvas>
+        <div class="stats" id="audioStats">等待音频流…（无设备可点「演示波形」验证链路）</div>
+      </div>
+    </div>
+    <div class="panel"><h3>结果</h3><div class="body"><pre id="resultOut">等待操作…</pre></div></div>
+    <div class="panel"><h3>📁 文件列表</h3><div class="body" id="fileTable">尚未列出</div></div>
+    <div class="panel"><h3>🎛️ 设备事件</h3><div class="body" id="eventList"><div class="evt" style="color:var(--dim)">等待事件…</div></div></div>
+    <div class="panel">
+      <h3>📜 日志</h3>
+      <div class="toolbar">
+        <span id="lvChips">
+          <label><input type="checkbox" checked value="INFO">ℹ️ 信息</label>
+          <label><input type="checkbox" checked value="WARN">⚠️ 警告</label>
+          <label><input type="checkbox" checked value="ERROR">❌ 错误</label>
+          <label><input type="checkbox" value="DEBUG">🐛 调试</label>
+          <label><input type="checkbox" value="TRACE">🔬 细节</label>
+        </span>
+        <label class="pause"><input type="checkbox" id="pauseScroll">暂停滚动</label>
+      </div>
+      <div class="body" id="logList"></div>
+    </div>
+  </section>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+let busy = false;
+let connected = false;
+
+// ---------- SSE ----------
+const es = new EventSource('/api/stream');
+es.addEventListener('log', e => addLog(JSON.parse(e.data)));
+es.addEventListener('device', e => addEvent(JSON.parse(e.data)));
+es.onerror = () => { connected = false; $('connState').className = 'badge off'; };
+
+// ---------- 连接控制 ----------
+async function doScan() {
+  const devices = await api('/api/scan?secs=5', {method:'GET'});
+  const sel = $('devices');
+  sel.innerHTML = '';
+  (devices || []).forEach(d => {
+    const opt = document.createElement('option');
+    opt.value = d.id;
+    opt.textContent = `${d.name}（${d.rssi ?? '-'} dBm）`;
+    sel.appendChild(opt);
+  });
+  if (!devices || !devices.length) sel.innerHTML = '<option value="">未发现设备</option>';
+}
+
+async function doConnect() {
+  const id = $('devices').value;
+  if (!id) return alert('请先扫描并选择设备');
+  setBusy(true, '连接中…');
+  try {
+    await api('/api/connect', {method:'POST', body:{id}});
+    connected = true;
+    $('connState').className = 'badge on';
+    $('connState').textContent = '已连接';
+    // 设备音源在 WS 建立时订阅：连接新设备后重建音频通道
+    reopenAudioSocket();
+    refreshCards();
+  } finally { setBusy(false); }
+}
+
+async function doDisconnect() {
+  await api('/api/disconnect', {method:'POST', body:{}});
+  connected = false;
+  $('connState').className = 'badge off';
+  $('connState').textContent = '未连接';
+  reopenAudioSocket();
+}
+
+// ---------- 命令 ----------
+async function cmd(command, payload) {
+  setBusy(true);
+  try {
+    return await api('/api/command', {method:'POST', body:{command, payload: payload ?? null}});
+  } finally { setBusy(false); }
+}
+
+function sysDanger(command, message) {
+  if (!confirm(message + ' 该操作可能中断连接或影响设备状态。')) return;
+  cmd(command);
+}
+
+async function listFiles() {
+  setBusy(true);
+  try {
+    const files = await api('/api/files', {method:'GET'});
+    renderFiles(files || []);
+  } finally { setBusy(false); }
+}
+
+function renderFiles(files) {
+  if (!files.length) { $('fileTable').textContent = '目录为空'; return; }
+  let html = '<table><tr><th>#</th><th>名称</th><th>大小</th><th>目录</th><th>操作</th></tr>';
+  files.forEach(f => {
+    html += `<tr><td>${f.index}</td><td>${esc(f.name ?? '-')}</td><td>${f.size ?? '-'}</td>
+      <td>${f.is_dir === 1 ? '是' : '否'}</td>
+      <td>
+        <button onclick="takeFile('${esc(f.name ?? '')}')">取走</button>
+        <button class="danger" onclick="delFileByName('${esc(f.name ?? '')}')">删除</button>
+      </td></tr>`;
+  });
+  $('fileTable').innerHTML = html + '</table>';
+}
+
+async function takeFile(name) {
+  if (!confirm(`取走 ${name}？\n传输成功后设备会删除该源文件（含同名 .TXT）。`)) return;
+  setBusy(true, '传输中…');
+  try { await api('/api/take', {method:'POST', body:{name, wav: $('saveWav').checked}}); }
+  finally { setBusy(false); }
+}
+
+async function delFile() { const n = $('delName').value.trim(); if (n) delFileByName(n); }
+async function delFileByName(name) {
+  if (!confirm(`删除设备文件 ${name}？不可恢复。`)) return;
+  await cmd('FILE_DELETE', {filename: name});
+}
+
+async function clearFiles() {
+  if (!confirm('FILE_CLEAR 会删除设备根目录全部文件，不可恢复！确定？')) return;
+  setBusy(true, '清空中…');
+  try { await cmd('FILE_CLEAR'); listFiles(); }
+  finally { setBusy(false); }
+}
+
+async function wifiScan() {
+  setBusy(true, '扫描中…');
+  try { await api('/api/wifi/scan', {method:'GET'}); }
+  finally { setBusy(false); }
+}
+
+async function wifiStatus() {
+  // SDK 封装：模块断电时直接返回关闭态，不会打 10s 超时
+  return api('/api/wifi/status', {method:'GET'});
+}
+
+async function wifiConnect() {
+  const ssid = $('ssid').value.trim(), password = $('pwd').value;
+  if (!ssid) return alert('请输入 SSID');
+  setBusy(true, '连接中（最坏 ~12s）…');
+  try { await cmd('WIFI_CONNECT', {ssid, password}); }
+  finally { setBusy(false); }
+}
+
+async function apStatus() {
+  // 服务端一键闭环：模块上电？→ 探测 ESP32（电脑是否已连热点）→ 已连则带回 AP 文件列表
+  setBusy(true, '检查快传…');
+  try {
+    const st = await api('/api/ap/status', {method:'GET'});
+    if (!st) return;
+    if (!st.reachable) {
+      $('fileTable').innerHTML =
+        `<div style="color:var(--warn);line-height:1.8">${esc(st.hint)}</div>` +
+        `<div style="color:var(--dim);font:12px var(--mono);margin-top:6px">热点 <b>${esc(st.ssid)}</b> · 密码 <b>${esc(st.password ?? '见设备说明')}</b> · ${esc(st.endpoint)}</div>`;
+      return;
+    }
+    renderApFiles(st.files);
+  } finally { setBusy(false); }
+}
+
+function renderApFiles(page) {
+  const files = page?.files || [];
+  if (!files.length) { $('fileTable').textContent = 'AP 侧没有文件'; return; }
+  let html = '<table><tr><th>AP 文件</th><th>大小</th><th>操作</th></tr>';
+  files.forEach(f => {
+    html += `<tr><td>${esc(f.name ?? '-')}</td><td>${f.size ?? f.sizeFormatted ?? '-'}</td>
+      <td><button onclick="apDownload('${esc(f.name ?? '')}')">下载</button></td></tr>`;
+  });
+  $('fileTable').innerHTML = html + '</table>';
+}
+
+async function apDownload(name) {
+  // 固件目录遍历防护拒绝前导 /，这里统一剥掉（SDK 侧也会兜底）
+  const path = (name || $('apPath').value.trim()).replace(/^\/+/, '');
+  if (!path) return alert('请输入文件名（不带 / 前缀），或先点「列AP文件」');
+  setBusy(true, 'AP 下载中…');
+  try { await api('/api/ap/download', {method:'POST', body:{path, wav: $('saveWav').checked}}); }
+  finally { setBusy(false); }
+}
+
+async function listUploads() {
+  setBusy(true);
+  try {
+    const files = await api('/api/uploads', {method:'GET'});
+    renderFiles(files || []);
+  } finally { setBusy(false); }
+}
+
+async function runUpload() {
+  const name = $('upName').value.trim();
+  if (!name) return alert('请输入文件名');
+  if (!confirm(`上传 ${name} 到已配置的服务器？\n设备同步上传，期间界面阻塞，成功后删除源文件。`)) return;
+  setBusy(true, '上传中（可能数分钟）…');
+  try { await cmd('UPLOAD_FILE', {name}); }
+  finally { setBusy(false); }
+}
+
+async function delUpload() {
+  const name = $('upName').value.trim();
+  if (!name) return alert('请输入文件名');
+  if (!confirm(`删除待上传文件 ${name}？`)) return;
+  await cmd('UPLOAD_DELETE', {name});
+}
+
+function cfgGet() { const k = $('cfgKey').value.trim(); if (k) cmd('CONFIG_GET', {key: k}); }
+function cfgSet() { const k = $('cfgKey').value.trim(); if (k) cmd('CONFIG_SET', {key: k, value: $('cfgVal').value}); }
+function cfgDel() { const k = $('cfgKey').value.trim(); if (k && confirm(`删除配置 ${k}？`)) cmd('CONFIG_DEL', {key: k}); }
+
+// ---------- 状态卡片 ----------
+async function refreshCards() {
+  if ($('connState').className !== 'badge on') return;
+  const state = await cmd('STATE_INFO');
+  const battery = await cmd('BATTERY');
+  if (battery && battery.level !== undefined) $('cBattery').textContent = `${battery.level}% ${battery.levelText ?? ''}${battery.isCharging ? ' ⚡' : ''}`;
+  // WIFI_OPEN 后 SD 卡挂到 ESP32 侧，nRF 的 STORAGE 必回 sd not mounted，不白查
+  if (state?.wifiOpen) {
+    $('cStorage').textContent = 'WiFi 占用';
+  } else {
+    const storage = await cmd('STORAGE');
+    if (storage && storage.total !== undefined) $('cStorage').textContent = `${storage.used}/${storage.total}`;
+  }
+  const record = await cmd('RECORD_STATUS');
+  if (record) $('cRecord').textContent = record.isRecording ? '● 录音中' : '○ 停止';
+  const wifi = await wifiStatus();
+  if (wifi) {
+    $('cWifi').textContent = wifi.status === 'off' ? '关'
+      : wifi.connected ? (wifi.ssid ?? '已连接')
+      : (wifi.mode ?? wifi.status);
+  }
+}
+
+// ---------- 结果与事件 ----------
+function show(value) { $('resultOut').textContent = JSON.stringify(value, null, 2); }
+
+async function api(path, opts) {
+  const init = {method: opts.method, headers: {'Content-Type': 'application/json'}};
+  if (opts.body !== undefined) init.body = JSON.stringify(opts.body);
+  try {
+    const resp = await fetch(path, init);
+    const data = await resp.json().catch(() => null);
+    show(data);
+    if (!resp.ok) {
+      addLog({level: 'ERROR', line: `${now()} ❌ [HTTP] ${path} 请求失败: ${data?.error ?? resp.status}`});
+    }
+    return data;
+  } catch (error) {
+    addLog({level: 'ERROR', line: `${now()} ❌ [HTTP] ${path} 网络异常: ${error}`});
+    return null;
+  }
+}
+
+function setBusy(state, text) {
+  busy = state;
+  if (state) {
+    $('connState').className = 'badge busy';
+    $('connState').innerHTML = `<span class="spin">⏳</span> ${text ?? '执行中…'}`;
+  } else {
+    // 空闲态由真实连接状态决定，不因命令执行完而误标“已连接”
+    $('connState').className = connected ? 'badge on' : 'badge off';
+    $('connState').textContent = connected ? '已连接' : '未连接';
+  }
+}
+
+function addEvent({command, payload}) {
+  const list = $('eventList');
+  if (list.firstElementChild?.style?.color) list.innerHTML = '';
+  const div = document.createElement('div');
+  div.className = 'evt';
+  div.innerHTML = `${now()} <span class="cmd">${esc(command)}</span> ${esc(JSON.stringify(payload))}`;
+  list.prepend(div);
+  while (list.children.length > 100) list.lastElementChild.remove();
+}
+
+// ---------- 日志面板 ----------
+const MAX_LOG_LINES = 800;
+function addLog({level, line}) {
+  if (!levelVisible(level)) return;
+  const list = $('logList');
+  const div = document.createElement('div');
+  div.className = `log-line lv-${level}`;
+  div.textContent = line;
+  list.appendChild(div);
+  while (list.children.length > MAX_LOG_LINES) list.firstElementChild.remove();
+  if (!$('pauseScroll').checked) list.scrollTop = list.scrollHeight;
+}
+
+function levelVisible(level) {
+  const chip = document.querySelector(`#lvChips input[value="${level}"]`);
+  return !chip || chip.checked;
+}
+$('lvChips').addEventListener('change', () => {
+  // 切换过滤后隐藏已有行，保持视图一致
+  document.querySelectorAll('#logList .log-line').forEach(div => {
+    const level = (div.className.match(/lv-(\w+)/) || [])[1];
+    div.style.display = levelVisible(level) ? '' : 'none';
+  });
+});
+
+function esc(text) {
+  return String(text).replace(/[&<>"']/g, ch =>
+    ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
+}
+function now() { return new Date().toLocaleTimeString('zh-CN', {hour12:false}); }
+
+// ---------- 实时录音与波形 ----------
+// 音频通道常开：页面加载即建立 WebSocket，波形永远跟随实际到达的数据；
+// 「演示波形」只是无真机时注入测试信号的手段，不是看波形的前提。
+const AUDIO = {
+  ws: null, running: false,
+  chunks: 0, samples: 0, lost: 0, peak: 0,
+  ring: new Float32Array(16000 * 5),  // 最近 5 秒样本
+  pos: 0, fill: 0,
+  wav: [],                            // 勾选“保存 WAV”时累积
+  dirty: false, statsAt: 0, lastDataAt: 0,
+};
+
+function audioReset() {
+  AUDIO.chunks = 0; AUDIO.samples = 0; AUDIO.lost = 0; AUDIO.peak = 0;
+  AUDIO.pos = 0; AUDIO.fill = 0; AUDIO.wav = [];
+  AUDIO.lastDataAt = 0;
+  AUDIO.dirty = true;
+}
+
+function setAudioBadge(state, text) {
+  const badge = $('audioState');
+  badge.className = `badge ${state}`;
+  badge.textContent = text;
+}
+
+/// 徽标完全由实际状态与数据驱动：SDK 会话进行中 → 录音中；
+/// 最近 1.2s 内有数据（如设备侧按键触发的被动流）→ 接收中；否则空闲。
+function refreshAudioBadge() {
+  if (AUDIO.running) { setAudioBadge('on', '录音中'); return; }
+  if (AUDIO.lastDataAt && performance.now() - AUDIO.lastDataAt < 1200) {
+    setAudioBadge('busy', '接收中');
+    return;
+  }
+  setAudioBadge('off', '空闲');
+}
+
+async function audioStart() {
+  setBusy(true, '启动录音…');
+  try {
+    const res = await api('/api/record/realtime/start', {method:'POST', body:{}});
+    if (res?.started) {
+      AUDIO.running = true;
+      $('btnAudioStart').disabled = true;
+      $('btnAudioStop').disabled = false;
+      refreshAudioBadge();
+    }
+  } finally { setBusy(false); }
+}
+
+async function audioStop() {
+  try { await api('/api/record/realtime/stop', {method:'POST', body:{}}); }
+  finally {
+    AUDIO.running = false;
+    $('btnAudioStart').disabled = false;
+    $('btnAudioStop').disabled = true;
+    // 不关音频通道：若设备侧仍有被动流（按键触发的录音），波形继续跟随
+    refreshAudioBadge();
+    if ($('audioWav').checked) saveWav();
+  }
+}
+
+async function audioDemo() {
+  await api('/api/audio/demo?secs=6', {method:'POST'});
+}
+
+function openAudioSocket() {
+  if (AUDIO.ws && AUDIO.ws.readyState <= WebSocket.OPEN) return;
+  audioReset();
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  const sock = new WebSocket(`${proto}://${location.host}/api/audio`);
+  sock.binaryType = 'arraybuffer';
+  sock.onmessage = ev => {
+    if (typeof ev.data === 'string') {
+      const msg = JSON.parse(ev.data);
+      if (msg.type === 'lost') {
+        AUDIO.lost += msg.chunks;
+        AUDIO.dirty = true;
+        addLog({level:'WARN', line:`${now()} ⚠️ [音频] 推送过慢，丢失 ${msg.chunks} 块（解码流断裂）`});
+      }
+      return;
+    }
+    const samples = new Int16Array(ev.data);
+    for (let i = 0; i < samples.length; i++) {
+      const v = samples[i] / 32768;
+      AUDIO.ring[AUDIO.pos] = v;
+      AUDIO.pos = (AUDIO.pos + 1) % AUDIO.ring.length;
+      const a = v < 0 ? -v : v;
+      if (a > AUDIO.peak) AUDIO.peak = a;
+    }
+    AUDIO.fill = Math.min(AUDIO.fill + samples.length, AUDIO.ring.length);
+    AUDIO.chunks++;
+    AUDIO.samples += samples.length;
+    AUDIO.lastDataAt = performance.now();
+    if ($('audioWav').checked) for (const s of samples) AUDIO.wav.push(s);
+    AUDIO.dirty = true;
+  };
+  sock.onclose = () => {
+    const wasLive = AUDIO.ws === sock;
+    if (wasLive) AUDIO.ws = null;
+    refreshAudioBadge();
+    // 常开管道断线自动重连（服务重启后波形自恢复）；主动 reopen 的旧 socket 不重排
+    if (wasLive) setTimeout(openAudioSocket, 3000);
+  };
+  AUDIO.ws = sock;
+  refreshAudioBadge();
+}
+
+function closeAudioSocket() {
+  if (AUDIO.ws) { const sock = AUDIO.ws; AUDIO.ws = null; sock.close(); }
+}
+
+/// 设备连接/断开后重开音频通道：设备音源在 WS 建立时订阅，
+/// 连接新设备必须重建通道才能收到它的流。
+function reopenAudioSocket() {
+  closeAudioSocket();
+  openAudioSocket();
+}
+
+function drawWave() {
+  requestAnimationFrame(drawWave);
+  // 统计与徽标每 500ms 无条件刷新：徽标必须能在数据停止后自己回到空闲，
+  // 不能依赖“有新数据才触发”的路径；波形绘制才按 dirty 跳过。
+  const t = performance.now();
+  if (t - AUDIO.statsAt <= 500) return;
+  AUDIO.statsAt = t;
+
+  if (AUDIO.dirty) {
+    AUDIO.dirty = false;
+    drawWaveform();
+  }
+  const secs = AUDIO.samples / 16000;
+  $('audioStats').innerHTML =
+    `块 <b>${AUDIO.chunks}</b> · 样本 <b>${AUDIO.samples}</b>（${secs.toFixed(1)} 秒）` +
+    ` · 峰值 <b>${Math.round(AUDIO.peak * 100)}%</b>` +
+    (AUDIO.lost ? ` · <span class="gap">断流丢块 ${AUDIO.lost}</span>` : ' · 无断流');
+  refreshAudioBadge();
+}
+
+function drawWaveform() {
+  const canvas = $('waveCanvas');
+  const ctx = canvas.getContext('2d');
+  const W = canvas.width, H = canvas.height, mid = H / 2;
+  ctx.clearRect(0, 0, W, H);
+  // 中线与 ±50% 参考线
+  ctx.strokeStyle = 'rgba(125,150,180,.16)';
+  ctx.lineWidth = 1;
+  [0.5, 0.25, 0.75].forEach(f => {
+    ctx.beginPath(); ctx.moveTo(0, H * f); ctx.lineTo(W, H * f); ctx.stroke();
+  });
+
+  const view = AUDIO.fill;
+  if (!view) return;
+  const per = view / W;
+  const ring = AUDIO.ring, cap = ring.length;
+  ctx.strokeStyle = '#3ddc97';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  for (let x = 0; x < W; x++) {
+    const start = Math.floor(x * per);
+    const end = Math.min(view, Math.max(start + 1, Math.floor((x + 1) * per)));
+    let min = 1, max = -1;
+    for (let s = start; s < end; s++) {
+      const v = ring[(AUDIO.pos - view + s + cap) % cap];
+      if (v < min) min = v;
+      if (v > max) max = v;
+    }
+    if (min > max) continue;
+    const y1 = mid - max * (mid - 8);
+    const y2 = mid - min * (mid - 8);
+    ctx.moveTo(x + 0.5, y1);
+    ctx.lineTo(x + 0.5, Math.max(y2, y1 + 1));
+  }
+  ctx.stroke();
+}
+requestAnimationFrame(drawWave);
+
+function saveWav() {
+  if (!AUDIO.wav.length) return;
+  const pcm = AUDIO.wav, dataLen = pcm.length * 2;
+  const buffer = new ArrayBuffer(44 + dataLen);
+  const view = new DataView(buffer);
+  const str = (offset, text) => { for (let i = 0; i < text.length; i++) view.setUint8(offset + i, text.charCodeAt(i)); };
+  str(0, 'RIFF'); view.setUint32(4, 36 + dataLen, true); str(8, 'WAVEfmt ');
+  view.setUint32(16, 16, true); view.setUint16(20, 1, true); view.setUint16(22, 1, true);
+  view.setUint32(24, 16000, true); view.setUint32(28, 32000, true);
+  view.setUint16(32, 2, true); view.setUint16(34, 16, true);
+  str(36, 'data'); view.setUint32(40, dataLen, true);
+  pcm.forEach((s, i) => view.setInt16(44 + i * 2, s, true));
+  const url = URL.createObjectURL(new Blob([buffer], {type:'audio/wav'}));
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `realtime_${new Date().toISOString().replace(/[:.]/g, '-')}.wav`;
+  a.click();
+  URL.revokeObjectURL(url);
+  addLog({level:'INFO', line:`${now()} 💾 [音频] WAV 已保存 ${pcm.length} 样本`});
+}
+
+
+$('connState').className = 'badge off';
+$('connState').textContent = '未连接';
+// 页面加载即挂上音频通道：此后波形只由实际数据驱动
+openAudioSocket();
+</script>
+</body>
+</html>

@@ -1,0 +1,53 @@
+# reai-card-sdk 更新日志
+
+版本号独立于主控固件（nRF `v0.3.x` / WiFi `v0.0.x`）；SDK 与固件的协议对应关系见
+[`docs/protocol-support.md`](docs/protocol-support.md)。
+
+## 0.0.2（2026-10-20）
+
+开源首发：源码迁至公开仓库 <https://github.com/ReAI-com/reai-card-sdk>（MIT），tag `v0.0.2`。AP 快传已真机验证通过（上电→连热点→列文件→下载→转 WAV）。
+
+安全调整：**不再内置设备热点密码**（原 `AP_DEFAULT_PASSWORD` 常量移除）——HTTP 文件接口无鉴权，密码即访问凭证，不随开源 SDK 发布；应用自行从配置/设备文档获取。`dyj_web` 通过环境变量 `REAI_CARD_AP_PASSWORD` 注入显示。
+
+真机联调修复（针对 v0.3.x 固件实测发现的问题）：
+
+- **通知流出错立即终结挂起请求**：此前 worker 出错只发 Fault 就退出，`take_file` 等会挂满 30s 才失败；现在立刻以 `Disconnected` 返回，新增回归测试。
+- **ESP32 透传命令上电预检**：`WIFI_SCAN/CONNECT/DISCONNECT`、`AP_*`、`UPLOAD_*`、`AUTH_*`、`OTA_WIFI_*` 先查 `STATE_INFO.wifiOpen`，模块断电直接返回 `WifiModulePoweredDown`（此前白等 10s 超时）。
+- **AP 快传改为事件驱动 + 固定端点**：v0.3.x 固件上电自动启动 AP（固定 `DYJ-HD-AP` / `192.168.4.1:80`）且 nRF 不透传 `AP_*`；`access_point_client()` 不再查询 `AP_STATUS`，等待 `WIFI_AP_START` 事件（新增 `wait_for_ap_ready` / `access_point_ready`）后直接使用 `AP_DEFAULT_IP/PORT` 常量。`start_access_point` 等保留给带 `AP_` 透传的未来固件。HTTP 客户端建连超时 5s（电脑未连热点时快速失败而非挂到系统超时）；连接建立时模块已在供电、本次收不到就绪事件的重连场景，3s 宽限后按“AP 随上电自启”推断就绪。
+- **AP 下载/删除 403 修复**：固件的目录遍历防护拒绝带前导 `/` 的 `path`（实测 `path=%2F059F19DF.APM` → 403 Invalid path）；`AccessPointClient::download_file_to/delete_file` 现在自动剥掉前导斜杠。
+- **SD 卡归属预检**：`WIFI_OPEN` 后 SD 卡挂载权移交 ESP32，nRF 侧 `STORAGE`/`FILE_LIST`/`FILE_DELETE`/`FILE_CLEAR`/取走/`RECORD_START`/`RECORD_MARK` 都会 `sd not mounted`；SDK 现在先查 `STATE_INFO.wifiOpen`，模块上电时直接返回 `SdOwnedByWifiModule`（提示先 `close_wifi`，文件请走 AP 快传）。
+- **`open_wifi` 幂等**：BLE 断链重连后 ESP32 常仍在供电，`wifiOpen` 已 true 时跳过 `WIFI_OPEN` 直接成功，并把快传入口标记为就绪（AP 随上电自启，本次连接不会再收到 `WIFI_AP_START`）。
+- **录音时间命名**：固件按同名 `.txt` 的时间戳给录音起名（`synced_<unix>.apm` / `nosync_<unix>.apm`），BLE 取走的 start 帧 `name` 与 AP 下载的 `Content-Disposition` 都带它；新增 `RecordingStamp::parse` 解析，`AccessPointDownloadedFile.suggested_name` 透出建议名。dyj_web 落盘改为「本地时间_原编号.apm」（如 `20261019-160849_059F19DF.apm`），日志/结果带录音时间；时钟未同步的标 `nosync-<ts>_…`；无需额外下载 `.txt`。
+- **落盘与转码进 SDK**：新增 `recording` 模块——`DyjDevice::take_file_to_dir` / `AccessPointClient::download_to_dir` 下载到指定目录（`.part` 原子改名、按录音时间命名、失败清理），返回 `SavedRecording`；`SavedRecording::to_wav()` / `apm_to_wav()` 把 IMA ADPCM 转成 16kHz WAV。dyj_web 改用这些接口并提供“落盘后转 WAV”开关；`chrono` 升为正式依赖。
+- 明确结论：BLE 取走仅适合小文件（固件节奏 200B/25ms ≈ 8KB/s 上限），大文件一律走 AP 快传或云上传；云上传需 STA 模式 + 接收服务器，当前默认 AP 且无服务器，延后。
+
+## 0.0.1（2026-10-19）
+
+首个交付版本，供 ai-vibe-board / driver-v2 以 `recorder-card-v2` 硬件类型接入。
+
+### 能力面
+
+- **连接管理**：`DeviceManager` BLE 扫描/连接（NUS 服务校验），连接即自动 `SYNC_TIME`；命令串行化（协议无请求 ID）。
+- **信息查询**（已真机验证）：`device_info` / `state` / `battery` / `storage` / `record_status` / `test_modules`。
+- **录音控制**（已真机验证）：`start_recording` / `stop_recording` / `toggle_recording` / `record_mark`；录音写 SD 卡 `.apm`（16kHz/16bit/单声道，IMA ADPCM 4:1）。
+- **实时音频**（已真机验证）：`start_realtime_recording()` 会话式收流 + `subscribe_audio()` 被动订阅；SDK 内置 IMA ADPCM→PCM 解码（16kHz 单声道 i16），丢块以 `Lagged` 上报；`wav_bytes()` 封 WAV；离线 `.apm` 可用 `AdpcmDecoder` 解码。
+- **文件管理（BLE）**：`list_files`（已真机验证）、`delete_file`、`clear_files`、`take_file_to`（取走语义：设备删源文件；与实时录音互斥）。
+- **硬件事件**：`subscribe_events()` 推送按键/拨杆/录音状态/WiFi 列表/OTA 进度等主动上报。
+- **WiFi / 热点 / 云上传 / OTA / 配置**：API 已实现（`open_wifi`、`scan_wifi`、`connect_wifi`、`wifi_status`、`AccessPointClient` 快传、`upload_file_via_sta`、`wifi_ota_*`、`CONFIG_*`），协议层有 mock 测试覆盖，**尚未真机回归**。
+- **测试工具**：`examples/dyj_cli`（全 API CLI，`--verbose/--trace`）与 `examples/dyj_web`（网页控制台：SSE 日志/事件推送、实时录音波形面板、演示信号源）。
+
+### 已知限制
+
+- 仅承诺 macOS/Linux；Windows 未验证（driver-v2 进 Windows 默认构建前必须先验证）。
+- 二进制通道由文件下载与实时音频共用，无头部区分；SDK 以互斥门保证不混流，设备侧自触发录音期间取文件仍是固件层限制。
+- `publish = false`：阶段一以 path / git + tag 依赖交付；发 crates.io 需补 LICENSE/CI。
+
+### 依赖引入
+
+0.0.1 托管于固件仓库（`dyj-hd-v2/sdk/rust`，tag `sdk-v0.0.1`）；0.0.2 起迁至本公开仓库，请使用：
+
+```toml
+reai-card-sdk = { git = "https://github.com/ReAI-com/reai-card-sdk.git", tag = "v0.0.2" }
+```
+
+验收命令：`make verify`（fmt/check/test/clippy 全绿）。

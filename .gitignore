@@ -1,0 +1,14 @@
+# Rust
+/target/
+
+# 测试工具落盘目录（dyj_web / dyj_cli 下载的录音与 WAV）
+/downloads/
+*.part
+
+# 本地日志
+*.log
+
+# OS / IDE
+.DS_Store
+.vscode/
+.idea/

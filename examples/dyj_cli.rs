@@ -1,0 +1,518 @@
+//! DYJ 设备手动测试 CLI：扫描、连接并驱动 SDK 的全部公开 API。
+//!
+//! 用法（`--id` 可选，缺省取扫描到的第一台 DYJ 设备）：
+//!
+//! ```text
+//! cargo run --example dyj_cli -- scan
+//! cargo run --example dyj_cli -- check
+//! cargo run --example dyj_cli -- info
+//! cargo run --example dyj_cli -- take RECORD_001.APM out.apm
+//! cargo run --example dyj_cli -- wifi open
+//! cargo run --example dyj_cli -- raw 'LED' '{"state":"on"}'
+//! ```
+//!
+//! 连接期间会起一个事件打印任务，按键/开关/录音状态等主动上报会实时打到 stdout。
+
+use std::time::Duration;
+
+use reai_card_sdk::{DeviceEvent, DeviceManager, DyjDevice};
+use serde_json::Value;
+
+#[path = "common/mod.rs"]
+mod common;
+
+const DEFAULT_SCAN_SECS: u64 = 5;
+
+#[tokio::main]
+async fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let (global, command) = split_globals(&args);
+    common::init_tracing(global.verbosity);
+    let result = run(&global, &command).await;
+    if let Err(error) = result {
+        eprintln!("error: {error}");
+        std::process::exit(1);
+    }
+}
+
+struct Globals {
+    id: Option<String>,
+    scan_secs: u64,
+    verbosity: u8,
+}
+
+/// 把 `--id x` / `--seconds n` / `--verbose` / `--trace` 从子命令参数里摘出来。
+fn split_globals(args: &[String]) -> (Globals, Vec<String>) {
+    let mut globals = Globals {
+        id: None,
+        scan_secs: DEFAULT_SCAN_SECS,
+        verbosity: 0,
+    };
+    let mut command = Vec::new();
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--id" => globals.id = iter.next().cloned(),
+            "--seconds" => {
+                globals.scan_secs = iter
+                    .next()
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or(DEFAULT_SCAN_SECS);
+            }
+            "--verbose" => globals.verbosity = globals.verbosity.max(1),
+            "--trace" => globals.verbosity = 2,
+            _ => command.push(arg.clone()),
+        }
+    }
+    (globals, command)
+}
+
+fn usage() {
+    println!(
+        "commands:
+  scan                              列出广播中的 DYJ 设备
+  check                             只读全流程验收（scan→connect→info→state→battery→storage→modules→files）
+  info | state | battery | storage  查询类
+  record start|stop|toggle|status|mark | realtime on|off
+  realtime <seconds> [output.wav]   开始实时录音并收流 N 秒（Ctrl-C 中止），可选保存 16k 单声道 WAV
+  decode <in.apm> <out.wav>         离线把录音 .apm（IMA ADPCM）转成 16k 单声道 WAV，不需要设备
+  files [folder]                    FILE_LIST
+  take <name> <output>              FILE_UPLOAD（取走语义：设备会删源文件，先写 .part 再改名）
+  delete <filename> | clear-files   删除类（clear-files 会删根目录全部文件）
+  wifi open|close|status|scan|disconnect | wifi connect <ssid> <password>
+  ap start|stop|status              ESP32 热点与快传入口
+  uploads list|upload <name>|delete <name>|clear
+  config get <key> | config set <key> <value> | config del <key>
+  led on|off|toggle
+  ota check|start|status            ESP32 OTA
+  auth activate <deviceId> <name> <code> | auth clear
+  restart | shutdown | dfu
+  events                             挂机只打印主动上报事件（Ctrl-C 退出）
+  raw <CMD> [json]                  发送任意协议命令
+
+global options: --id <device-id>  --seconds <scan-secs>  --verbose(调试日志)  --trace(字节级)"
+    );
+}
+
+async fn run(globals: &Globals, command: &[String]) -> reai_card_sdk::Result<()> {
+    let Some(first) = command.first() else {
+        usage();
+        return Ok(());
+    };
+    // 离线命令：不需要蓝牙适配器
+    if first == "decode" {
+        return decode(&command[1..]).await;
+    }
+
+    let manager = DeviceManager::new().await?;
+    if first == "scan" {
+        return scan(&manager, globals.scan_secs).await;
+    }
+
+    let device = connect(&manager, globals).await?;
+    let rest = &command[1..];
+    match first.as_str() {
+        "check" => check(&device, rest).await,
+        "info" => print_json(serde_json::to_value(device.device_info().await?)?),
+        "state" => print_json(serde_json::to_value(device.state().await?)?),
+        "battery" => print_json(serde_json::to_value(device.battery().await?)?),
+        "storage" => print_json(serde_json::to_value(device.storage().await?)?),
+        "record" => record(&device, rest).await,
+        "realtime" => realtime_stream(&device, rest).await,
+        "files" => {
+            let files = device
+                .list_files(rest.first().map(|value| value.as_str()))
+                .await?;
+            println!("{} entries", files.len());
+            print_json(serde_json::to_value(files)?)?;
+            Ok(())
+        }
+        "take" => take(&device, rest).await,
+        "delete" => {
+            let name = required(rest, 0, "filename")?;
+            print_json(serde_json::to_value(device.delete_file(name).await?)?)
+        }
+        "clear-files" => {
+            let files = device.clear_files().await?;
+            println!("cleared {} entries", files.len());
+            Ok(())
+        }
+        "wifi" => wifi(&device, rest).await,
+        "ap" => ap(&device, rest).await,
+        "uploads" => uploads(&device, rest).await,
+        "config" => config(&device, rest).await,
+        "led" => {
+            let state = required(rest, 0, "state (on/off/toggle)")?;
+            print_json(serde_json::to_value(device.set_led(state).await?)?)
+        }
+        "ota" => ota(&device, rest).await,
+        "auth" => auth(&device, rest).await,
+        "restart" => print_json(serde_json::to_value(device.restart().await?)?),
+        "shutdown" => print_json(serde_json::to_value(device.shutdown().await?)?),
+        "dfu" => print_json(serde_json::to_value(device.enter_dfu_mode().await?)?),
+        "events" => {
+            println!("listening for device events, Ctrl-C to exit");
+            loop {
+                tokio::time::sleep(Duration::from_secs(3600)).await;
+            }
+        }
+        "raw" => {
+            let name = required(rest, 0, "command")?;
+            let payload = rest.get(1).map(|json| {
+                serde_json::from_str::<Value>(json).expect("payload must be valid JSON")
+            });
+            print_json(device.raw_command(name, payload).await?)
+        }
+        other => {
+            println!("unknown command `{other}`");
+            usage();
+            Ok(())
+        }
+    }
+}
+
+async fn scan(manager: &DeviceManager, secs: u64) -> reai_card_sdk::Result<()> {
+    let devices = manager.scan(Duration::from_secs(secs)).await?;
+    if devices.is_empty() {
+        println!("no DYJ device found in {secs}s");
+        return Ok(());
+    }
+    for device in &devices {
+        println!(
+            "{}  name={} rssi={:?}",
+            device.id,
+            device.name,
+            device
+                .rssi
+                .map(|rssi| rssi.to_string())
+                .unwrap_or_else(|| "-".into())
+        );
+    }
+    Ok(())
+}
+
+async fn connect(manager: &DeviceManager, globals: &Globals) -> reai_card_sdk::Result<DyjDevice> {
+    let devices = manager.scan(Duration::from_secs(globals.scan_secs)).await?;
+    let found = match &globals.id {
+        Some(id) => devices.iter().find(|device| &device.id == id),
+        None => devices.first(),
+    }
+    .ok_or_else(|| {
+        reai_card_sdk::SdkError::DeviceNotFound(globals.id.clone().unwrap_or_default())
+    })?;
+    println!("connecting {} ({}) ...", found.name, found.id);
+    let device = manager.connect(found).await?;
+    spawn_event_printer(&device);
+    Ok(device)
+}
+
+fn spawn_event_printer(device: &DyjDevice) {
+    let mut events = device.subscribe_events();
+    tokio::spawn(async move {
+        loop {
+            match events.recv().await {
+                Ok(event) => println!("event: {}", summarize(event)),
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(count)) => {
+                    eprintln!("event printer lagged by {count}");
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+            }
+        }
+    });
+}
+
+fn summarize(event: DeviceEvent) -> String {
+    fn json(value: impl serde::Serialize) -> String {
+        serde_json::to_string(&value).unwrap_or_default()
+    }
+    match event {
+        DeviceEvent::Button(payload) => json(payload),
+        DeviceEvent::ToggleSwitch(payload) => json(payload),
+        DeviceEvent::RecordStatus(status) => json(status),
+        DeviceEvent::WifiNetwork(network) => json(network),
+        DeviceEvent::WifiOff(response) => json(response),
+        DeviceEvent::UploadComplete(response) => json(response),
+        DeviceEvent::WifiOtaProgress(progress) => json(progress),
+        DeviceEvent::AccessPointReady(response) => json(response),
+        DeviceEvent::Unhandled { command, payload } => format!("{command}:{payload}"),
+    }
+}
+
+/// 只读验收：连接后依次跑一遍查询类 API，适合拿到新固件后先跑这个。
+async fn check(device: &DyjDevice, _rest: &[String]) -> reai_card_sdk::Result<()> {
+    println!("== device_info ==");
+    print_json(serde_json::to_value(device.device_info().await?)?)?;
+    println!("== state ==");
+    print_json(serde_json::to_value(device.state().await?)?)?;
+    println!("== battery ==");
+    print_json(serde_json::to_value(device.battery().await?)?)?;
+    println!("== storage ==");
+    print_json(serde_json::to_value(device.storage().await?)?)?;
+    println!("== record_status ==");
+    print_json(serde_json::to_value(device.record_status().await?)?)?;
+    println!("== test_modules ==");
+    for module in device.test_modules().await? {
+        println!(
+            "  {:<18} {}",
+            module.key,
+            if module.result { "OK" } else { "FAIL" }
+        );
+    }
+    println!("== files ==");
+    for file in device.list_files(None).await? {
+        println!(
+            "  {:<28} size={:<10} dir={}",
+            file.name.as_deref().unwrap_or("-"),
+            file.size
+                .map(|size| size.to_string())
+                .unwrap_or_else(|| "-".into()),
+            file.is_dir.unwrap_or(0) == 1
+        );
+    }
+    println!("check finished");
+    Ok(())
+}
+
+async fn record(device: &DyjDevice, rest: &[String]) -> reai_card_sdk::Result<()> {
+    match required(rest, 0, "record subcommand")? {
+        "start" => print_json(serde_json::to_value(device.start_recording().await?)?),
+        "stop" => print_json(serde_json::to_value(device.stop_recording().await?)?),
+        "toggle" => print_json(serde_json::to_value(device.toggle_recording().await?)?),
+        "status" => print_json(serde_json::to_value(device.record_status().await?)?),
+        "mark" => print_json(device.record_mark().await?),
+        "realtime" => {
+            let enabled = match required(rest, 1, "realtime on|off")? {
+                value if value.eq_ignore_ascii_case("on") => true,
+                value if value.eq_ignore_ascii_case("off") => false,
+                other => return Err(reai_card_sdk::SdkError::InvalidCommand(other.into())),
+            };
+            print_json(serde_json::to_value(
+                device.set_realtime_enabled(enabled).await?,
+            )?)
+        }
+        other => Err(reai_card_sdk::SdkError::InvalidCommand(other.into())),
+    }
+}
+
+/// `realtime <seconds> [output.wav]`：开实时录音收流，每秒打印速率，结束停录。
+async fn realtime_stream(device: &DyjDevice, rest: &[String]) -> reai_card_sdk::Result<()> {
+    let seconds: u64 = rest
+        .first()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(10);
+    let output = rest.get(1);
+
+    let session = device.start_realtime_recording().await?;
+    let mut audio = session.subscribe();
+    println!("recording {seconds}s (Ctrl-C to abort), 16 kHz mono ...");
+
+    let started = tokio::time::Instant::now();
+    let mut samples_total = 0_usize;
+    let mut chunks_total = 0_usize;
+    let mut lagged_total = 0_u64;
+    let mut collected: Option<Vec<i16>> = output.map(|_| Vec::new());
+    let deadline = started + Duration::from_secs(seconds);
+    let mut next_report = started + Duration::from_secs(1);
+
+    loop {
+        let recv = tokio::time::timeout_at(deadline, audio.recv()).await;
+        let chunk = match recv {
+            Ok(Ok(chunk)) => chunk,
+            Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(count))) => {
+                lagged_total += count;
+                continue;
+            }
+            // 超时到期或通道关闭都走正常收尾
+            _ => break,
+        };
+        chunks_total += 1;
+        samples_total += chunk.samples.len();
+        if let Some(buffer) = collected.as_mut() {
+            buffer.extend_from_slice(&chunk.samples);
+        }
+        if tokio::time::Instant::now() >= next_report {
+            next_report += Duration::from_secs(1);
+            let elapsed = started.elapsed().as_secs_f64();
+            println!(
+                "  {elapsed:5.1}s  chunks={chunks_total}  samples={samples_total}  rate={:.0} samples/s",
+                samples_total as f64 / elapsed
+            );
+        }
+    }
+
+    let result = session.stop().await;
+    let elapsed = started.elapsed().as_secs_f64();
+    println!(
+        "done: {chunks_total} chunks, {samples_total} samples ({:.1}s, {:.0} samples/s), lagged={lagged_total}",
+        elapsed,
+        samples_total as f64 / elapsed.max(0.001)
+    );
+    if let (Some(buffer), Some(path)) = (collected.as_ref(), output) {
+        tokio::fs::write(
+            path,
+            reai_card_sdk::wav_bytes(buffer, reai_card_sdk::SAMPLE_RATE_HZ),
+        )
+        .await?;
+        println!("wav saved -> {path} ({} samples)", buffer.len());
+    }
+    result
+}
+
+/// `decode <in.apm> <out.wav>`：固件录音是裸 IMA ADPCM 流，离线解码成可播放的 WAV。
+async fn decode(rest: &[String]) -> reai_card_sdk::Result<()> {
+    let input = required(rest, 0, "input .apm")?;
+    let output = required(rest, 1, "output .wav")?;
+    let adpcm = tokio::fs::read(input).await?;
+    let samples = reai_card_sdk::AdpcmDecoder::new().decode(&adpcm);
+    tokio::fs::write(
+        output,
+        reai_card_sdk::wav_bytes(&samples, reai_card_sdk::SAMPLE_RATE_HZ),
+    )
+    .await?;
+    println!(
+        "decoded {} bytes ADPCM -> {} samples ({:.2}s @16kHz) -> {output}",
+        adpcm.len(),
+        samples.len(),
+        samples.len() as f64 / reai_card_sdk::SAMPLE_RATE_HZ as f64
+    );
+    Ok(())
+}
+
+async fn take(device: &DyjDevice, rest: &[String]) -> reai_card_sdk::Result<()> {
+    let name = required(rest, 0, "file name")?;
+    let output = required(rest, 1, "output path")?;
+    let part = format!("{output}.part");
+    let mut writer = tokio::fs::File::create(&part).await?;
+    let result = device.take_file_to(name, &mut writer).await?;
+    tokio::fs::rename(&part, output).await?;
+    println!(
+        "took {} bytes (device file `{}` removed) -> {output}",
+        result.bytes_written, result.name
+    );
+    Ok(())
+}
+
+async fn wifi(device: &DyjDevice, rest: &[String]) -> reai_card_sdk::Result<()> {
+    match required(rest, 0, "wifi subcommand")? {
+        "open" => print_json(serde_json::to_value(device.open_wifi().await?)?),
+        "close" => print_json(serde_json::to_value(device.close_wifi().await?)?),
+        "status" => print_json(serde_json::to_value(device.wifi_status().await?)?),
+        "scan" => {
+            let networks = device.scan_wifi().await?;
+            println!("{} networks", networks.len());
+            for network in networks {
+                println!(
+                    "  [{:<2}] {:<32} rssi={:<5} {}",
+                    network.index,
+                    network.ssid.as_deref().unwrap_or("<hidden>"),
+                    network
+                        .rssi
+                        .map(|rssi| rssi.to_string())
+                        .unwrap_or_else(|| "-".into()),
+                    network.encryption.as_deref().unwrap_or("-")
+                );
+            }
+            Ok(())
+        }
+        "connect" => {
+            let ssid = required(rest, 1, "ssid")?;
+            let password = required(rest, 2, "password")?;
+            print_json(serde_json::to_value(
+                device.connect_wifi(ssid, password).await?,
+            )?)
+        }
+        "disconnect" => print_json(serde_json::to_value(device.disconnect_wifi().await?)?),
+        other => Err(reai_card_sdk::SdkError::InvalidCommand(other.into())),
+    }
+}
+
+async fn ap(device: &DyjDevice, rest: &[String]) -> reai_card_sdk::Result<()> {
+    match required(rest, 0, "ap subcommand")? {
+        "start" => print_json(serde_json::to_value(
+            device
+                .start_access_point(
+                    rest.get(1).map(|value| value.as_str()),
+                    rest.get(2).map(|value| value.as_str()),
+                )
+                .await?,
+        )?),
+        "stop" => print_json(serde_json::to_value(device.stop_access_point().await?)?),
+        "status" => print_json(serde_json::to_value(device.access_point_status().await?)?),
+        other => Err(reai_card_sdk::SdkError::InvalidCommand(other.into())),
+    }
+}
+
+async fn uploads(device: &DyjDevice, rest: &[String]) -> reai_card_sdk::Result<()> {
+    match required(rest, 0, "uploads subcommand")? {
+        "list" => {
+            let files = device.list_uploads().await?;
+            println!("{} uploads", files.len());
+            print_json(serde_json::to_value(files)?)?;
+            Ok(())
+        }
+        "upload" => {
+            let name = required(rest, 1, "name")?;
+            println!("uploading {name} (blocks until the device finishes the HTTP upload) ...");
+            print_json(serde_json::to_value(device.upload_file(name).await?)?)
+        }
+        "delete" => print_json(serde_json::to_value(
+            device.delete_upload(required(rest, 1, "name")?).await?,
+        )?),
+        "clear" => print_json(serde_json::to_value(device.clear_uploads().await?)?),
+        other => Err(reai_card_sdk::SdkError::InvalidCommand(other.into())),
+    }
+}
+
+async fn config(device: &DyjDevice, rest: &[String]) -> reai_card_sdk::Result<()> {
+    match required(rest, 0, "config subcommand")? {
+        "get" => print_json(device.get_config(required(rest, 1, "key")?).await?),
+        "set" => print_json(serde_json::to_value(
+            device
+                .set_config(required(rest, 1, "key")?, required(rest, 2, "value")?)
+                .await?,
+        )?),
+        "del" => print_json(serde_json::to_value(
+            device.delete_config(required(rest, 1, "key")?).await?,
+        )?),
+        other => Err(reai_card_sdk::SdkError::InvalidCommand(other.into())),
+    }
+}
+
+async fn ota(device: &DyjDevice, rest: &[String]) -> reai_card_sdk::Result<()> {
+    match required(rest, 0, "ota subcommand")? {
+        "check" => print_json(device.check_wifi_ota().await?),
+        "start" => print_json(serde_json::to_value(device.start_wifi_ota().await?)?),
+        "status" => print_json(serde_json::to_value(device.wifi_ota_status().await?)?),
+        other => Err(reai_card_sdk::SdkError::InvalidCommand(other.into())),
+    }
+}
+
+async fn auth(device: &DyjDevice, rest: &[String]) -> reai_card_sdk::Result<()> {
+    match required(rest, 0, "auth subcommand")? {
+        "activate" => print_json(serde_json::to_value(
+            device
+                .activate(
+                    required(rest, 1, "deviceId")?,
+                    required(rest, 2, "deviceName")?,
+                    required(rest, 3, "code")?,
+                )
+                .await?,
+        )?),
+        "clear" => print_json(serde_json::to_value(device.clear_activation().await?)?),
+        other => Err(reai_card_sdk::SdkError::InvalidCommand(other.into())),
+    }
+}
+
+fn required<'a>(args: &'a [String], index: usize, what: &str) -> reai_card_sdk::Result<&'a str> {
+    args.get(index)
+        .map(|value| value.as_str())
+        .ok_or_else(|| reai_card_sdk::SdkError::InvalidCommand(format!("missing argument: {what}")))
+}
+
+fn print_json(value: Value) -> reai_card_sdk::Result<()> {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&value).unwrap_or_default()
+    );
+    Ok(())
+}
