@@ -695,12 +695,12 @@ async fn wifi_connect(
 /// 路由后 WIFI_STATUS 可能超时）→ 放行，交给设备自己判断。
 async fn ensure_sta_connected_lenient(device: &DyjDevice) -> ApiResult<()> {
     match device.wifi_status().await {
-        Ok(status) if !status.connected => Err(ApiError(reai_card_sdk::SdkError::InvalidCommand(
-            format!(
+        Ok(status) if !status.connected => {
+            Err(ApiError(reai_card_sdk::SdkError::InvalidCommand(format!(
                 "WiFi 模块未连接路由器（WIFI_STATUS status={} connected=false），请先完成第 2 步 WIFI_CONNECT",
                 status.status
-            ),
-        ))),
+            ))))
+        }
         Ok(_) => Ok(()),
         Err(error) => {
             tracing::warn!(target: "dyj.ota", "⚠️ WIFI_STATUS 不可用（{error}），跳过联网预检，交给设备判断");
