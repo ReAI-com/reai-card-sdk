@@ -8,6 +8,9 @@
 # 本地日志
 *.log
 
+# 本机私密配置（热点密码、测试路由器账号），由 Makefile 读入，绝不提交
+.env.local
+
 # OS / IDE
 .DS_Store
 .vscode/

@@ -32,6 +32,7 @@
 - **OTA 版本信息**（`ota` 模块）：`OtaInfo::fetch(base, OtaModule::Main|Wifi)` / `is_newer_than` / `download`——主控的版本比较归上位机（设备不检查），WiFi 的归 ESP32。
 - **在线升级旧 WiFi 固件**：`check_and_update_wifi_firmware(wait)` 一步完成（固件要求 CHECK/UPDATE 同一上电周期先后执行），返回 `WifiOnlineOtaOutcome::{UpToDate, Finished(OtaProgress)}`；`OtaInfo` 的 URL 约定对齐固件（`{api_base}/ota/info?mod=…`），新增常量 `OTA_DEFAULT_API_BASE_URL` / `OTA_DEFAULT_INFO_PATH`（所有 WiFi 固件版本内置默认即 dyj2 服务，旧设备无需配置）。经历史核对写入兼容性矩阵：OTA 协议 0.0.1–0.0.9 逐字节一致、主控 v0.1.5 起透传、热点上传 0.0.4 起、`wifiVersion` 需主控 ≥0.3.5、老设备分区表风险。
 - `dyj_cli` 新增 `dfu <zip> [packet_size]`（完整升级）、`dfu-scan`、`dfu-resume <zip>`、`ap ota-check` / `ap ota-upload <bin>`、`ota info <base> main|wifi`；`dyj_web` OTA 分组新增「主控 DFU 升级（选 .zip）」「WiFi 本地升级（选 .bin）」「WiFi 当前版本」，接口 `POST /api/dfu`、`GET /api/ap/ota/check`、`POST /api/ap/ota/upload`。
+- Makefile 支持 `.env.local`（git 忽略）：`REAI_CARD_AP_PASSWORD` / `REAI_CARD_WIFI_SSID` / `REAI_CARD_WIFI_PASSWORD` 自动导出给 `make web`，私密配置不再需要外层包装 Makefile。
 - `clear_config(key) -> bool`：幂等删除——nRF 缺键回 `code 3`、**ESP32 缺键回 `code 1 "配置删除失败"`**（与真实失败无法区分，路由键先读再删）；`clear_control_action` 改用它。`delete_config` 保持原语义。
 - **命令日志打码**：`WIFI_CONNECT` 的 `password`、`AUTH_ACTIVE` 的 `code` 在 📤 日志里显示为 `***`。
 - `OTA_WIFI_CHECK` 超时 10s → 30s（ESP32 现场做 TLS GET，旧固件连上路由后主循环还可能被其他网络操作占住）；`WifiStatus` 三个必填字段加 `serde(default)` 兼容旧固件缺字段。

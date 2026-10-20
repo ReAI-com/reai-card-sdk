@@ -40,6 +40,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 要求 Rust 1.93+（edition 2024）。`main` 分支可能领先于最新 tag（未发布改动见 [CHANGELOG](CHANGELOG.md)），要用最新 API 可改成 `branch = "main"`。
 
 - **macOS**：首次运行会弹蓝牙授权，需在「系统设置 → 隐私与安全性 → 蓝牙」里允许终端/应用。
+- **本机私密配置**：在仓库根放一个 `.env.local`（已 git 忽略）写 `REAI_CARD_AP_PASSWORD=…`（设备热点密码，供控制台提示）、`REAI_CARD_WIFI_SSID=…` / `REAI_CARD_WIFI_PASSWORD=…`（WiFi 升级专页预填），`make web` 会自动读入；SDK 本身不内置任何凭据。
 - **Linux**：需要 BlueZ 开发头文件（`sudo apt-get install libdbus-1-dev pkg-config`）。
 - **Windows**：未验证，进默认构建前请先用 `dyj_cli check` 跑一遍。
 
