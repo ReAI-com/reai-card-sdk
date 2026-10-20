@@ -10,6 +10,8 @@ pub mod access_point;
 pub mod audio;
 pub mod controls;
 mod device;
+pub mod dfu;
+pub mod ota;
 mod protocol;
 pub mod recording;
 pub mod transport;
@@ -25,6 +27,11 @@ pub use device::{
     CONFIG_KEY_MAX_BYTES, CONFIG_VALUE_MAX_BYTES, DyjDevice, RealtimeRecordingSession,
     config_key_routes_to_wifi_module,
 };
+pub use dfu::{
+    DFU_ADVERTISED_NAME, DFU_CONTROL_POINT_UUID, DFU_PACKET_UUID, DFU_SERVICE_UUID, DfuOptions,
+    DfuPackage, DfuProgress, DfuReport, DfuStage, DfuTarget, DfuTransport, SharedDfuTransport,
+};
+pub use ota::{OtaInfo, OtaModule};
 pub use recording::{RecordingFileName, SavedRecording, WavFile, apm_to_wav, recording_file_name};
 pub use transport::{BleTransport, NotificationStream, SharedTransport};
 pub use types::*;
@@ -98,4 +105,13 @@ pub enum SdkError {
     SdOwnedByWifiModule { command: String },
     #[error("system time predates the Unix epoch")]
     InvalidSystemTime,
+    #[error("DFU package error: {0}")]
+    DfuPackage(String),
+    #[error("DFU {operation} failed (result 0x{result:02x}, extended {extended:?}): {message}")]
+    Dfu {
+        operation: &'static str,
+        result: u8,
+        extended: Option<u8>,
+        message: String,
+    },
 }

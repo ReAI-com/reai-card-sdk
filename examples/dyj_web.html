@@ -316,9 +316,23 @@
     </div>
     <div class="group"><h3><span class="no">09</span>OTA</h3>
       <div class="row">
-        <button onclick="cmd('OTA_WIFI_CHECK')">检查</button>
-        <button onclick="cmd('OTA_WIFI_UPDATE')">升级</button>
+        <button onclick="cmd('OTA_WIFI_CHECK')">在线检查</button>
+        <button onclick="cmd('OTA_WIFI_UPDATE')">在线升级</button>
         <button onclick="cmd('OTA_WIFI_STATUS')">进度</button>
+      </div>
+      <div class="row" style="color:var(--dim);font-size:11px">在线 OTA 需 STA 已连 + wifi_api_base_url 服务；下面两条不需要服务器。</div>
+      <div class="row">
+        <input type="file" id="dfuZip" accept=".zip" style="max-width:180px">
+        <button onclick="dfuUpload()">主控 DFU 升级</button>
+      </div>
+      <div class="row">
+        <input type="file" id="wifiBin" accept=".bin" style="max-width:180px">
+        <button onclick="apOtaUpload()">WiFi 本地升级</button>
+        <button onclick="apOtaCheck()">WiFi 当前版本</button>
+      </div>
+      <div class="row" style="color:var(--dim);font-size:11px;line-height:1.6">
+        主控：发 OTA → 设备重启进 bootloader（DFU_DYJ）→ 推 .zip 包（约 1–2 分钟，进度看日志）→ 自动重启进新固件，之后需重新扫描连接。
+        WiFi 本地：需电脑已连设备热点，上传 .bin 后 ESP32 3 秒自重启。
       </div>
     </div>
     <div class="group"><h3><span class="no">10</span>LED 系统</h3>
@@ -563,6 +577,46 @@ async function delUpload() {
 function cfgGet() { const k = $('cfgKey').value.trim(); if (k) cmd('CONFIG_GET', {key: k}); }
 function cfgSet() { const k = $('cfgKey').value.trim(); if (k) cmd('CONFIG_SET', {key: k, value: $('cfgVal').value}); }
 function cfgDel() { const k = $('cfgKey').value.trim(); if (k && confirm(`删除配置 ${k}？`)) cmd('CONFIG_DEL', {key: k}); }
+
+// ---------- 固件升级 ----------
+async function uploadForm(path, form, busyText) {
+  setBusy(true, busyText);
+  try {
+    const resp = await fetch(path, {method:'POST', body: form});
+    const data = await resp.json().catch(() => null);
+    show(data);
+    if (!resp.ok) addLog({level:'ERROR', line:`${now()} ❌ [HTTP] ${path} 请求失败: ${data?.error ?? resp.status}`});
+    return resp.ok ? data : null;
+  } catch (error) {
+    addLog({level:'ERROR', line:`${now()} ❌ [HTTP] ${path} 网络异常: ${error}`});
+    return null;
+  } finally { setBusy(false); }
+}
+async function dfuUpload() {
+  const file = $('dfuZip').files[0];
+  if (!file) { alert('先选择 nrfutil 生成的 .zip 包（如 app_update_v306.zip）'); return; }
+  if (!confirm(`用 ${file.name} 升级主控？设备会重启进 DFU 模式并推送固件（约 1–2 分钟），期间请勿断电。`)) return;
+  const form = new FormData();
+  form.append('package', file);
+  const data = await uploadForm('/api/dfu', form, 'DFU 升级中…');
+  // 无论成败设备都已离开应用固件，连接作废
+  connected = false;
+  $('connState').className = 'badge off';
+  $('connState').textContent = data ? '升级完成·待重连' : '未连接';
+  reopenAudioSocket();
+}
+async function apOtaUpload() {
+  const file = $('wifiBin').files[0];
+  if (!file) { alert('先选择 ESP32 固件 .bin（如 esp32c3wifi.ino.bin）'); return; }
+  if (!confirm(`上传 ${file.name}（${file.size} 字节）到 WiFi 模块？需电脑已连接设备热点；成功后 ESP32 自动重启。`)) return;
+  const form = new FormData();
+  form.append('firmware', file);
+  await uploadForm('/api/ap/ota/upload', form, 'WiFi 固件上传中…');
+}
+async function apOtaCheck() {
+  setBusy(true);
+  try { await api('/api/ap/ota/check', {method:'GET'}); } finally { setBusy(false); }
+}
 
 // ---------- 按键 / 开关绑定 ----------
 async function ctlList() {

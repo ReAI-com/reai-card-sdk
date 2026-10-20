@@ -37,7 +37,10 @@ The wire protocol does not contain a request ID. The SDK consequently permits on
 | Recording | `start_recording`, `stop_recording`, `toggle_recording`, `record_status`, `set_realtime_enabled`, `record_mark`, `start_realtime_recording`, `subscribe_audio` | `RECORD_*`, `RECORD` |
 | Files | `list_files`, `delete_file`, `clear_files`, `take_file_to` | `FILE_LIST`, `FILE_DELETE`, `FILE_CLEAR`, `FILE_UPLOAD` |
 | WiFi / AP control | `open_wifi`, `close_wifi`, `scan_wifi`, `connect_wifi`, `disconnect_wifi`, `wifi_status`, `start_access_point`, `stop_access_point`, `access_point_status` | `WIFI_*`, `AP_*` through nRF UART passthrough |
-| AP fast transfer | `AccessPointClient::{device_info,list_files,download_file_to,delete_file}` | ESP32 HTTP `GET /api/files`, `GET /api/files/download`, `DELETE /api/files/delete` |
+| AP fast transfer | `AccessPointClient::{device_info,list_files,download_file_to,download_to_dir,delete_file}` | ESP32 HTTP `GET /api/files`, `GET /api/files/download`, `DELETE /api/files/delete` |
+| AP-mode WiFi OTA | `AccessPointClient::{ota_status,upload_firmware}` | ESP32 HTTP `GET /api/ota/check`, `POST /api/ota/upload` (multipart `firmware`) |
+| Main-controller DFU | `DeviceManager::{scan_dfu_targets,connect_dfu,update_main_firmware}`, `DfuTarget::upload`, `DfuPackage` | `OTA` to enter the bootloader, then Nordic Secure DFU over GATT `0xFE59` |
+| OTA info | `OtaInfo::{fetch,is_newer_than,download}` | API server `GET /api/ota/info?mod=main\|wifi` |
 | STA upload/auth | `list_uploads`, `upload_file_via_sta`, `delete_upload`, `clear_uploads`, `activate`, `clear_activation` | `UPLOAD_*`, `AUTH_*` |
 | WiFi OTA | `check_wifi_ota`, `start_wifi_ota`, `update_wifi_firmware`, `wifi_ota_status` | `OTA_WIFI_CHECK`, `OTA_WIFI_UPDATE` (+ `OTA_WIFI_PROCESS` pushes), `OTA_WIFI_STATUS` |
 | Device config | `set_config`, `get_config`, `config_value`, `delete_config`, `set_sta_*`/`sta_*`, `set_wifi_ota_info_path`/`wifi_ota_info_path`, `config_key_routes_to_wifi_module`, `set_led(LedState)`, `test_modules` | `CONFIG_*`, `LED`, `TEST_CHECK` |
@@ -125,7 +128,40 @@ The ESP32 updates itself over STA; the nRF is not involved beyond passthrough. P
 
 Status vocabulary (`OtaStatus`): `IDLE`, `CHECKING`, `UPDATE_AVAILABLE`, `DOWNLOADING`, `SUCCESS`, `FAILED`; anything else is carried as `Other(String)`. `wifi_ota_status()` reads the same structure on demand.
 
-The nRF's own `OTA` command (`enter_dfu_mode`) is unrelated: it reboots the main controller into the Nordic Secure DFU bootloader (BLE link drops, the device re-advertises for the DFU protocol). Discovering and transferring the DFU package is a separate Nordic protocol and is deliberately outside this SDK.
+### AP-mode WiFi OTA (no internet needed)
+
+The ESP32 web server that serves the fast-transfer file API also accepts firmware while the host is joined to the device hotspot:
+
+- `GET /api/ota/check` → `{currentVersion, currentVersionCode, chipModel, freeHeap, otaReady}` (`AccessPointClient::ota_status`). The device has no uplink in AP mode, so the *latest* version must come from `OtaInfo::fetch(..., OtaModule::Wifi)` obtained while the host still had internet; compare `version_code` with `current_version_code` on the host.
+- `POST /api/ota/upload`, `multipart/form-data` with the `.bin` in field `firmware` (`AccessPointClient::upload_firmware`). The ESP32 streams it into the inactive OTA partition (`Update.begin(UPDATE_SIZE_UNKNOWN)`), answers `200 {"success":true,"size":N,"restart":true}` and **restarts 3 seconds later** — the hotspot and HTTP server go away with it, `wifiOpen` stays true, and a fresh `WIFI_AP_START` arrives when the new firmware is up. Failure is `500 {"success":false,"error":"OTA update failed"}`, surfaced as `SdkError::Device { command: "POST /api/ota/upload", code: 500 }`; the ESP32 keeps running the old partition. There is no version check on the device: re-flashing the running version succeeds. The SDK allows 10 minutes for the upload (≈1.3 MB over the hotspot).
+
+### Main-controller DFU (Nordic Secure DFU over BLE)
+
+`OTA` (`enter_dfu_mode`) answers `code 0`, sets `GPREGRET = 0xB1` and resets. The nRF52840 comes back in the Secure Bootloader (nRF5 SDK 17.1, `nrf52840dk/bootloader`): advertising name `DFU_DYJ`, Secure DFU service `0xFE59`, no bonding required, `NRF_DFU_APP_DOWNGRADE_PREVENTION = 1`, hardware version 52, SoftDevice S140 7.2.0 (`--sd-req 0x100`), MTU up to 247. The device no longer exposes NUS, so the normal `DyjDevice` cannot talk to it; the SDK implements the Secure DFU client itself (`src/dfu.rs`) because Nordic ships DFU libraries for iOS/Android/RN/Flutter but nothing for Rust/desktop.
+
+Package: `nrfutil pkg generate --application <hex> --application-version N --hw-version 52 --sd-req 0x100 --key-file dfu_private_key.pem app_update_vN.zip` (`nrf52840dk/ota_package.sh`). The zip holds `manifest.json` → `application.{dat_file,bin_file}`; `DfuPackage::from_zip_*` reads exactly that and refuses packages that also carry SoftDevice/bootloader images (two-stage transfer, not implemented). The repository's `dfu_packages/app_update_v3xx.zip` version numbers equal the firmware `versionCode`.
+
+Protocol as driven by `DfuTarget::upload` (all integers little-endian):
+
+| Step | Control Point write | Response `0x60 <op> <result> …` |
+| --- | --- | --- |
+| Set PRN | `02 <prn u16>` | — |
+| Select command object | `06 01` | `max_size u32, offset u32, crc32 u32` |
+| Create command object | `01 01 <len u32>` | — |
+| init packet bytes | Packet characteristic, write-without-response, ≤ `packet_size` each | every `prn` packets: `60 03 01 offset crc` |
+| Calculate CRC / Execute | `03` / `04` | CRC → `offset crc`; Execute validates signature, hw/sd/fw version → extended errors |
+| Select data object | `06 02` | `max_size` (4096) + what the bootloader already holds |
+| per object | `01 02 <size>` → packets → `03` → `04` | repeated until the image is complete |
+
+Behaviour worth knowing: the CRC the bootloader reports is cumulative over the whole image, so the client keeps a running CRC32 (`crc32fast`) and compares after every PRN batch and before every Execute; an object whose CRC disagrees is re-created and re-sent (`object_retries`, default 3). `Select` also enables **resume**: if the bootloader already holds a prefix of the same image, the client continues inside the partially written object (or re-executes a completed-but-unexecuted one; the bootloader answers `operation not permitted` for a second Execute, which the SDK tolerates). A prefix that does not match the package restarts the current object; a mismatch inside already-executed data cannot be repaired — power-cycle the device. After the last Execute the bootloader checks the whole image and resets into the application; the link drops without a further response. Result codes map to `SdkError::Dfu { operation, result, extended }`; extended `0x05` is downgrade prevention (package `--application-version` below the installed one — equal versions pass), `0x06` hw-version, `0x07` sd-req, `0x0C` signature does not match the bootloader's public key.
+
+Transport defaults (`DfuOptions`): `packet_size = 20` (safe under the default 23-byte ATT MTU; btleplug does not expose the negotiated MTU, raise it only if you know the link allows up to 244), `prn = 10` (bounds in-flight write-without-response data — macOS can drop WWR packets silently; the PRN CRC catches that early), `response_timeout = 10 s` (init-packet Execute includes an ECDSA verify, ≈1 s). Throughput with the defaults is roughly 5–7 KB/s, i.e. one to two minutes for a 170 KB application.
+
+Known platform caveat: entering the bootloader via `GPREGRET` keeps the BLE address, so CoreBluetooth may serve the cached NUS GATT table on the first connection and no DFU characteristics are found. `connect_dfu` disconnects, waits one second and reconnects once; `scan_dfu_targets` filters on the advertised `0xFE59` service (advertising data is never cached). `DeviceManager::update_main_firmware` strings everything together: `OTA` → wait up to 20 s for `DFU_DYJ` → connect → upload. If it fails midway the device stays in DFU mode and keeps advertising; `scan_dfu_targets` + `connect_dfu` + `upload` resumes without sending `OTA` again.
+
+### OTA info API
+
+The product API server publishes `GET <api_base>/api/ota/info?mod=main` and `?mod=wifi` (no auth) → `{"version":"0.3.7","versionCode":307,"url":"https://…/app_update_v307.zip"}`. `OtaInfo::fetch` / `download` wrap the two HTTP calls and `is_newer_than(installed_version_code)` compares **only** `versionCode` (the `url` file name may lag behind `version`). For the main controller the comparison is the host's job (`BASE_INFO.versionCode`); for the WiFi module the ESP32 compares on its own during `OTA_WIFI_CHECK`, so hosts only need `OtaInfo` for the AP-mode path or for display.
 
 ## Events
 
@@ -171,5 +207,5 @@ Host-side throughput note: NUS runs 247-byte ATT MTU (244-byte notifications, TX
 | Item | Reason |
 | --- | --- |
 | `TEST_UPLOAD_EDIT` | ESP32 has a handler, but the nRF BLE parser does not pass this `TEST_` command through. |
-| Complete Nordic DFU transfer | `OTA` only switches firmware into DFU mode; package discovery and transfer use a separate Nordic DFU protocol and are not implemented. |
+| SoftDevice / bootloader DFU packages | `DfuPackage` accepts application-only packages; two-stage SoftDevice+bootloader updates are refused. Application updates are fully supported (see "Main-controller DFU"). |
 | Web Bluetooth UI | An independent manual test page kept with the firmware; not part of this SDK. |

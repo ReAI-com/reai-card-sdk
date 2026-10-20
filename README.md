@@ -22,6 +22,7 @@ ReAI 录音卡（DYJ-HD v2）的异步 Rust SDK：通过 BLE 控制设备、接�
 - [按键与侧边开关](#按键与侧边开关)
 - [录音文件：两条通道](#录音文件两条通道)
 - [WiFi 与热点](#wifi-与热点)
+- [固件升级](#固件升级)
 - [错误速查](#错误速查)
 - [测试工具](#测试工具)
 - [已知限制与路线图](#已知限制与路线图)
@@ -260,6 +261,51 @@ async fn prepare_ap(device: &DyjDevice) -> reai_card_sdk::Result<()> {
 - **ESP32 侧配置**（云上传 / OTA 用）：`set_sta_api_base_url` / `set_sta_websocket_base_url` / `set_sta_upload_path` / `set_wifi_ota_info_path` 及对应读取（`None` = 未配置）。这些键经 nRF 透传，要求模块已上电；通用的 `set_config` / `config_value` / `delete_config` 对键长（≤31 字节）值长（≤63 字节）做本地校验。
 - **WiFi 模块 OTA**：`check_wifi_ota()` 后 `update_wifi_firmware(wait)` 一步跟到 `Success`/`Failed`；需要 STA 已连且 `wifi_api_base_url` 服务可用（见[已知限制](#已知限制与路线图)）。主控进 DFU 用 `enter_dfu_mode()`。
 
+## 固件升级
+
+两颗芯片各有一条升级路径，都不需要改固件：
+
+| 目标 | 机制 | 需要什么 |
+| --- | --- | --- |
+| **主控 nRF52840** | `OTA` 命令让设备重启进 Nordic Secure Bootloader（广播 `DFU_DYJ`），SDK 内置 Secure DFU 客户端把 nrfutil `.zip` 包推过去 | 一个 `.zip` 包；版本号不低于已装版本（防降级，等版本可重刷） |
+| **WiFi 模块 ESP32**（热点本地） | 连上设备热点后 `POST /api/ota/upload` 上传 `.bin`，ESP32 写完 3 秒自重启 | 电脑连 `DYJ-HD-AP`；一个 `.bin` |
+| WiFi 模块（在线） | `check_wifi_ota()` → `update_wifi_firmware()`，设备自己从服务器下载 | STA 已连 + `wifi_api_base_url` 服务（见[已知限制](#已知限制与路线图)） |
+
+```rust,no_run
+use std::time::Duration;
+use reai_card_sdk::{DeviceManager, DfuOptions, DfuPackage, DyjDevice, OtaInfo, OtaModule};
+
+async fn upgrade_main(manager: &DeviceManager, device: &DyjDevice) -> reai_card_sdk::Result<()> {
+    // 要不要升级由你决定：服务器版本 vs BASE_INFO.versionCode
+    let installed = device.device_info().await?.version_code;
+    let latest = OtaInfo::fetch("https://hdd.dev.reai.com", OtaModule::Main).await?;
+    if !latest.is_newer_than(installed) {
+        return Ok(());
+    }
+    let package = DfuPackage::from_zip_bytes(&latest.download().await?)?;
+    // OTA → 等 DFU_DYJ 广播 → 连接 → 推包；成功后设备以新固件重启，重新扫描连接即可
+    let report = manager
+        .update_main_firmware(device, &package, &DfuOptions::default(), |p| {
+            println!("{:?} {}%", p.stage, p.percent())
+        })
+        .await?;
+    println!("{} 字节，{:.0}s", report.firmware_bytes, report.elapsed.as_secs_f64());
+    Ok(())
+}
+
+async fn upgrade_wifi_locally(device: &DyjDevice, firmware: Vec<u8>) -> reai_card_sdk::Result<()> {
+    let ap = device.access_point_client().await?;          // 电脑已连 DYJ-HD-AP
+    println!("当前 {}", ap.ota_status().await?.current_version);
+    ap.upload_firmware(firmware, "esp32c3wifi.bin").await?; // 成功后 ESP32 3 秒自重启
+    device.wait_for_ap_ready(Duration::from_secs(30)).await  // 热点重启后再用快传
+}
+```
+
+- 主控升级中途失败时设备停在 DFU 模式继续广播，用 `scan_dfu_targets()` + `connect_dfu()` + `DfuTarget::upload()` 可直接续传（bootloader 记得已收到的偏移），不必再发 `OTA`。
+- `DfuOptions::default()` 走 20 字节包 + 每 10 包一次回执，约 1–2 分钟传完 170 KB，稳妥优先；确认链路 MTU 后可把 `packet_size` 调到 244 提速。
+- 升级失败不会变砖：bootloader 校验不过保留旧应用；ESP32 写入失败留在旧分区。
+- `DfuPackage` 只接受应用镜像包；SoftDevice / bootloader 组合包不支持。
+
 ## 错误速查
 
 | `SdkError` | 含义 | 下一步 |
@@ -294,7 +340,8 @@ make web                                # 网页控制台 http://127.0.0.1:8787
 
 - **Windows 未验证**：btleplug 支持 Windows，但本 SDK 未在 Windows 上跑过真机。
 - **云上传（STA 模式上传到服务器）暂未启用**：`upload_file_via_sta` 等 API 已实现，但需要 STA 模式 + 接收服务器，当前固件默认热点模式，后续版本再启用。
-- **WiFi 模块 OTA 与云上传同源**：`check_wifi_ota` / `start_wifi_ota` 要求 STA 已连接，且从 `wifi_api_base_url` + `wifi_ota_info_path`（默认 `/ota/info?mod=wifi`）拉取 `{version, versionCode, url}`；没有该服务时无法真机验证，API 已实现、与云上传一并延后。主控 `enter_dfu_mode()` 不依赖服务器，但固件包传输本身不在 SDK 范围。
+- **WiFi 模块在线 OTA 与云上传同源**：`check_wifi_ota` / `update_wifi_firmware` 要求 STA 已连接，且从 `wifi_api_base_url` + `wifi_ota_info_path`（默认 `/ota/info?mod=wifi`）拉取 `{version, versionCode, url}`；没有该服务时无法真机验证，API 已实现、与云上传一并延后。**热点本地升级**（`AccessPointClient::upload_firmware`）和**主控 DFU**（`update_main_firmware`）都不依赖服务器，见[固件升级](#固件升级)。
+- **主控 DFU 的两个平台风险待真机确认**：经 `OTA` 进 bootloader 时蓝牙地址不变，macOS 可能沿用缓存的 GATT 表（SDK 会断开重连一次）；无响应写可能被系统静默丢弃（SDK 用 PRN 回执 + 对象 CRC 重试兜底）。
 - **AP_\* 透传**：当前固件 v0.3.x 不透传 `AP_START/AP_STOP/AP_STATUS`，相关 API 保留给未来固件。
 - **BLE 取走大文件**：固件以 200 B/25 ms 发送，MB 级文件请走热点快传。
 - **crates.io**：暂以 git tag 方式分发，发布到 crates.io 待定。

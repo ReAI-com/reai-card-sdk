@@ -11,7 +11,7 @@ use std::{collections::HashMap, net::SocketAddr, path::PathBuf, sync::Arc, time:
 
 use axum::{
     Json, Router,
-    extract::{Query, State, ws},
+    extract::{DefaultBodyLimit, Multipart, Query, State, ws},
     http::StatusCode,
     response::{
         Html, IntoResponse, Response,
@@ -24,8 +24,8 @@ use tokio::sync::{Mutex, RwLock, broadcast};
 
 use reai_card_sdk::{
     AP_DEFAULT_IP, AP_DEFAULT_PORT, AP_DEFAULT_SSID, AccessPointClient, ControlAction,
-    ControlBindings, ControlInput, DeviceEvent, DeviceManager, DyjDevice, PcmChunk,
-    RealtimeRecordingSession, SAMPLE_RATE_HZ, SavedRecording,
+    ControlBindings, ControlInput, DeviceEvent, DeviceManager, DfuOptions, DfuPackage, DfuStage,
+    DyjDevice, PcmChunk, RealtimeRecordingSession, SAMPLE_RATE_HZ, SavedRecording,
 };
 
 #[path = "common/mod.rs"]
@@ -118,6 +118,11 @@ async fn main() {
         .route("/api/controls/set", post(controls_set))
         .route("/api/controls/clear", post(controls_clear))
         .route("/api/controls/preset", post(controls_preset))
+        .route("/api/dfu", post(dfu_update))
+        .route("/api/ap/ota/check", get(ap_ota_check))
+        .route("/api/ap/ota/upload", post(ap_ota_upload))
+        // 固件上传：ESP32 .bin 约 1.3MB，nrfutil .zip 约 170KB；默认 2MB 限制不够
+        .layer(DefaultBodyLimit::max(16 * 1024 * 1024))
         .with_state(state);
 
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
@@ -617,6 +622,119 @@ async fn current_device(state: &AppState) -> ApiResult<DyjDevice> {
 
 fn invalid_body(message: &str) -> ApiError {
     ApiError(reai_card_sdk::SdkError::InvalidFrame(message.to_owned()))
+}
+
+// ========== 固件升级 ==========
+
+/// 从 multipart 里取名为 `field` 的文件（文件名, 内容），其余文本字段原样收集。
+async fn read_upload(
+    mut multipart: Multipart,
+    field: &str,
+) -> ApiResult<(String, Vec<u8>, HashMap<String, String>)> {
+    let mut file = None;
+    let mut fields = HashMap::new();
+    while let Some(part) = multipart
+        .next_field()
+        .await
+        .map_err(|error| invalid_body(&format!("multipart 解析失败: {error}")))?
+    {
+        let name = part.name().unwrap_or_default().to_owned();
+        if name == field {
+            let file_name = part.file_name().unwrap_or("upload.bin").to_owned();
+            let bytes = part
+                .bytes()
+                .await
+                .map_err(|error| invalid_body(&format!("读取 {field} 失败: {error}")))?;
+            file = Some((file_name, bytes.to_vec()));
+        } else {
+            let text = part
+                .text()
+                .await
+                .map_err(|error| invalid_body(&format!("读取字段 {name} 失败: {error}")))?;
+            fields.insert(name, text);
+        }
+    }
+    let (file_name, bytes) = file.ok_or_else(|| invalid_body(&format!("缺少文件字段 {field}")))?;
+    Ok((file_name, bytes, fields))
+}
+
+/// 主控 DFU 全流程：multipart `package`（nrfutil .zip）+ 可选 `packet_size`。
+/// 同步执行（约 1–2 分钟），进度每 5% 走一条日志；完成后设备以新固件重启，旧连接作废。
+async fn dfu_update(
+    State(state): State<Arc<AppState>>,
+    multipart: Multipart,
+) -> ApiResult<Json<serde_json::Value>> {
+    let (file_name, bytes, fields) = read_upload(multipart, "package").await?;
+    let package = DfuPackage::from_zip_bytes(&bytes)?;
+    let mut options = DfuOptions::default();
+    if let Some(size) = fields
+        .get("packet_size")
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|size| *size > 0)
+    {
+        options.packet_size = size;
+    }
+    let device = current_device(&state).await?;
+    tracing::info!(target: "dyj.dfu", "⬆️ 网页发起主控升级 {file_name}：init {} 字节，固件 {} 字节，packet {}", package.init_packet.len(), package.firmware.len(), options.packet_size);
+
+    // 录音会话在设备复位前收尾，避免后台还在尝试停录
+    if let Some(session) = state.recording.lock().await.take() {
+        let _ = session.stop().await;
+    }
+    let mut last: Option<(DfuStage, u8)> = None;
+    let report = state
+        .manager
+        .update_main_firmware(&device, &package, &options, move |progress| {
+            let bucket = progress.percent() / 5;
+            if last != Some((progress.stage, bucket)) {
+                let label = match progress.stage {
+                    DfuStage::InitPacket => "init packet",
+                    DfuStage::Firmware => "固件",
+                };
+                tracing::info!(target: "dyj.dfu", "⬆️ {label} {:>3}%（{}/{} 字节）", progress.percent(), progress.sent, progress.total);
+                last = Some((progress.stage, bucket));
+            }
+        })
+        .await;
+    // 无论成败，设备都已复位离开应用固件，旧连接作废
+    state.device.write().await.take();
+    let report = report?;
+    Ok(Json(serde_json::json!({
+        "fileName": file_name,
+        "initPacketBytes": report.init_packet_bytes,
+        "firmwareBytes": report.firmware_bytes,
+        "objects": report.objects,
+        "retries": report.retries,
+        "resumedFrom": report.resumed_from,
+        "elapsedSecs": report.elapsed.as_secs_f64(),
+        "hint": "bootloader 正在校验并重启进新固件，请稍后重新扫描连接；BASE_INFO 的 version 应为新版本",
+    })))
+}
+
+/// 热点模式读 WiFi 模块当前固件版本。
+async fn ap_ota_check(State(state): State<Arc<AppState>>) -> ApiResult<Json<serde_json::Value>> {
+    let device = current_device(&state).await?;
+    let client = device.access_point_client().await?;
+    Ok(Json(serde_json::to_value(client.ota_status().await?)?))
+}
+
+/// 热点模式本地升级 WiFi 模块：multipart `firmware`（.bin）。需电脑已连设备热点。
+async fn ap_ota_upload(
+    State(state): State<Arc<AppState>>,
+    multipart: Multipart,
+) -> ApiResult<Json<serde_json::Value>> {
+    let (file_name, bytes, _) = read_upload(multipart, "firmware").await?;
+    let device = current_device(&state).await?;
+    let client = device.access_point_client().await?;
+    let before = client.ota_status().await?;
+    tracing::info!(target: "dyj.ap", "⬆️ 网页发起 WiFi 模块本地升级 {file_name}（{} 字节），当前 {} (code {})", bytes.len(), before.current_version, before.current_version_code);
+    let result = client.upload_firmware(bytes, &file_name).await?;
+    Ok(Json(serde_json::json!({
+        "fileName": file_name,
+        "before": before,
+        "result": result,
+        "hint": "ESP32 将在 3 秒后重启，热点随之重启；稍后再点「快传状态」确认新版本（WIFI_AP_START 事件会再来一次）",
+    })))
 }
 
 // ========== 按键 / 侧边开关绑定 ==========

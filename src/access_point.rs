@@ -14,8 +14,12 @@ use crate::{
     recording::SavedRecording,
     types::{
         AccessPointDeviceInfo, AccessPointDownloadedFile, AccessPointFilePage, AccessPointInfo,
+        AccessPointOtaStatus, AccessPointOtaUpload,
     },
 };
+
+/// 经热点上传 1MB 级固件并等 ESP32 写完 flash 的总时长上限。
+const OTA_UPLOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
 
 /// HTTP client for the ESP32 file service reachable while the device AP is active.
 ///
@@ -170,6 +174,62 @@ impl AccessPointClient {
             .map_err(Into::into)
     }
 
+    /// AP 模式本地升级·第一步：读 ESP32 当前固件版本（`GET /api/ota/check`）。
+    /// 设备在热点模式下没有外网，最新版本要由上位机在有网时从 [`crate::OtaInfo`] 取得并比较。
+    pub async fn ota_status(&self) -> Result<AccessPointOtaStatus> {
+        let status: AccessPointOtaStatus = self
+            .client
+            .get(self.endpoint("api/ota/check")?)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        tracing::info!(target: "dyj.ap", "🌐 WiFi 模块当前固件 {} (code {}) otaReady={}", status.current_version, status.current_version_code, status.ota_ready);
+        Ok(status)
+    }
+
+    /// AP 模式本地升级·第二步：把 `.bin` 固件以 multipart（字段 `firmware`）上传到
+    /// `POST /api/ota/upload`。ESP32 边收边写 flash，成功后回 200 并在 3 秒后自行重启——
+    /// 热点与 HTTP 服务随之中断，之后请重新等待 `WIFI_AP_START`。固件不做版本检查，
+    /// 同版本重刷也会成功。
+    pub async fn upload_firmware(
+        &self,
+        firmware: Vec<u8>,
+        file_name: &str,
+    ) -> Result<AccessPointOtaUpload> {
+        let size = firmware.len();
+        tracing::info!(target: "dyj.ap", "⬆️ 上传 WiFi 固件 {file_name}（{size} 字节），ESP32 写 flash 可能需要数分钟");
+        let part = reqwest::multipart::Part::bytes(firmware)
+            .file_name(file_name.to_owned())
+            .mime_str("application/octet-stream")?;
+        let form = reqwest::multipart::Form::new().part("firmware", part);
+        let response = self
+            .client
+            .post(self.endpoint("api/ota/upload")?)
+            .multipart(form)
+            .timeout(OTA_UPLOAD_TIMEOUT)
+            .send()
+            .await?;
+        let status = response.status();
+        let body: AccessPointOtaUpload = response.json().await.unwrap_or_default();
+        if !status.is_success() || !body.success {
+            let message = body
+                .error
+                .clone()
+                .or(body.message.clone())
+                .unwrap_or_else(|| "OTA update failed".to_owned());
+            tracing::error!(target: "dyj.ap", "❌ WiFi 固件上传失败 http={status} {message}");
+            return Err(SdkError::Device {
+                command: "POST /api/ota/upload".to_owned(),
+                code: i32::from(status.as_u16()),
+                message,
+            });
+        }
+        tracing::info!(target: "dyj.ap", "✅ WiFi 固件已写入 {} 字节，ESP32 将在 3 秒后重启", body.size.unwrap_or(size as u64));
+        Ok(body)
+    }
+
     fn endpoint(&self, path: &str) -> Result<Url> {
         self.base_url
             .join(path)
@@ -276,6 +336,108 @@ mod tests {
                 .ends_with(saved.path.with_extension("wav").file_name().unwrap())
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 读完整个 HTTP 请求（头 + Content-Length 指定的体）。
+    fn read_full_request(socket: &mut std::net::TcpStream) -> Vec<u8> {
+        let mut buffer = Vec::new();
+        let mut chunk = [0_u8; 4096];
+        let header_end = loop {
+            let size = socket.read(&mut chunk).unwrap();
+            buffer.extend_from_slice(&chunk[..size]);
+            if let Some(index) = buffer.windows(4).position(|w| w == b"\r\n\r\n") {
+                break index + 4;
+            }
+        };
+        let headers = String::from_utf8_lossy(&buffer[..header_end]).to_string();
+        let length: usize = headers
+            .lines()
+            .find_map(|line| line.strip_prefix("content-length: "))
+            .map(|value| value.trim().parse().unwrap())
+            .unwrap_or(0);
+        while buffer.len() < header_end + length {
+            let size = socket.read(&mut chunk).unwrap();
+            buffer.extend_from_slice(&chunk[..size]);
+        }
+        buffer
+    }
+
+    #[tokio::test]
+    async fn uploads_firmware_as_multipart_and_reads_the_result() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let request = read_full_request(&mut socket);
+            let text = String::from_utf8_lossy(&request);
+            assert!(text.starts_with("POST /api/ota/upload HTTP/1.1"), "{text}");
+            assert!(text.contains("multipart/form-data"), "{text}");
+            assert!(text.contains("name=\"firmware\""), "{text}");
+            assert!(text.contains("filename=\"wifi_0.0.9.bin\""), "{text}");
+            assert!(
+                request.windows(4).any(|w| w == [0xE9, 1, 2, 3]),
+                "body must carry the firmware bytes"
+            );
+            let body = r#"{"success":true,"message":"OTA update successful, device will restart in 3 seconds","size":4,"restart":true}"#;
+            write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+        });
+
+        let result = AccessPointClient::new("127.0.0.1", port)
+            .unwrap()
+            .upload_firmware(vec![0xE9, 1, 2, 3], "wifi_0.0.9.bin")
+            .await
+            .unwrap();
+        server.join().unwrap();
+        assert!(result.success);
+        assert_eq!(result.size, Some(4));
+        assert_eq!(result.restart, Some(true));
+    }
+
+    #[tokio::test]
+    async fn firmware_upload_failure_surfaces_the_device_error() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let _ = read_full_request(&mut socket);
+            let body = r#"{"success":false,"error":"OTA update failed"}"#;
+            write!(socket, "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+        });
+
+        let error = AccessPointClient::new("127.0.0.1", port)
+            .unwrap()
+            .upload_firmware(vec![1, 2, 3], "fw.bin")
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            crate::SdkError::Device { code: 500, ref message, .. } if message == "OTA update failed"
+        ));
+    }
+
+    #[tokio::test]
+    async fn reads_the_current_wifi_firmware_version() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 1024];
+            let size = socket.read(&mut request).unwrap();
+            assert!(
+                std::str::from_utf8(&request[..size])
+                    .unwrap()
+                    .starts_with("GET /api/ota/check HTTP/1.1")
+            );
+            let body = r#"{"currentVersion":"0.0.9","currentVersionCode":9,"chipModel":"ESP32-C3","freeHeap":123456,"otaReady":true}"#;
+            write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+        });
+        let status = AccessPointClient::new("127.0.0.1", port)
+            .unwrap()
+            .ota_status()
+            .await
+            .unwrap();
+        assert_eq!(status.current_version_code, 9);
+        assert!(status.ota_ready);
     }
 
     #[tokio::test]

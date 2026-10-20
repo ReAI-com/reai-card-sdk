@@ -16,7 +16,8 @@
 use std::time::Duration;
 
 use reai_card_sdk::{
-    ControlAction, ControlBindings, ControlInput, DeviceEvent, DeviceManager, DyjDevice, LedState,
+    ControlAction, ControlBindings, ControlInput, DeviceEvent, DeviceManager, DfuOptions,
+    DfuPackage, DfuProgress, DfuStage, DyjDevice, LedState, OtaInfo, OtaModule,
 };
 use serde_json::Value;
 
@@ -83,6 +84,8 @@ fn usage() {
   delete <filename> | clear-files   删除类（clear-files 会删根目录全部文件）
   wifi open|close|status|scan|disconnect | wifi connect <ssid> <password>
   ap start|stop|status              ESP32 热点与快传入口
+  ap ota-check                      热点模式读 WiFi 模块当前固件版本（需已连热点）
+  ap ota-upload <fw.bin>            热点模式本地升级 WiFi 模块（multipart 上传，成功后 ESP32 3s 自重启）
   uploads list|upload <name>|delete <name>|clear
   config get <key> | config set <key> <value> | config del <key>
   controls list                      读六个按键/开关输入的绑定表
@@ -90,8 +93,13 @@ fn usage() {
                                      action: none|record_start|record_stop|record_toggle|record_mark
   controls clear <input> | controls preset recorder | controls reset
   led on|off|toggle
-  ota check|start|status            ESP32 OTA（需 STA 已连 + wifi_api_base_url 服务）
+  ota check|start|status            ESP32 在线 OTA（需 STA 已连 + wifi_api_base_url 服务）
   ota update [secs]                 check→update→跟进 OTA_WIFI_PROCESS 到 SUCCESS/FAILED（默认上限 600s）
+  ota info <api_base_url> main|wifi 查服务器最新版本（不需要设备）
+  dfu                               仅让主控进 DFU 模式（之后广播 DFU_DYJ）
+  dfu <package.zip> [packet_size]   主控完整升级：OTA 进 DFU → 扫 DFU_DYJ → Secure DFU 推包
+  dfu-scan                          扫描已在 DFU 模式的主控（不需要先连设备）
+  dfu-resume <package.zip> [packet_size]  对已在 DFU 模式的主控直接推包/续传
   auth activate <deviceId> <name> <code> | auth clear
   restart | shutdown | dfu
   events                             挂机只打印主动上报事件（Ctrl-C 退出）
@@ -111,9 +119,48 @@ async fn run(globals: &Globals, command: &[String]) -> reai_card_sdk::Result<()>
         return decode(&command[1..]).await;
     }
 
+    // 不需要设备的在线命令
+    if first == "ota" && command.get(1).map(String::as_str) == Some("info") {
+        let base = required(&command[2..], 0, "api base url")?;
+        let module = match required(&command[2..], 1, "main|wifi")? {
+            "main" => OtaModule::Main,
+            "wifi" => OtaModule::Wifi,
+            other => return Err(reai_card_sdk::SdkError::InvalidCommand(other.into())),
+        };
+        return print_json(serde_json::to_value(OtaInfo::fetch(base, module).await?)?);
+    }
+
     let manager = DeviceManager::new().await?;
     if first == "scan" {
         return scan(&manager, globals.scan_secs).await;
+    }
+    // bootloader 不提供 NUS，这两条直接找 DFU_DYJ，不走普通连接
+    if first == "dfu-scan" {
+        let targets = manager
+            .scan_dfu_targets(Duration::from_secs(globals.scan_secs))
+            .await?;
+        println!("{} DFU target(s)", targets.len());
+        for target in &targets {
+            println!("{}  name={} rssi={:?}", target.id, target.name, target.rssi);
+        }
+        return Ok(());
+    }
+    if first == "dfu-resume" {
+        let package = DfuPackage::from_zip_path(required(&command[1..], 0, "package.zip")?)?;
+        let options = dfu_options(command.get(2))?;
+        let target = manager
+            .scan_dfu_targets(Duration::from_secs(globals.scan_secs))
+            .await?
+            .into_iter()
+            .next()
+            .ok_or_else(|| reai_card_sdk::SdkError::DeviceNotFound("DFU_DYJ".into()))?;
+        println!("connecting DFU target {} ({}) ...", target.name, target.id);
+        let dfu = manager.connect_dfu(&target).await?;
+        let report = dfu
+            .upload(&package, &options, dfu_progress_printer())
+            .await?;
+        let _ = dfu.disconnect().await;
+        return print_dfu_report(&report);
     }
 
     let device = connect(&manager, globals).await?;
@@ -157,7 +204,24 @@ async fn run(globals: &Globals, command: &[String]) -> reai_card_sdk::Result<()>
         "auth" => auth(&device, rest).await,
         "restart" => print_json(serde_json::to_value(device.restart().await?)?),
         "shutdown" => print_json(serde_json::to_value(device.shutdown().await?)?),
-        "dfu" => print_json(serde_json::to_value(device.enter_dfu_mode().await?)?),
+        "dfu" => match rest.first() {
+            None => print_json(serde_json::to_value(device.enter_dfu_mode().await?)?),
+            Some(path) => {
+                let package = DfuPackage::from_zip_path(path)?;
+                let options = dfu_options(rest.get(1))?;
+                println!(
+                    "updating main firmware: init {} B, image {} B, packet {} B, prn {}",
+                    package.init_packet.len(),
+                    package.firmware.len(),
+                    options.packet_size,
+                    options.prn
+                );
+                let report = manager
+                    .update_main_firmware(&device, &package, &options, dfu_progress_printer())
+                    .await?;
+                print_dfu_report(&report)
+            }
+        },
         "events" => {
             println!("listening for device events, Ctrl-C to exit");
             loop {
@@ -452,8 +516,80 @@ async fn ap(device: &DyjDevice, rest: &[String]) -> reai_card_sdk::Result<()> {
         )?),
         "stop" => print_json(serde_json::to_value(device.stop_access_point().await?)?),
         "status" => print_json(serde_json::to_value(device.access_point_status().await?)?),
+        "ota-check" => {
+            let client = device.access_point_client().await?;
+            print_json(serde_json::to_value(client.ota_status().await?)?)
+        }
+        "ota-upload" => {
+            let path = required(rest, 1, "firmware .bin path")?;
+            let firmware = tokio::fs::read(path).await?;
+            let name = std::path::Path::new(path)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("firmware.bin")
+                .to_owned();
+            let client = device.access_point_client().await?;
+            let before = client.ota_status().await?;
+            println!(
+                "current WiFi firmware {} (code {}), uploading {} ({} bytes) ...",
+                before.current_version,
+                before.current_version_code,
+                name,
+                firmware.len()
+            );
+            let result = client.upload_firmware(firmware, &name).await?;
+            println!("ESP32 restarts in ~3s; wait for WIFI_AP_START before using the AP again");
+            print_json(serde_json::to_value(result)?)
+        }
         other => Err(reai_card_sdk::SdkError::InvalidCommand(other.into())),
     }
+}
+
+fn dfu_options(packet_size: Option<&String>) -> reai_card_sdk::Result<DfuOptions> {
+    let mut options = DfuOptions::default();
+    if let Some(size) = packet_size {
+        options.packet_size = size.parse().map_err(|_| {
+            reai_card_sdk::SdkError::InvalidCommand(format!("invalid packet size `{size}`"))
+        })?;
+    }
+    Ok(options)
+}
+
+/// 每 5% 或阶段切换时打一行进度。
+fn dfu_progress_printer() -> impl FnMut(DfuProgress) + Send {
+    let mut last: Option<(DfuStage, u8)> = None;
+    move |progress| {
+        let bucket = progress.percent() / 5;
+        if last != Some((progress.stage, bucket)) {
+            let label = match progress.stage {
+                DfuStage::InitPacket => "init packet",
+                DfuStage::Firmware => "firmware",
+            };
+            println!(
+                "dfu {label}: {:>3}% ({}/{} bytes)",
+                progress.percent(),
+                progress.sent,
+                progress.total
+            );
+            last = Some((progress.stage, bucket));
+        }
+    }
+}
+
+fn print_dfu_report(report: &reai_card_sdk::DfuReport) -> reai_card_sdk::Result<()> {
+    println!(
+        "dfu done: {} bytes in {:.1}s, {} objects, {} retries{}; bootloader validates and reboots into the new app",
+        report.firmware_bytes,
+        report.elapsed.as_secs_f64(),
+        report.objects,
+        report.retries,
+        if report.resumed_from > 0 {
+            format!(", resumed from {}", report.resumed_from)
+        } else {
+            String::new()
+        }
+    );
+    Ok(())
 }
 
 async fn uploads(device: &DyjDevice, rest: &[String]) -> reai_card_sdk::Result<()> {

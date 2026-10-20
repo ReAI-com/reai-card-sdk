@@ -274,6 +274,28 @@ pub struct AccessPointSdCardStatus {
     pub available: bool,
 }
 
+/// `GET /api/ota/check`：AP 模式下 ESP32 当前固件信息（设备无外网，不含最新版本）。
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct AccessPointOtaStatus {
+    pub current_version: String,
+    pub current_version_code: u32,
+    pub chip_model: String,
+    pub free_heap: u64,
+    pub ota_ready: bool,
+}
+
+/// `POST /api/ota/upload` 的响应。成功时 ESP32 在回复后 3 秒自行重启（热点随之重启）。
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct AccessPointOtaUpload {
+    pub success: bool,
+    pub message: Option<String>,
+    /// 写入的固件字节数。
+    pub size: Option<u64>,
+    pub restart: Option<bool>,
+    pub error: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AccessPointDownloadedFile {
     pub requested_path: String,
