@@ -1122,11 +1122,18 @@ fn event_from_frame(frame: &TextFrame) -> Option<DeviceEvent> {
         "WIFI_AP_START" => serde_json::from_value(frame.payload.clone())
             .ok()
             .map(DeviceEvent::AccessPointReady),
+        // 现固件把电源通知当裸 JSON 发（见 event_from_raw）；若将来按协议格式封装成
+        // `POWER:{json}`，这里映射到同一个事件，应用无需关心固件版本。
+        "POWER" => Some(
+            serde_json::from_value::<PowerEvent>(frame.payload.clone())
+                .map(DeviceEvent::Power)
+                .unwrap_or_else(|_| unhandled()),
+        ),
         _ => None,
     }
 }
 
-/// 无命令封装的裸 JSON：目前只有电源管理会这么发（`{"type":...}`）。
+/// 无命令封装的裸 JSON：现固件的电源管理直接写 BLE（`{"type":...}`），不走协议封装。
 fn event_from_raw(value: Value) -> DeviceEvent {
     match serde_json::from_value::<PowerEvent>(value.clone()) {
         Ok(power) => DeviceEvent::Power(power),
@@ -1716,6 +1723,28 @@ mod tests {
         match events.recv().await.unwrap() {
             DeviceEvent::Unhandled { command, payload } => {
                 assert!(command.is_empty());
+                assert_eq!(payload["type"], "mystery");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn framed_power_notification_maps_to_the_same_event() {
+        // 未来固件若按协议格式封装电源通知（POWER:{json}\r\n），应用拿到的事件不变。
+        let transport = Arc::new(MockTransport::new());
+        let device = DyjDevice::from_transport(transport.clone()).await.unwrap();
+        let mut events = device.subscribe_events();
+        transport.reply(b"POWER:{\"type\":\"shutdown_imminent\",\"seconds\":5}\r\n");
+        transport.reply(b"POWER:{\"type\":\"mystery\"}\r\n");
+        let _ = device.device_info().await.unwrap();
+        assert!(matches!(
+            events.recv().await.unwrap(),
+            DeviceEvent::Power(PowerEvent::ShutdownImminent { seconds: 5 })
+        ));
+        match events.recv().await.unwrap() {
+            DeviceEvent::Unhandled { command, payload } => {
+                assert_eq!(command, "POWER");
                 assert_eq!(payload["type"], "mystery");
             }
             other => panic!("unexpected {other:?}"),

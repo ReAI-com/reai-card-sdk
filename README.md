@@ -145,32 +145,54 @@ async fn realtime(device: &DyjDevice) -> reai_card_sdk::Result<()> {
 
 ## 按键与侧边开关
 
-录音卡有一个按键和一个侧边拨杆开关。它们做什么**由设备自己决定**：六个输入（按键单击 / 双击 / 长按 / 长按松开、开关 on / off）各绑定一个动作，存在设备 KV 配置里，重启后保留。输入触发时固件先上报事件，再在设备侧执行绑定的动作——上位机只需要订阅事件，不要再替它执行一遍。
+录音卡有一个按键和一个侧边拨杆开关。它们做什么**由设备自己决定**：六个输入（按键单击 / 双击 / 长按 / 长按松开、开关 on / off）各对应一个存在设备 KV 里的动作，输入触发时固件先上报事件、再在设备侧执行该动作。
+
+**SDK 在这里的职责只有一件：把事件类型化传出去。** `DeviceEvent::Button { gesture, action }` / `ToggleSwitch { position, action }` 里的 `action` 是设备**已经执行**（或因绑定为 `None` 而未执行）的动作，随后若录音状态变化还会跟一条 `RecordStatus { reason: Button | Switch }`。业务层据这些事件做自己的响应（UI、上报、联动其他设备）即可，**不要再替设备重放动作**。
+
+```rust,no_run
+use reai_card_sdk::{ControlAction, DeviceEvent, DyjDevice, SwitchPosition};
+
+async fn watch_controls(device: &DyjDevice) {
+    let mut events = device.subscribe_events();
+    while let Ok(event) = events.recv().await {
+        match event {
+            DeviceEvent::Button(e) => println!("按键 {}，设备执行了 {}", e.gesture, e.action),
+            DeviceEvent::ToggleSwitch(e) if e.position == SwitchPosition::On
+                && e.action == ControlAction::RecordStart =>
+            {
+                println!("用户拨开关开始录音了，准备接收音频")
+            }
+            _ => {}
+        }
+    }
+}
+```
+
+无论绑定是谁、何时写进设备的，只要实时传输开着（`set_realtime_enabled(true)`，设备上持久化），设备侧触发的录音会让 `subscribe_audio()` 的 PCM 块自动到达，上位机不需要发任何命令。
+
+### 可选：改写设备上的绑定表
+
+绑定表本身是六个 `CONFIG_*` 键（`btn_single / btn_double / btn_long_press / btn_long_release / switch_on / switch_off`），SDK 提供了它们的类型化透传。**这是可选能力**：用不用、何时用（例如放进你的设备设置页）、默认值是什么，都由业务层决定；SDK 不预设任何绑定。
 
 ```rust,no_run
 use reai_card_sdk::{ButtonGesture, ControlAction, ControlBindings, DyjDevice, SwitchPosition};
 
 async fn configure(device: &DyjDevice) -> reai_card_sdk::Result<()> {
-    // 单项绑定：开关拨到 on 开始录音、拨回 off 停止；单击在录音中打标记
+    // 单项写入
     device.set_control_action(SwitchPosition::On, ControlAction::RecordStart).await?;
-    device.set_control_action(SwitchPosition::Off, ControlAction::RecordStop).await?;
     device.set_control_action(ButtonGesture::Single, ControlAction::RecordMark).await?;
-
-    // 读回整表（没配置过的输入是 None）
+    // 读回整表（设备上没配置过的输入是 None）
     let bindings = device.control_bindings().await?;
     println!("{bindings:?}");
-
-    // 或者一次写入预设（开关控制录音、单击打点、双击切换）
+    // 整表写入；`recorder()` 只是一个示例预设（开关控制录音、单击打点、双击切换），不是默认值
     device.apply_control_bindings(&ControlBindings::recorder()).await?;
-    // 解绑：回到出厂的“什么都不做”
+    // 解绑：回到出厂的"什么都不做"
     device.clear_control_action(ButtonGesture::Double).await?;
     Ok(())
 }
 ```
 
-可用动作：`None`（不动作，默认）、`RecordStart`、`RecordStop`、`RecordToggle`、`RecordMark`；`ControlAction::Other(String)` 用来无损携带未来固件新增的值。
-
-把录音卡当作语音采集外设时的典型做法：绑定开关到 `RecordStart/RecordStop`，然后同时订阅 `subscribe_events()` 和 `subscribe_audio()`——用户拨开关，`RecordStatus { reason: Switch }` 事件到达，若实时传输开着（`set_realtime_enabled(true)`，设备上持久化），PCM 块随即开始到达，不需要上位机发任何命令。
+可用动作：`None`（不动作，出厂默认）、`RecordStart`、`RecordStop`、`RecordToggle`、`RecordMark`；`ControlAction::Other(String)` 用来无损携带未来固件新增的值。绑定存在设备 KV 里，重启后保留。
 
 ## 录音文件：两条通道
 

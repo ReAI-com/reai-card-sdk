@@ -5,7 +5,9 @@
 
 ## 0.0.3（未发布）
 
-按键 / 侧边开关进入 SDK 一等公民，事件全部类型化，并修复一个会丢帧的解码器问题。
+按键 / 侧边开关事件全部类型化，并修复一个会丢帧的解码器问题。
+
+**定位说明**：按键 / 开关在 SDK 里**只做事件传出**——固件在输入触发时先上报事件（带设备已执行的动作）再自己执行动作，业务层订阅事件做响应即可，不重放动作。随附的绑定 API 只是六个 `CONFIG_*` 键的类型化透传，**可选**：用不用、默认绑什么由业务层决定，SDK 不预设任何绑定（`ControlBindings::recorder()` 仅为示例预设）。
 
 **⚠️ 不兼容变更**（0.0.x 阶段、driver-v2 尚未接入，一次性收口）：
 
@@ -17,7 +19,7 @@
 新增：
 
 - **按键 / 开关绑定 API**（`controls` 模块）：`control_action` / `set_control_action` / `clear_control_action` / `control_bindings` / `apply_control_bindings`，覆盖固件六个输入（`btn_single/btn_double/btn_long_press/btn_long_release/switch_on/switch_off`）与五个动作（`none/record_start/record_stop/record_toggle/record_mark`）。未配置读为 `ControlAction::None`，解绑幂等（固件 `not found` 视为成功），`ControlBindings::recorder()` 提供录音笔式预设。`ButtonGesture`/`SwitchPosition` 可直接传入（`Into<ControlInput>`）。
-- **电源事件** `DeviceEvent::Power(PowerEvent)`：`ShutdownImminent { seconds }`（`SHUTDOWN` 响应后紧跟）、`DeviceWakeup`、`StartupComplete`。
+- **电源事件** `DeviceEvent::Power(PowerEvent)`：`ShutdownImminent { seconds }`（`SHUTDOWN` 响应后紧跟）、`DeviceWakeup`、`StartupComplete`。固件现状是**协议格式偏离**（裸 JSON，见下方修复项）；SDK 同时接受未来固件按协议格式封装的 `POWER:{json}\r\n` 文本帧，两种来源映射为同一事件。固件侧正确修法（`power_mgmt_event_handler` 改走 `app_protocol_send_event("POWER", …)`）已记入 `docs/protocol-support.md`，固件冻结仅记录。
 - `config_value(key) -> Option<String>`：键不存在返回 `None` 而非错误。
 - `dyj_cli` 新增 `controls list|set|clear|preset recorder|reset`，事件打印改为可读文本；`dyj_web` 新增「08 按键 / 开关」分组（读绑定表 / 绑定 / 解绑 / 预设）与 `/api/controls*` 接口。
 

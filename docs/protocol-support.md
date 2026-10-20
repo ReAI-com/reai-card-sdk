@@ -57,6 +57,8 @@ This powered-down short-circuit is not unique to `WIFI_STATUS`: every UART-passt
 
 The nRF stores one action per physical input in its KV settings (`setting_kv`, 16 slots shared with every other key, 32-byte keys / 64-byte values). When an input fires, `main.c` reads the key, reports the event **with the bound action** (`BTN_CLICK {"key","action"}` / `TOGGLE_SWITCH {"state","action"}`) and then performs the action itself on the device (deferred to the main loop because the button timer callback cannot touch the SD card or PDM). The host must not replay the action.
 
+Division of responsibility: the SDK's job here is to deliver the typed events (`DeviceEvent::Button` / `ToggleSwitch`, plus the `RECORD_STATUS` push with `reason: button|switch`). The binding methods (`control_action` / `set_control_action` / `clear_control_action` / `control_bindings` / `apply_control_bindings`) are only a typed pass-through over `CONFIG_GET/SET/DEL` for the six keys below — **optional**: whether, when and with which defaults the bindings are written is the application's decision, and the SDK ships no default binding (`ControlBindings::recorder()` is an example preset, nothing more).
+
 | Input | KV key | Reported as |
 | --- | --- | --- |
 | button single click | `btn_single` | `BTN_CLICK key=single` |
@@ -103,9 +105,18 @@ The event receiver emits typed `DeviceEvent`s for `BTN_CLICK` (`ButtonEvent { ge
 
 `RECORD_STATUS` pushes carry `reason` (`app`, `button`, `switch`, `auto` for the 10-minute auto-split, `unknown`) and, for `RECORD_EVT_ERROR`, an `error` code with `isRecording: false`. The same command name answers the `record_status()` query; that response has no `reason` and is also broadcast on the event channel.
 
-### Unframed power notifications
+### Protocol deviation: unframed power notifications
 
-`power_mgmt` in `main.c` writes three messages straight to `ble_uart_send` **without** the `COMMAND:` prefix and **without** a `\r\n` terminator: `{"type":"shutdown_imminent","seconds":5}` (right after the `SHUTDOWN` response, and before a low-battery/timer shutdown), `{"type":"device_wakeup"}` and `{"type":"startup_complete"}` (normally emitted before any BLE link exists, so rarely observed). A line-oriented parser would glue the first one to whatever frame follows and lose both. The SDK's `FrameDecoder` therefore treats a buffer that starts with `{` as a raw JSON object, cuts it at the JSON boundary as soon as it is complete (no newline needed), emits `DeviceEvent::Power(PowerEvent)`, and resumes normal line parsing on the remaining bytes. Raw JSON with an unknown `type` is delivered as `Unhandled` with an empty `command`; malformed raw JSON is dropped up to the next newline so the stream resynchronizes.
+The protocol defines one wire format for everything the device sends, including unsolicited events: `NAME:json\r\n` (`BTN_CLICK:{...}\r\n`, `RECORD_STATUS:{...}\r\n`, …), produced by `app_protocol.c respond()`. The power manager does **not** follow it. `power_mgmt_event_handler` in `main.c` writes three messages straight to `ble_uart_send`, **without** a command name and **without** the `\r\n` terminator: `{"type":"shutdown_imminent","seconds":5}` (right after the `SHUTDOWN` response, and before a low-battery/timer shutdown), `{"type":"device_wakeup"}` and `{"type":"startup_complete"}` (normally emitted before any BLE link exists, so rarely observed). A line-oriented parser glues the first one to whatever frame follows and loses both — in practice, any command answered during the 5-second shutdown countdown would time out.
+
+The SDK accepts both shapes and surfaces them as the same `DeviceEvent::Power(PowerEvent)`:
+
+| Shape | Who sends it | How the SDK handles it |
+| --- | --- | --- |
+| Raw `{"type":...}` with no name and no CRLF | v0.3.x firmware (current) | `FrameDecoder` treats a buffer starting with `{` as a raw JSON object, cuts it at the JSON boundary as soon as it is complete (no newline needed), and resumes line parsing on the remaining bytes. Unknown `type` → `Unhandled` with an empty `command`; malformed raw JSON is dropped up to the next newline so the stream resynchronizes. |
+| Framed `POWER:{"type":...}\r\n` | a future firmware that fixes the deviation | ordinary text frame; `event_from_frame` maps command `POWER` to `PowerEvent`, unknown `type` → `Unhandled { command: "POWER" }`. |
+
+Firmware-side fix (recorded, **not applied** — the v0.3.x firmware is frozen): replace the three `ble_uart_send(...)` calls in `power_mgmt_event_handler` with `app_protocol_send_event("POWER", json)` so the notices go through `respond()` and get the standard name + CRLF framing. Both SDK paths stay valid before and after that change.
 
 Event availability caveat: with the current ESP32 firmware the `UPLOAD_COMPLETE` notification is only sent from the automatic-upload loop, which is disabled (`UploadManager::loop` returns immediately). The `UPLOAD_FILE` command therefore reports completion through its own (delayed) response, not through `UPLOAD_COMPLETE`; treat `DeviceEvent::UploadComplete` as reserved for future firmware. `WIFI_AP_START` is emitted by the ESP32 boot flow once its AP and HTTP server are both up.
 
