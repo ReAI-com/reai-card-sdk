@@ -1523,12 +1523,25 @@ pub const DISPLAY_TIMEOUT_MAX_MS: u32 = 3_600_000;
 ///
 /// 点阵由调用方渲染（网页 canvas、字体栅格化、二维码等任意来源），
 /// 布局与固件文本路径一致：按列字节，每字节 bit0 为该 8 行页的顶行。
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct DisplayShowRequest {
     pub lines: Vec<String>,
     pub bitmap: Option<Vec<u8>>,
     pub persistent: bool,
     pub timeout_ms: u32,
+}
+
+impl Default for DisplayShowRequest {
+    /// 与 `text()` / `bitmap()` 一致：timeout_ms 默认 5000（派生 Default 会给 0，
+    /// 直接被 1..=3_600_000 的校验拒绝——网页控制台首测就栽在这里）。
+    fn default() -> Self {
+        Self {
+            lines: Vec::new(),
+            bitmap: None,
+            persistent: false,
+            timeout_ms: 5000,
+        }
+    }
 }
 
 impl DisplayShowRequest {
@@ -2535,6 +2548,27 @@ mod tests {
         assert_eq!(payload["lines"], json!(["HELLO", "DYJ"]));
         assert_eq!(payload["persistent"], json!(true));
         assert_eq!(payload["timeoutMs"], json!(5000));
+    }
+
+    #[tokio::test]
+    async fn display_show_default_struct_carries_usable_timeout() {
+        // 网页控制台用 Default 再填字段：timeout_ms 必须是可用默认值而不是 0
+        let transport = Arc::new(MockTransport::new());
+        let device = DyjDevice::from_transport(transport.clone()).await.unwrap();
+        let request = DisplayShowRequest {
+            lines: vec!["HELLO".into()],
+            ..Default::default()
+        };
+        device.display_show(&request).await.unwrap();
+        let sent = transport
+            .lines
+            .lock()
+            .await
+            .iter()
+            .find(|line| line.starts_with("DISPLAY_SHOW:"))
+            .cloned()
+            .unwrap();
+        assert!(sent.contains("\"timeoutMs\":5000"), "{sent}");
     }
 
     #[tokio::test]
