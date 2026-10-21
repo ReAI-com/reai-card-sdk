@@ -1743,7 +1743,7 @@ mod tests {
                     );
                 }
                 "WIFI_STATUS" => {
-                    self.reply(b"WIFI_STATUS:{\"status\":\"connected\",\"enabled\":true,\"connected\":true,\"mode\":\"sta\",\"ssid\":\"home\",\"ip\":\"192.168.1.23\",\"rssi\":-52}\r\n");
+                    self.reply(b"WIFI_STATUS:{\"version\":\"0.1.0\",\"versionCode\":100,\"status\":\"connected\",\"enabled\":true,\"connected\":true,\"mode\":\"sta\",\"ssid\":\"home\",\"ip\":\"192.168.1.23\",\"rssi\":-52}\r\n");
                 }
                 "BASE_INFO" => self.reply(b"BASE_INFO:{\"version\":\"0.3.6\",\"versionCode\":306,\"deviceId\":\"DYJ1\",\"deviceName\":\"DYJ\",\"timestamp\":1}\r\n"),
                 "FILE_LIST" => {
@@ -2330,6 +2330,18 @@ mod tests {
         let mark = device.record_mark().await.unwrap();
         assert_eq!(mark.filename, "059F19DF.APM");
         assert_eq!(mark.offset_secs, 53);
+    }
+
+    #[tokio::test]
+    async fn wifi_status_carries_live_module_version() {
+        let transport = Arc::new(MockTransport::new());
+        let device = DyjDevice::from_transport(transport.clone()).await.unwrap();
+        // wifi_status() 先查 STATE_INFO，模块未上电时合成 off 不上线；先上电再查
+        transport.wifi_open.store(true, Ordering::Relaxed);
+        let status = device.wifi_status().await.unwrap();
+        assert_eq!(status.version.as_deref(), Some("0.1.0"));
+        assert_eq!(status.version_code, Some(100));
+        assert_eq!(status.status, "connected");
     }
 
     #[tokio::test]

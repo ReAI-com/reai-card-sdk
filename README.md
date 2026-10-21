@@ -259,6 +259,7 @@ async fn prepare_ap(device: &DyjDevice) -> reai_card_sdk::Result<()> {
 - `access_point_client()` 不查询设备，直接使用固件固定端点（`AP_DEFAULT_IP:AP_DEFAULT_PORT`）；若连接建立时模块早已供电、收不到就绪事件，3 秒宽限后按“热点随上电自启”推断就绪。
 - 电脑没加入热点时 HTTP 请求会在 5 秒内失败（建连超时），不会挂死。
 - 连路由器：`connect_wifi(ssid, password)`（最长约 12 秒）、`wifi_status()`（模块断电时直接返回 `status:"off"`）、`scan_wifi()`、`disconnect_wifi()`。热点激活时固件会跳过自动连路由器，两者互斥。
+- **查模块固件版本**：`wifi_status()` 的 `version`/`version_code` 是模块实时版本（WiFi 0.1.0 起；旧固件为 `None`）。`BASE_INFO.wifiVersion` 是主控缓存（模块开机上报时刷新）；热点模式下 `/api/ota/check` 也是实时值。升级后核对版本优先用 `wifi_status()`。
 - `start_access_point` / `stop_access_point` / `access_point_status` 需要带 `AP_` 透传的未来固件，v0.3.x 上调用会等到超时；当前固件用不到它们。
 - **ESP32 侧配置**（上传 / OTA 用，WiFi 0.1.0 短键）：`set_sta_api_base_url`（`api_url`）/ `set_wifi_upload_url`（`upload_url`）/ `set_wifi_ota_info_path`（`ota_path`）及对应读取（`None` = 未配置）。这些键经 nRF 透传，要求模块已上电；通用的 `set_config` / `config_value` / `delete_config` 对键长（≤31 字节）值长（≤63 字节）做本地校验。
 - **WiFi 模块 OTA**：`check_wifi_ota()` 后 `update_wifi_firmware(wait)` 一步跟到 `Success`/`Failed`；需要 STA 已连且 `api_url` 服务可用（见[已知限制](#已知限制与路线图)）。主控进 DFU 用 `enter_dfu_mode()`。

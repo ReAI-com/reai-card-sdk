@@ -224,6 +224,11 @@ pub struct WifiStatus {
     pub ssid: Option<String>,
     pub ip: Option<String>,
     pub rssi: Option<i16>,
+    /// 模块固件实时版本（WiFi 0.1.0 起 `WIFI_STATUS` 自带；旧固件为 `None`，
+    /// 那时只能看 `BASE_INFO.wifiVersion`——那是主控的缓存）。
+    pub version: Option<String>,
+    #[serde(default, rename = "versionCode")]
+    pub version_code: Option<u32>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
