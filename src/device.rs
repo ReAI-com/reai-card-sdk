@@ -615,17 +615,49 @@ impl DyjDevice {
     /// Uploads a file over the ESP32 STA link. The firmware responds only after the whole
     /// HTTP upload finishes, so this call can legitimately run for minutes on large files.
     pub async fn upload_file(&self, name: &str) -> Result<CommandResponse> {
-        self.require_wifi_module("UPLOAD_FILE").await?;
-        self.request_success(
-            "UPLOAD_FILE",
-            Some(json!({"name": name})),
-            UPLOAD_FILE_TIMEOUT,
-        )
-        .await
+        self.upload_file_via_sta_to(name, None).await
     }
-    /// Requests that the ESP32 upload a file over its STA connection to the configured server.
+    /// Same as [`Self::upload_file_via_sta`], with an explicit target base URL
+    /// (WiFi 0.0.10+；旧固件会忽略 `url` 并回落 token 门控的旧链路).
+    pub async fn upload_file_via_sta_to(
+        &self,
+        name: &str,
+        url: Option<&str>,
+    ) -> Result<CommandResponse> {
+        self.require_wifi_module("UPLOAD_FILE").await?;
+        let mut payload = json!({"name": name});
+        if let Some(url) = url {
+            payload["url"] = json!(url);
+        }
+        self.request_success("UPLOAD_FILE", Some(payload), UPLOAD_FILE_TIMEOUT)
+            .await
+    }
+    /// Convenience alias kept from earlier releases.
     pub async fn upload_file_via_sta(&self, name: &str) -> Result<CommandResponse> {
-        self.upload_file(name).await
+        self.upload_file_via_sta_to(name, None).await
+    }
+    /// 逐个上传 `UPLOAD_LIST` 里的全部文件到 `url`，返回 (文件名, 结果) 列表；
+    /// 单个失败不中断其余文件。
+    pub async fn upload_all_via_sta(
+        &self,
+        url: Option<&str>,
+    ) -> Result<Vec<(String, Result<CommandResponse>)>> {
+        let entries = self.list_uploads().await?;
+        let mut results = Vec::new();
+        for entry in entries {
+            let Some(name) = entry.name else { continue };
+            let outcome = self.upload_file_via_sta_to(&name, url).await;
+            results.push((name, outcome));
+        }
+        Ok(results)
+    }
+    /// 持久化默认上传基址（`upload_url`，需主控 ≥0.3.7 + WiFi ≥0.0.10；值 ≤63 字节）。
+    pub async fn set_wifi_upload_url(&self, url: &str) -> Result<CommandResponse> {
+        self.set_config("upload_url", url).await
+    }
+    /// 读取持久化的默认上传基址（未配置返回 None）。
+    pub async fn wifi_upload_url(&self) -> Result<Option<String>> {
+        self.config_value("upload_url").await
     }
     pub async fn delete_upload(&self, name: &str) -> Result<CommandResponse> {
         self.require_wifi_module("UPLOAD_DELETE").await?;
@@ -658,7 +690,7 @@ impl DyjDevice {
     }
     // ========== WiFi 模块 OTA ==========
     //
-    // 需要 STA 已连上路由且能访问 `wifi_api_base_url` + `wifi_ota_info_path`
+    // 需要 STA 已连上路由且能访问 `api_url` + `ota_path`
     // （默认 `/ota/info?mod=wifi`，返回 `{version, versionCode, url}`）。没有该服务时
     // ESP32 回 `code 1 "OTA检查更新失败"`；STA 未连接回 `code 1 "WiFi未连接…"`。
 
@@ -757,44 +789,24 @@ impl DyjDevice {
         .await
     }
 
-    /// Sets the ESP32's relative upload route, for example `/record`.
-    pub async fn set_sta_upload_path(&self, path: &str) -> Result<CommandResponse> {
-        validate_relative_path(path, "STA upload path")?;
-        self.set_config("wifi_file_upload_path", path).await
-    }
-
-    /// `None` 表示未配置（ESP32 使用自身默认值）。
-    pub async fn sta_upload_path(&self) -> Result<Option<String>> {
-        self.config_value("wifi_file_upload_path").await
-    }
-
     pub async fn set_sta_api_base_url(&self, url: &str) -> Result<CommandResponse> {
         validate_url_scheme(url, &["http", "https"])?;
-        self.set_config("wifi_api_base_url", url).await
+        self.set_config("api_url", url).await
     }
 
     pub async fn sta_api_base_url(&self) -> Result<Option<String>> {
-        self.config_value("wifi_api_base_url").await
+        self.config_value("api_url").await
     }
 
-    pub async fn set_sta_websocket_base_url(&self, url: &str) -> Result<CommandResponse> {
-        validate_url_scheme(url, &["ws", "wss"])?;
-        self.set_config("wifi_ws_base_url", url).await
-    }
-
-    pub async fn sta_websocket_base_url(&self) -> Result<Option<String>> {
-        self.config_value("wifi_ws_base_url").await
-    }
-
-    /// ESP32 拉取 OTA 版本信息的相对路径（拼在 `wifi_api_base_url` 之后），
+    /// ESP32 拉取 OTA 版本信息的相对路径（拼在 `api_url` 之后），
     /// 例如 `/ota/info?mod=wifi`（未配置时的固件默认值）。
     pub async fn set_wifi_ota_info_path(&self, path: &str) -> Result<CommandResponse> {
         validate_relative_path(path, "WiFi OTA info path")?;
-        self.set_config("wifi_ota_info_path", path).await
+        self.set_config("ota_path", path).await
     }
 
     pub async fn wifi_ota_info_path(&self) -> Result<Option<String>> {
-        self.config_value("wifi_ota_info_path").await
+        self.config_value("ota_path").await
     }
 
     /// 原样返回 `CONFIG_GET` 响应；nRF 侧键不存在时固件回错误（`code 3`）。
@@ -945,6 +957,31 @@ impl DyjDevice {
             NORMAL_TIMEOUT,
         )
         .await
+    }
+    /// 在 OLED 上显示自定义内容（需主控固件 ≥0.3.7）。文本走设备内置 5×8 字体
+    /// （仅可打印 ASCII）；点阵/中文/图形由调用方渲染成 72×40 位图传入。
+    pub async fn display_show(&self, request: &DisplayShowRequest) -> Result<CommandResponse> {
+        request.validate()?;
+        let mut payload = serde_json::Map::new();
+        if !request.lines.is_empty() {
+            payload.insert("lines".into(), json!(request.lines));
+        }
+        if let Some(bitmap) = &request.bitmap {
+            use base64::Engine as _;
+            payload.insert(
+                "bitmap".into(),
+                json!(base64::engine::general_purpose::STANDARD.encode(bitmap)),
+            );
+        }
+        payload.insert("persistent".into(), json!(request.persistent));
+        payload.insert("timeoutMs".into(), json!(request.timeout_ms));
+        self.request_success("DISPLAY_SHOW", Some(Value::Object(payload)), NORMAL_TIMEOUT)
+            .await
+    }
+    /// 清除屏幕内容并复位显示超时（需主控固件 ≥0.3.7）。
+    pub async fn display_clear(&self) -> Result<CommandResponse> {
+        self.request_success("DISPLAY_CLEAR", None, NORMAL_TIMEOUT)
+            .await
     }
     pub async fn test_modules(&self) -> Result<Vec<ModuleCheck>> {
         // Firmware sends exactly one response for each of its 11 registered modules and no sentinel.
@@ -1337,11 +1374,110 @@ pub const CONFIG_KEY_MAX_BYTES: usize = 31;
 /// 设备 KV 配置值的最大字节数（nRF `handler_sys.c` 解析缓冲 `value[64]`）。
 pub const CONFIG_VALUE_MAX_BYTES: usize = 63;
 
-/// 该配置键是否由 nRF 透传给 ESP32（`wifi_` 前缀或 `_wifi` 后缀，
-/// 与固件 `strip_wifi_key` 规则一致）。透传键需要 WiFi 模块已上电，
-/// 且 ESP32 对不存在的键回空字符串而不是错误。
+/// 该配置键是否由 nRF 透传给 ESP32。与固件 `strip_wifi_key` 规则一致：
+/// `wifi_` 前缀 / `_wifi` 后缀，外加 WiFi 0.0.10 起的短键
+/// `upload_url` / `api_url` / `ota_path`（NVS 键名 15 字符硬限所致）。
 pub fn config_key_routes_to_wifi_module(key: &str) -> bool {
-    key.starts_with("wifi_") || key.ends_with("_wifi")
+    matches!(key, "upload_url" | "api_url" | "ota_path")
+        || key.starts_with("wifi_")
+        || key.ends_with("_wifi")
+}
+
+/// OLED 可见区点阵字节数：72×40 = 5 页 × 72 列，纵向字节、bit0 为页顶。
+pub const DISPLAY_BITMAP_BYTES: usize = 360;
+/// OLED 文本模式最大行数（可见区 40px 高 / 8px 行高）。
+pub const DISPLAY_MAX_LINES: usize = 5;
+/// OLED 每行可见字符数（5×8 字体 + 1px 间距，72px 宽）。
+pub const DISPLAY_LINE_CHARS: usize = 12;
+/// 显示超时上限（毫秒），与固件 `handler_display.c` 一致。
+pub const DISPLAY_TIMEOUT_MAX_MS: u32 = 3_600_000;
+
+/// `display_show` 的请求内容：`bitmap`（72×40 单色点阵）与 `lines`（ASCII 文本）
+/// 至少给一个，同时存在时固件按 bitmap 显示。
+///
+/// 点阵由调用方渲染（网页 canvas、字体栅格化、二维码等任意来源），
+/// 布局与固件文本路径一致：按列字节，每字节 bit0 为该 8 行页的顶行。
+#[derive(Debug, Clone, Default)]
+pub struct DisplayShowRequest {
+    pub lines: Vec<String>,
+    pub bitmap: Option<Vec<u8>>,
+    pub persistent: bool,
+    pub timeout_ms: u32,
+}
+
+impl DisplayShowRequest {
+    /// 文本模式：每行 ≤ [`DISPLAY_LINE_CHARS`] 个可打印 ASCII 字符，最多 [`DISPLAY_MAX_LINES`] 行。
+    pub fn text(lines: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        Self {
+            lines: lines.into_iter().map(Into::into).collect(),
+            bitmap: None,
+            persistent: false,
+            timeout_ms: 5000,
+        }
+    }
+
+    /// 点阵模式：`bytes` 必须恰好 [`DISPLAY_BITMAP_BYTES`] 字节。
+    pub fn bitmap(bytes: Vec<u8>) -> Self {
+        Self {
+            lines: Vec::new(),
+            bitmap: Some(bytes),
+            persistent: false,
+            timeout_ms: 5000,
+        }
+    }
+
+    /// 常显（不自动清屏，直到系统界面覆盖或 `display_clear`）。
+    pub fn persistent(mut self, on: bool) -> Self {
+        self.persistent = on;
+        self
+    }
+
+    /// 非常显时的自动清屏时长。
+    pub fn timeout_ms(mut self, ms: u32) -> Self {
+        self.timeout_ms = ms;
+        self
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self.lines.is_empty() && self.bitmap.is_none() {
+            return Err(SdkError::InvalidCommand(
+                "display_show requires `lines` or `bitmap`".into(),
+            ));
+        }
+        if self.lines.len() > DISPLAY_MAX_LINES {
+            return Err(SdkError::InvalidCommand(format!(
+                "display_show accepts at most {DISPLAY_MAX_LINES} lines, got {}",
+                self.lines.len()
+            )));
+        }
+        for line in &self.lines {
+            if line.chars().count() > DISPLAY_LINE_CHARS {
+                return Err(SdkError::InvalidCommand(format!(
+                    "display line `{line}` exceeds the visible {DISPLAY_LINE_CHARS} characters"
+                )));
+            }
+            if !line.chars().all(|c| (' '..='~').contains(&c)) {
+                return Err(SdkError::InvalidCommand(
+                    "display lines accept printable ASCII only; render other glyphs into `bitmap`"
+                        .into(),
+                ));
+            }
+        }
+        if let Some(bitmap) = &self.bitmap
+            && bitmap.len() != DISPLAY_BITMAP_BYTES
+        {
+            return Err(SdkError::InvalidCommand(format!(
+                "display bitmap must be exactly {DISPLAY_BITMAP_BYTES} bytes (72x40), got {}",
+                bitmap.len()
+            )));
+        }
+        if !(1..=DISPLAY_TIMEOUT_MAX_MS).contains(&self.timeout_ms) {
+            return Err(SdkError::InvalidCommand(format!(
+                "display timeout_ms must be within 1..={DISPLAY_TIMEOUT_MAX_MS}"
+            )));
+        }
+        Ok(())
+    }
 }
 
 fn validate_config_key(key: &str) -> Result<()> {
@@ -2138,15 +2274,15 @@ mod tests {
         assert!(device.clear_config("btn_single").await.unwrap());
         // ESP32 键：缺失时固件回 code 1，直接 delete_config 会报错，clear_config 先读再删
         assert!(matches!(
-            device.delete_config("wifi_api_base_url").await,
+            device.delete_config("api_url").await,
             Err(SdkError::Device { code: 1, .. })
         ));
-        assert!(!device.clear_config("wifi_api_base_url").await.unwrap());
+        assert!(!device.clear_config("api_url").await.unwrap());
         device
             .set_sta_api_base_url("https://dyj2.dev.reai.com/api")
             .await
             .unwrap();
-        assert!(device.clear_config("wifi_api_base_url").await.unwrap());
+        assert!(device.clear_config("api_url").await.unwrap());
         assert_eq!(device.sta_api_base_url().await.unwrap(), None);
     }
 
@@ -2196,6 +2332,155 @@ mod tests {
                 .await
                 .contains(&"LED:{\"state\":\"toggle\"}".to_owned())
         );
+    }
+
+    #[tokio::test]
+    async fn display_show_text_frame_carries_all_fields() {
+        let transport = Arc::new(MockTransport::new());
+        let device = DyjDevice::from_transport(transport.clone()).await.unwrap();
+        device
+            .display_show(&DisplayShowRequest::text(["HELLO", "DYJ"]).persistent(true))
+            .await
+            .unwrap();
+        let sent = transport
+            .lines
+            .lock()
+            .await
+            .iter()
+            .find(|line| line.starts_with("DISPLAY_SHOW:"))
+            .cloned()
+            .unwrap();
+        let payload: Value =
+            serde_json::from_str(sent.strip_prefix("DISPLAY_SHOW:").unwrap()).unwrap();
+        assert_eq!(payload["lines"], json!(["HELLO", "DYJ"]));
+        assert_eq!(payload["persistent"], json!(true));
+        assert_eq!(payload["timeoutMs"], json!(5000));
+    }
+
+    #[tokio::test]
+    async fn display_show_bitmap_is_base64_encoded() {
+        let transport = Arc::new(MockTransport::new());
+        let device = DyjDevice::from_transport(transport.clone()).await.unwrap();
+        device
+            .display_show(
+                &DisplayShowRequest::bitmap(vec![0u8; DISPLAY_BITMAP_BYTES]).timeout_ms(8000),
+            )
+            .await
+            .unwrap();
+        let sent = transport
+            .lines
+            .lock()
+            .await
+            .iter()
+            .find(|line| line.starts_with("DISPLAY_SHOW:"))
+            .cloned()
+            .unwrap();
+        let payload: Value =
+            serde_json::from_str(sent.strip_prefix("DISPLAY_SHOW:").unwrap()).unwrap();
+        use base64::Engine as _;
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(payload["bitmap"].as_str().unwrap())
+                .unwrap()
+                .len(),
+            DISPLAY_BITMAP_BYTES
+        );
+        assert_eq!(payload["timeoutMs"], json!(8000));
+        assert!(payload.get("lines").is_none());
+    }
+
+    #[tokio::test]
+    async fn display_show_rejects_invalid_input_locally() {
+        let transport = Arc::new(MockTransport::new());
+        let device = DyjDevice::from_transport(transport.clone()).await.unwrap();
+        let before = transport.commands.lock().await.len();
+        // 空、超行数、非 ASCII、超宽行、位图尺寸、超时范围
+        assert!(matches!(
+            device.display_show(&DisplayShowRequest::default()).await,
+            Err(SdkError::InvalidCommand(_))
+        ));
+        assert!(matches!(
+            device
+                .display_show(&DisplayShowRequest::text(["a"; DISPLAY_MAX_LINES + 1]))
+                .await,
+            Err(SdkError::InvalidCommand(_))
+        ));
+        assert!(matches!(
+            device
+                .display_show(&DisplayShowRequest::text(["中文"]))
+                .await,
+            Err(SdkError::InvalidCommand(_))
+        ));
+        let too_long = "x".repeat(DISPLAY_LINE_CHARS + 1);
+        assert!(matches!(
+            device
+                .display_show(&DisplayShowRequest::text([too_long]))
+                .await,
+            Err(SdkError::InvalidCommand(_))
+        ));
+        assert!(matches!(
+            device
+                .display_show(&DisplayShowRequest::bitmap(vec![0u8; 359]))
+                .await,
+            Err(SdkError::InvalidCommand(_))
+        ));
+        assert!(matches!(
+            device
+                .display_show(&DisplayShowRequest::text(["ok"]).timeout_ms(0))
+                .await,
+            Err(SdkError::InvalidCommand(_))
+        ));
+        assert_eq!(transport.commands.lock().await.len(), before);
+    }
+
+    #[tokio::test]
+    async fn upload_via_sta_to_carries_url_in_payload() {
+        let transport = Arc::new(MockTransport::new());
+        let device = DyjDevice::from_transport(transport.clone()).await.unwrap();
+        transport.wifi_open.store(true, Ordering::Relaxed);
+        device
+            .upload_file_via_sta_to(
+                "1A2B3C4D.apm",
+                Some("https://dyj2.dev.reai.com/api/upload/DYJ001"),
+            )
+            .await
+            .unwrap();
+        let sent = transport
+            .lines
+            .lock()
+            .await
+            .iter()
+            .find(|line| line.starts_with("UPLOAD_FILE:"))
+            .cloned()
+            .unwrap();
+        assert_eq!(
+            sent,
+            "UPLOAD_FILE:{\"name\":\"1A2B3C4D.apm\",\"url\":\"https://dyj2.dev.reai.com/api/upload/DYJ001\"}"
+        );
+    }
+
+    #[tokio::test]
+    async fn upload_url_config_routes_to_wifi_module() {
+        let transport = Arc::new(MockTransport::new());
+        let device = DyjDevice::from_transport(transport.clone()).await.unwrap();
+        transport.wifi_open.store(true, Ordering::Relaxed);
+        device
+            .set_wifi_upload_url("https://dyj2.dev.reai.com/api/upload/DYJ")
+            .await
+            .unwrap();
+        let sent = transport
+            .lines
+            .lock()
+            .await
+            .iter()
+            .find(|line| line.starts_with("CONFIG_SET:"))
+            .cloned()
+            .unwrap();
+        assert!(sent.starts_with("CONFIG_SET:{\"key\":\"upload_url\""));
+        for key in ["upload_url", "api_url", "ota_path", "wifi_ota_info_path"] {
+            assert!(config_key_routes_to_wifi_module(key));
+        }
+        assert!(!config_key_routes_to_wifi_module("btn_single"));
     }
 
     #[tokio::test]

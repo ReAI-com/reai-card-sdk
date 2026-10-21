@@ -87,8 +87,8 @@
   <div class="step"><h3><span class="no">3</span>OTA 服务器（通常无需改动） <span id="s3" class="badge">默认 dyj2</span></h3>
     <div class="row"><button onclick="readOtaConfig()">读当前配置</button><button onclick="serverInfo()">查服务器最新版本</button></div>
     <div class="row">
-      <input id="cfgBase" placeholder="https://dyj2.dev.reai.com/api" style="width:260px" title="wifi_api_base_url">
-      <input id="cfgPath" placeholder="/ota/info?mod=wifi" style="width:180px" title="wifi_ota_info_path">
+      <input id="cfgBase" placeholder="https://dyj2.dev.reai.com/api" style="width:260px" title="api_url">
+      <input id="cfgPath" placeholder="/ota/info?mod=wifi" style="width:180px" title="ota_path">
       <button class="danger" onclick="writeOtaConfig(false)">写入设备</button>
       <button class="danger" onclick="writeOtaConfig(true)">恢复固件默认（删除配置）</button>
     </div>

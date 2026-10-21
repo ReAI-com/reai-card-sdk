@@ -134,6 +134,10 @@ async fn main() {
         .route("/api/wifi/ota/versions", get(wifi_ota_versions))
         .route("/api/wifi/ota/check", get(wifi_ota_check))
         .route("/api/wifi/ota/update", post(wifi_ota_update))
+        .route("/api/display/show", post(display_show))
+        .route("/api/display/clear", post(display_clear))
+        .route("/api/upload/file", post(upload_file_to))
+        .route("/api/upload/all", post(upload_all))
         // 固件上传：ESP32 .bin 约 1.3MB，nrfutil .zip 约 170KB；默认 2MB 限制不够
         .layer(DefaultBodyLimit::max(16 * 1024 * 1024))
         .with_state(state);
@@ -731,14 +735,14 @@ async fn wifi_ota_set_config(
     let device = current_device(&state).await?;
     if let Some(base) = body.get("apiBaseUrl").and_then(serde_json::Value::as_str) {
         if base.trim().is_empty() {
-            device.clear_config("wifi_api_base_url").await?;
+            device.clear_config("api_url").await?;
         } else {
             device.set_sta_api_base_url(base.trim()).await?;
         }
     }
     if let Some(path) = body.get("otaInfoPath").and_then(serde_json::Value::as_str) {
         if path.trim().is_empty() {
-            device.clear_config("wifi_ota_info_path").await?;
+            device.clear_config("ota_path").await?;
         } else {
             device.set_wifi_ota_info_path(path.trim()).await?;
         }
@@ -837,6 +841,87 @@ async fn wifi_ota_update(
             })))
         }
     }
+}
+
+// ========== 屏幕显示 / STA 上传 ==========
+
+/// body：`{"lines": ["AB","CD"]} | {"bitmapBase64": "..."} | {"persistent": bool, "timeoutMs": n}`。
+/// bitmap 由网页 canvas 渲染成 72×40 单色点阵后 base64 传入（支持中文/图形）。
+async fn display_show(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<serde_json::Value>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let device = current_device(&state).await?;
+    let mut request = reai_card_sdk::DisplayShowRequest::default();
+    if let Some(lines) = body.get("lines").and_then(serde_json::Value::as_array) {
+        request.lines = lines
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .map(str::to_owned)
+            .collect();
+    }
+    if let Some(bitmap) = body.get("bitmapBase64").and_then(serde_json::Value::as_str) {
+        use base64::Engine as _;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(bitmap.trim())
+            .map_err(|error| invalid_body(&format!("bitmapBase64 非法: {error}")))?;
+        request.bitmap = Some(bytes);
+    }
+    if let Some(persistent) = body.get("persistent").and_then(serde_json::Value::as_bool) {
+        request.persistent = persistent;
+    }
+    if let Some(timeout) = body.get("timeoutMs").and_then(serde_json::Value::as_u64) {
+        request.timeout_ms = u32::try_from(timeout).unwrap_or(u32::MAX);
+    }
+    device.display_show(&request).await?;
+    Ok(Json(serde_json::json!({"ok": true})))
+}
+
+async fn display_clear(State(state): State<Arc<AppState>>) -> ApiResult<Json<serde_json::Value>> {
+    let device = current_device(&state).await?;
+    device.display_clear().await?;
+    Ok(Json(serde_json::json!({"ok": true})))
+}
+
+/// body：`{"name": "文件名", "url": "可选上传基址"}`。
+async fn upload_file_to(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<serde_json::Value>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let device = current_device(&state).await?;
+    let name = body
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| invalid_body("缺少 name 字段"))?;
+    let url = body.get("url").and_then(serde_json::Value::as_str);
+    tracing::info!(target: "dyj.wifi", "⬆️ 网页发起 STA 上传 name={name} url={:?}", url);
+    device.upload_file_via_sta_to(name, url).await?;
+    Ok(Json(serde_json::json!({"ok": true, "name": name})))
+}
+
+/// body：`{"url": "可选上传基址"}`。逐个上传 UPLOAD_LIST 里的全部文件，单个失败不中断。
+async fn upload_all(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<serde_json::Value>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let device = current_device(&state).await?;
+    let url = body.get("url").and_then(serde_json::Value::as_str);
+    tracing::info!(target: "dyj.wifi", "⬆️ 网页发起 STA 全量上传 url={:?}", url);
+    let results = device.upload_all_via_sta(url).await?;
+    let items: Vec<serde_json::Value> = results
+        .into_iter()
+        .map(|(name, outcome)| match outcome {
+            Ok(_) => serde_json::json!({"name": name, "ok": true}),
+            Err(error) => {
+                serde_json::json!({"name": name, "ok": false, "error": error.to_string()})
+            }
+        })
+        .collect();
+    let uploaded = items.iter().filter(|item| item["ok"] == true).count();
+    Ok(Json(
+        serde_json::json!({"total": items.len(), "uploaded": uploaded, "items": items}),
+    ))
 }
 
 // ========== 固件升级 ==========

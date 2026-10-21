@@ -316,7 +316,7 @@ pub struct ModuleCheck {
     pub result: bool,
 }
 
-/// `OTA_WIFI_CHECK` 的结果：ESP32 向 `wifi_api_base_url` + `wifi_ota_info_path`
+/// `OTA_WIFI_CHECK` 的结果：ESP32 向 `api_url` + `ota_path`
 /// 拉取版本信息后，告知是否有新固件。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
 #[serde(rename_all = "camelCase")]

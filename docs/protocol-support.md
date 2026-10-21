@@ -84,7 +84,7 @@ After `WIFI_OPEN`, the ESP32 owns SD-card access: every nRF-side card operation 
 | Mode | Workflow | Source-file behaviour |
 | --- | --- | --- |
 | AP quick transfer | `open_wifi` → wait for `WIFI_AP_START` (`wait_for_ap_ready`); join the AP `DYJ-HD-AP`; `access_point_client()` resolves the fixed endpoint `http://192.168.4.1:80` without any query; list and stream files over `/api/files`, `/api/files/download?path=…` (the firmware's traversal guard rejects a leading `/` in `path` with 403 — the client strips it, and the server joins the SD root itself). | HTTP download is read-only. HTTP deletion requires an explicit `delete_file`. |
-| STA cloud upload | Connect to a router, configure endpoint values if needed, then call `upload_file_via_sta`. | ESP32 upload manager deletes the local file after a successful server upload. Remote retrieval is governed by the configured service API, not this device protocol. |
+| STA cloud upload | Connect to a router, then call `upload_file_via_sta_to(name, url)` (or configure `upload_url` once and use `upload_file_via_sta`). | ESP32 streams the file via **HTTP POST** to `<url>/<generated-name>` and deletes the local file after a 2xx response. Remote retrieval is governed by the receiving service, not this device protocol. |
 
 AP mode is the firmware default: every `WIFI_OPEN` power-up auto-starts the SoftAP (fixed SSID `DYJ-HD-AP` with a fixed password that is deliberately not shipped in the SDK — the HTTP file API is unauthenticated, so the password is the only access control; take it from the device documentation —, IP `192.168.4.1`, HTTP port 80 — `ap_manager` never calls `softAPConfig` and its IP getter hardcodes the value) plus the file web server, then reports `WIFI_AP_START` as the readiness event. Because the AP endpoint is fixed, `access_point_client()` waits for that event and uses the constants (`AP_DEFAULT_IP`/`AP_DEFAULT_PORT`) instead of querying.
 
@@ -92,9 +92,29 @@ AP mode is the firmware default: every `WIFI_OPEN` power-up auto-starts the Soft
 
 Recording names carry the capture time. Each `.apm` has a sibling `.txt` (`{"timestamp":<unix s>,"synced":<bool>}`); the firmware derives `synced_<unix>.apm` (clock was synced) or `nosync_<unix>.apm` (clock was not — the value is not wall-clock time) and surfaces that name both in the `FILE_UPLOAD` start frame (`name`) and in the AP download's `Content-Disposition` filename (`AccessPointDownloadedFile::suggested_name`). `RecordingStamp::parse` decodes either; when the `.txt` is missing the firmware falls back to the raw `XXXXXXXX.APM` name and parsing yields `None`. There is no need to download the `.txt` separately.
 
+### STA upload protocol (WiFi 0.0.10)
+
+`UPLOAD_FILE {"name": "<SD file>", "url": "<base URL>"}` streams the file to the server over **plain HTTP POST** (the 0.0.9 hand-rolled WebSocket upload and its `auth/exchange` token gate are removed):
+
+- The device resolves the target as `url` from the request > `upload_url` config key > error `"上传地址未配置"`; it appends `/` + the generated recording name (`synced_/nosync_<unix>.apm`), so the URL is a per-device base such as `https://dyj2.dev.reai.com/api/upload/<deviceId>`.
+- Request: `Content-Type: application/octet-stream`, body = the raw file streamed from SD; headers `x-filename` (generated name), `x-filesize`, `x-format: adpcm`, plus `x-device-id` / `authorization: Bearer <token>` **when** those are set (no more hard requirement — activation is optional).
+- The command answers only after the transfer finishes (SDK timeout 600 s); a 2xx deletes the source `.apm` + `.txt` on the card, anything else keeps both and reports `上传失败`.
+- `UPLOAD_LIST` / `UPLOAD_DELETE` / `UPLOAD_CLEAR` are unchanged. The automatic upload loop stays disabled in firmware; uploads happen only on `UPLOAD_FILE`.
+
+The reference receiver is `dyj2.dev.reai.com` (`tools/uploadServer/` in the firmware repo): it validates `x-filesize`, stores under `uploads/<deviceId>/`, and answers `{"ok":true,"size":…,"sha256":…}` for host-side verification.
+
+### Custom display content (DISPLAY_SHOW / DISPLAY_CLEAR, main 0.3.7)
+
+The 128×64 OLED is driven over I2C from `display_buffer[8][128]`; only pages 0–4 × columns 0–71 fall inside the visible glass window, i.e. **72×40 px** with the 5×8 ASCII font giving 12 characters × 5 lines. Two new commands drive it from the host:
+
+- `DISPLAY_SHOW {"lines": ["AB", "CD"], "bitmap": "<base64>", "persistent": false, "timeoutMs": 5000}` — text uses the built-in font (printable ASCII only); `bitmap` decodes to exactly **360 bytes** written straight into `display_buffer[0..5][0..72]`. Byte layout mirrors the font rendering path: one byte per column, bit 0 = top row of its 8-pixel page. When both are present the bitmap wins. `persistent: true` keeps the frame until the next system screen or `DISPLAY_CLEAR`; otherwise `timeoutMs` (default 5000, ≤ 3 600 000) clears it via the existing `display_process()` tick. Any text longer than 12 chars per line and CJK/graphics must be rendered into a bitmap by the host (the `dyj_web` canvas panel does this, including Chinese).
+- `DISPLAY_CLEAR` — blank the screen and reset the timeout to the 5 s default.
+
+Precedence is deliberately boring: the custom frame is just another transient screen. Charging, recording, BLE and battery screens still override it whenever their events fire, and a non-persistent frame clears itself after `timeoutMs`. Frame budget: the nRF RX buffer and command-queue JSON grew from 256/255 to **1024 bytes** in 0.3.7 for exactly this command — a bitmap request is ≈530 bytes on the wire, so older firmware cannot receive it (the SDK does not gate this by version; a pre-0.3.7 device answers `unknown command`).
+
 ### Device KV configuration
 
-`CONFIG_SET/GET/DEL` is one command family backed by two stores. The nRF parses the request first (`handler_sys.c`, buffers `key[32]` / `value[64]`) and then routes it: a key that **starts with `wifi_` or ends with `_wifi`** is forwarded unchanged over UART to the ESP32 (`Preferences`, prefix `cfg_`), anything else lands in the nRF's own `setting_kv` (16 slots shared with every key, 32-byte keys / 64-byte values). The SDK exposes the same rule as `config_key_routes_to_wifi_module(key)` and applies it in three places:
+`CONFIG_SET/GET/DEL` is one command family backed by two stores. The nRF parses the request first (`handler_sys.c`, buffers `key[32]` / `value[64]`) and then routes it: a key that **starts with `wifi_` or ends with `_wifi`**, or — since main 0.3.7 / WiFi 0.0.10 — is exactly `upload_url`, `api_url` or `ota_path`, is forwarded unchanged over UART to the ESP32 (`Preferences`, prefix `cfg_`), anything else lands in the nRF's own `setting_kv` (16 slots shared with every key, 32-byte keys / 64-byte values). The SDK exposes the same rule as `config_key_routes_to_wifi_module(key)` and applies it in three places:
 
 - **Powered-module pre-check.** Routed keys need the ESP32 powered; otherwise the UART frame is never answered. `set_config`/`get_config`/`config_value`/`delete_config` fail fast with `WifiModulePoweredDown` for routed keys when `STATE_INFO.wifiOpen` is false.
 - **"Missing key" normalisation.** The two stores disagree: nRF answers `code 3 "not found"`, the ESP32 answers `{"key":…,"value":""}` (`Setting::getConfig(key, "")`). `config_value` returns `Ok(None)` for both (an empty string on a routed key counts as unset); `get_config` returns the raw response and therefore still errors on the nRF side.
@@ -110,10 +130,11 @@ Known keys on v0.3.x / WiFi v0.0.9:
 | `switch_on`, `switch_off` | nRF | host (`set_control_action`) | side switch position → `ControlAction` |
 | `low_power_mode` | nRF | firmware | deep-sleep flag used at boot; surfaced as `STATE_INFO.lowPowerMode`. Read-only for the host. |
 | `wifi_ver`, `wifi_ver_code` | nRF | firmware (`WIFI_SYNC`) | cached ESP32 version; surfaced as `BASE_INFO.wifiVersion/wifiVersionCode`. Despite the `wifi_` prefix these are stored on the nRF (the firmware writes them internally, bypassing the routing rule) — reading them from the host **is** routed to the ESP32 and returns `""`. |
-| `wifi_api_base_url` | ESP32 | host (`set_sta_api_base_url`) | `http://`/`https://` base URL for cloud upload, OTA info and auth |
-| `wifi_ws_base_url` | ESP32 | host (`set_sta_websocket_base_url`) | `ws://`/`wss://` base URL |
-| `wifi_file_upload_path` | ESP32 | host (`set_sta_upload_path`) | relative upload route, e.g. `/record` |
-| `wifi_ota_info_path` | ESP32 | host (`set_wifi_ota_info_path`) | relative OTA-info route; firmware default `/ota/info?mod=wifi` when unset |
+| `api_url` | ESP32 | host (`set_sta_api_base_url`) | `http://`/`https://` base URL for auth and OTA info (WiFi 0.0.10; ≤63 bytes like every config value) |
+| `upload_url` | ESP32 | host (`set_wifi_upload_url`) | default upload **base** URL for `UPLOAD_FILE` when the request carries no `url` (WiFi 0.0.10) |
+| `ota_path` | ESP32 | host (`set_wifi_ota_info_path`) | relative OTA-info route; firmware default `/ota/info?mod=wifi` when unset |
+
+**NVS key-length rule (and the v0.0.9 bug it explains).** ESP32 NVS rejects keys longer than 15 bytes, and `Setting::setConfig` prepends the `cfg_` prefix, so a config key may be at most **11 bytes**. The pre-0.0.10 keys `wifi_api_base_url`, `wifi_ws_base_url`, `wifi_file_upload_path`, `wifi_ota_info_path` (17–21 bytes, 20–25 with prefix) were therefore **never persistable**: `CONFIG_SET` on them always answered `code 1 "配置设置失败"` and every read silently fell back to the firmware defaults. WiFi 0.0.10 renames them to the short forms above (nothing to migrate — the old keys never held data), adds `upload_url`, and turns an over-long key into an explicit failure in `Setting::setConfig`. On main controllers older than 0.3.7 the short keys are *not* in the forwarding set and would be stored locally on the nRF instead — the `upload_url` fallback therefore needs main ≥0.3.7; the per-request `url` in `UPLOAD_FILE` works with any WiFi version that understands it (older firmware ignores the field).
 
 Slot budget on the nRF: 16 total, 3 used by firmware-internal keys, 6 by the control bindings → 7 free for application keys. ESP32 keys do not consume nRF slots.
 

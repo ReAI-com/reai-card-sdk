@@ -260,17 +260,22 @@
         一键检查：模块上电？→ 电脑已连热点？→ 已连则列出 AP 文件可直接下载；文件按录音时间命名存到 downloads/
       </div>
     </div>
-    <div class="group"><h3><span class="no">06</span>云上传</h3>
+    <div class="group"><h3><span class="no">06</span>STA 上传</h3>
+      <div class="row">
+        <input id="upUrl" placeholder="上传基址，如 https://dyj2.dev.reai.com/api/upload/<设备ID>" style="min-width:230px">
+      </div>
       <div class="row">
         <button onclick="listUploads()">待传列表</button>
+        <button class="primary" onclick="runUploadAll()">全部上传</button>
       </div>
       <div class="row">
         <input id="upName" placeholder="文件名">
-        <button class="danger" onclick="runUpload()">上传阻塞</button>
+        <button class="danger" onclick="runUpload()">上传单个</button>
         <button class="danger" onclick="delUpload()">删除</button>
       </div>
       <div class="row" style="color:var(--faint);font-size:11px;line-height:1.5">
-        需要 STA 模式 + 已配置接收服务器；当前固件默认 AP，此组暂不可测（延后）
+        需 WiFi 0.0.10+：先在 04 组 WIFI_OPEN + WIFI_CONNECT 连路由再传；成功后设备自动删源文件。
+        基址留空则用设备里 CONFIG 的 upload_url；服务端文件对账见 /api/files/&lt;设备ID&gt;
       </div>
     </div>
     <div class="group"><h3><span class="no">07</span>配置</h3>
@@ -320,7 +325,7 @@
         <button onclick="cmd('OTA_WIFI_UPDATE')">在线升级</button>
         <button onclick="cmd('OTA_WIFI_STATUS')">进度</button>
       </div>
-      <div class="row" style="color:var(--dim);font-size:11px">在线 OTA 需 STA 已连 + wifi_api_base_url 服务；下面两条不需要服务器。</div>
+      <div class="row" style="color:var(--dim);font-size:11px">在线 OTA 需 STA 已连 + api_url 服务；下面两条不需要服务器。</div>
       <div class="row">
         <input type="file" id="dfuZip" accept=".zip" style="max-width:180px">
         <button onclick="dfuUpload()">主控 DFU 升级</button>
@@ -351,6 +356,21 @@
         <button class="danger" onclick="sysDanger('OTA','进入 DFU 模式？连接会断开。')">DFU</button>
       </div>
     </div>
+    <div class="group"><h3><span class="no">11</span>屏幕（0.3.7+）</h3>
+      <div class="row">
+        <input id="dispLine1" placeholder="第1行 ASCII≤12" maxlength="12">
+        <input id="dispLine2" placeholder="第2行" maxlength="12">
+      </div>
+      <div class="row">
+        <label><input type="checkbox" id="dispPersistent">常显</label>
+        <button onclick="displaySendText()">发文本</button>
+        <button onclick="displaySendCanvas()">发画布</button>
+        <button onclick="api('/api/display/clear',{method:'POST'})">清屏</button>
+      </div>
+      <div class="row" style="color:var(--faint);font-size:11px;line-height:1.5">
+        文本走设备 5×8 字体（仅 ASCII，12 字符 × 5 行）；「发画布」把下方 72×40 画布转点阵原样显示——中文/图形先渲染到画布。充电/录音等系统界面会照常覆盖自定义内容。
+      </div>
+    </div>
   </nav>
 
   <section>
@@ -377,6 +397,20 @@
       </div>
     </div>
     <div class="panel"><h3>结果</h3><div class="body"><pre id="resultOut">等待操作…</pre></div></div>
+    <div class="panel">
+      <h3>🖥️ 屏幕画布 72×40 <span style="margin-left:6px;color:var(--faint);font:11px var(--mono)">拖拽绘制 · 所见即所得 · 放大 4 倍</span></h3>
+      <div class="toolbar">
+        <input id="dispText" placeholder="输入文字（支持中文）" style="width:170px">
+        <button onclick="dispRenderText()">渲染到画布</button>
+        <button onclick="dispInitCanvas()">清空画布</button>
+        <button class="primary" onclick="displaySendCanvas()">发送到屏幕</button>
+        <label><input type="checkbox" id="dispPersistent2">常显</label>
+        <span style="color:var(--faint);font:11px var(--mono)">白=点亮（bit0=页顶，与固件字体同序）</span>
+      </div>
+      <div class="body">
+        <canvas id="dispCanvas" width="288" height="160" style="image-rendering:pixelated;cursor:crosshair;border:1px solid var(--line)"></canvas>
+      </div>
+    </div>
     <div class="panel"><h3>📁 文件列表</h3><div class="body" id="fileTable">尚未列出</div></div>
     <div class="panel"><h3>🎛️ 设备事件</h3><div class="body" id="eventList"><div class="evt" style="color:var(--dim)">等待事件…</div></div></div>
     <div class="panel">
@@ -565,10 +599,105 @@ async function listUploads() {
 async function runUpload() {
   const name = $('upName').value.trim();
   if (!name) return alert('请输入文件名');
-  if (!confirm(`上传 ${name} 到已配置的服务器？\n设备同步上传，期间界面阻塞，成功后删除源文件。`)) return;
-  setBusy(true, '上传中（可能数分钟）…');
-  try { await cmd('UPLOAD_FILE', {name}); }
+  const url = $('upUrl').value.trim();
+  if (!confirm(`上传 ${name}？\n设备同步 HTTP 上传，期间命令阻塞；成功后删除源文件。`)) return;
+  setBusy(true, 'STA 上传中（可能数分钟）…');
+  try { await api('/api/upload/file', {method:'POST', body:{name, url: url || undefined}}); }
   finally { setBusy(false); }
+}
+
+async function runUploadAll() {
+  const url = $('upUrl').value.trim();
+  if (!confirm('逐个上传「待传列表」里的全部文件？单个失败不中断。')) return;
+  setBusy(true, 'STA 全量上传中…');
+  try { await api('/api/upload/all', {method:'POST', body:{url: url || undefined}}); }
+  finally { setBusy(false); listUploads(); }
+}
+
+// ========== 屏幕 72×40 ==========
+const DISP_W = 72, DISP_H = 40, DISP_SCALE = 4;
+
+function dispCtx() {
+  const canvas = $('dispCanvas');
+  const ctx = canvas.getContext('2d', {willReadFrequently: true});
+  if (!canvas.dataset.ready) {
+    dispInitCanvas();
+    canvas.addEventListener('pointerdown', e => { canvas.dataset.painting = '1'; dispPaint(e); });
+    canvas.addEventListener('pointermove', e => { if (canvas.dataset.painting) dispPaint(e); });
+    window.addEventListener('pointerup', () => delete canvas.dataset.painting);
+    canvas.dataset.ready = '1';
+  }
+  return ctx;
+}
+
+function dispInitCanvas() {
+  const ctx = $('dispCanvas').getContext('2d');
+  ctx.fillStyle = '#000';
+  ctx.fillRect(0, 0, DISP_W * DISP_SCALE, DISP_H * DISP_SCALE);
+}
+
+function dispPaint(event) {
+  const canvas = $('dispCanvas');
+  const rect = canvas.getBoundingClientRect();
+  const col = Math.floor((event.clientX - rect.left) / DISP_SCALE);
+  const row = Math.floor((event.clientY - rect.top) / DISP_SCALE);
+  if (col < 0 || col >= DISP_W || row < 0 || row >= DISP_H) return;
+  const ctx = canvas.getContext('2d');
+  ctx.fillStyle = '#e8f4ff';
+  ctx.fillRect(col * DISP_SCALE, row * DISP_SCALE, DISP_SCALE, DISP_SCALE);
+}
+
+function dispRenderText() {
+  const text = $('dispText').value.trim();
+  if (!text) return alert('请输入文字');
+  const ctx = $('dispCanvas').getContext('2d');
+  dispInitCanvas();
+  // 在 72×40 逻辑坐标系上渲染，白字黑底，随画布点阵化
+  ctx.save();
+  ctx.scale(DISP_SCALE, DISP_SCALE);
+  ctx.fillStyle = '#fff';
+  ctx.textBaseline = 'top';
+  let size = 9;
+  ctx.font = `${size}px sans-serif`;
+  while (ctx.measureText(text).width > DISP_W - 2 && size > 5) {
+    size -= 0.5;
+    ctx.font = `${size}px sans-serif`;
+  }
+  ctx.fillText(text, 1, (DISP_H - size) / 2);
+  ctx.restore();
+}
+
+function dispExtractBitmap() {
+  const img = $('dispCanvas').getContext('2d').getImageData(0, 0, DISP_W * DISP_SCALE, DISP_H * DISP_SCALE).data;
+  const bytes = new Uint8Array(DISP_W * 5);
+  for (let page = 0; page < 5; page++) {
+    for (let col = 0; col < DISP_W; col++) {
+      let bits = 0;
+      for (let line = 0; line < 8; line++) {
+        const y = page * 8 + line;
+        const px = ((y * DISP_SCALE + 2) * DISP_W * DISP_SCALE + col * DISP_SCALE + 2) * 4;
+        if ((img[px] + img[px + 1] + img[px + 2]) / 3 > 100) bits |= (1 << line); // bit0=页顶
+      }
+      bytes[page * DISP_W + col] = bits;
+    }
+  }
+  return bytes;
+}
+
+async function displaySendCanvas() {
+  dispCtx(); // 确保画布已初始化
+  let binary = '';
+  dispExtractBitmap().forEach(b => binary += String.fromCharCode(b));
+  const body = {bitmapBase64: btoa(binary), persistent: $('dispPersistent2').checked};
+  setBusy(true, '发送点阵…');
+  try { await api('/api/display/show', {method:'POST', body}); }
+  finally { setBusy(false); }
+}
+
+async function displaySendText() {
+  const lines = [$('dispLine1').value, $('dispLine2').value].filter(v => v && v.trim());
+  if (!lines.length) return alert('请输入至少一行文字（ASCII）');
+  await api('/api/display/show', {method:'POST', body:{lines, persistent: $('dispPersistent').checked}});
 }
 
 async function delUpload() {

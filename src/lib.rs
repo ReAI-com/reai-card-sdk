@@ -24,8 +24,9 @@ pub use controls::{
     ToggleSwitchEvent,
 };
 pub use device::{
-    CONFIG_KEY_MAX_BYTES, CONFIG_VALUE_MAX_BYTES, DyjDevice, RealtimeRecordingSession,
-    config_key_routes_to_wifi_module,
+    CONFIG_KEY_MAX_BYTES, CONFIG_VALUE_MAX_BYTES, DISPLAY_BITMAP_BYTES, DISPLAY_LINE_CHARS,
+    DISPLAY_MAX_LINES, DISPLAY_TIMEOUT_MAX_MS, DisplayShowRequest, DyjDevice,
+    RealtimeRecordingSession, config_key_routes_to_wifi_module,
 };
 pub use dfu::{
     DFU_ADVERTISED_NAME, DFU_CONTROL_POINT_UUID, DFU_PACKET_UUID, DFU_SERVICE_UUID, DfuOptions,

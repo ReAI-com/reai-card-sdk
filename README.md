@@ -22,6 +22,7 @@ ReAI 录音卡（DYJ-HD v2）的异步 Rust SDK：通过 BLE 控制设备、接�
 - [按键与侧边开关](#按键与侧边开关)
 - [录音文件：两条通道](#录音文件两条通道)
 - [WiFi 与热点](#wifi-与热点)
+- [屏幕自定义显示](#屏幕自定义显示)
 - [固件升级](#固件升级)
 - [错误速查](#错误速查)
 - [测试工具](#测试工具)
@@ -259,8 +260,58 @@ async fn prepare_ap(device: &DyjDevice) -> reai_card_sdk::Result<()> {
 - 电脑没加入热点时 HTTP 请求会在 5 秒内失败（建连超时），不会挂死。
 - 连路由器：`connect_wifi(ssid, password)`（最长约 12 秒）、`wifi_status()`（模块断电时直接返回 `status:"off"`）、`scan_wifi()`、`disconnect_wifi()`。热点激活时固件会跳过自动连路由器，两者互斥。
 - `start_access_point` / `stop_access_point` / `access_point_status` 需要带 `AP_` 透传的未来固件，v0.3.x 上调用会等到超时；当前固件用不到它们。
-- **ESP32 侧配置**（云上传 / OTA 用）：`set_sta_api_base_url` / `set_sta_websocket_base_url` / `set_sta_upload_path` / `set_wifi_ota_info_path` 及对应读取（`None` = 未配置）。这些键经 nRF 透传，要求模块已上电；通用的 `set_config` / `config_value` / `delete_config` 对键长（≤31 字节）值长（≤63 字节）做本地校验。
-- **WiFi 模块 OTA**：`check_wifi_ota()` 后 `update_wifi_firmware(wait)` 一步跟到 `Success`/`Failed`；需要 STA 已连且 `wifi_api_base_url` 服务可用（见[已知限制](#已知限制与路线图)）。主控进 DFU 用 `enter_dfu_mode()`。
+- **ESP32 侧配置**（上传 / OTA 用，WiFi 0.0.10 短键）：`set_sta_api_base_url`（`api_url`）/ `set_wifi_upload_url`（`upload_url`）/ `set_wifi_ota_info_path`（`ota_path`）及对应读取（`None` = 未配置）。这些键经 nRF 透传，要求模块已上电；通用的 `set_config` / `config_value` / `delete_config` 对键长（≤31 字节）值长（≤63 字节）做本地校验。
+- **WiFi 模块 OTA**：`check_wifi_ota()` 后 `update_wifi_firmware(wait)` 一步跟到 `Success`/`Failed`；需要 STA 已连且 `api_url` 服务可用（见[已知限制](#已知限制与路线图)）。主控进 DFU 用 `enter_dfu_mode()`。
+
+
+### STA 上传到服务器（WiFi 0.0.10+）
+
+设备在 STA 在线时把 SD 卡上的录音直接 HTTP POST 到你指定的地址，成功后自动删除源文件（`.apm` + `.txt`）：
+
+```rust,no_run
+use reai_card_sdk::DyjDevice;
+
+async fn upload_all(device: &DyjDevice) -> reai_card_sdk::Result<()> {
+    // 1) 连路由（热点会关闭；SD 卡此时归 WiFi 模块，BLE 文件命令不可用）
+    device.connect_wifi("SSID", "password").await?;
+    // 2) 上传：url 每次显式给（推荐），或先 set_wifi_upload_url 持久化默认值
+    let base = "https://dyj2.dev.reai.com/api/upload/<设备ID>";
+    for (name, outcome) in device.upload_all_via_sta(Some(base)).await? {
+        match outcome {
+            Ok(_) => println!("✅ {name}"),
+            Err(e) => println!("❌ {name}: {e}"),
+        }
+    }
+    // 3) 用完把卡还给主控：close_wifi 之后才能继续录音 / BLE 取文件
+    device.close_wifi().await
+}
+```
+
+- 协议：`POST <url>/<生成的文件名>`（`synced_/nosync_<时间戳>.apm`），头带 `x-filename` / `x-filesize` / `x-format: adpcm`，已激活时附 `x-device-id` / `authorization`；2xx 即成功。`url` 直接放在 `UPLOAD_FILE` 请求里，对旧固件优雅降级（忽略该字段）。
+- 配套接收端参考实现见固件仓库 `tools/uploadServer/`（返回 `sha256` 供对账）；`upload_file_via_sta_to` 单文件上传、`list_uploads()` 查看待传列表。
+- 需要主控 ≥0.3.7 才能把 `upload_url` 写进设备配置（短键透传）；每次显式传 `url` 则不受限。
+
+## 屏幕自定义显示
+
+主控那块 128×64 OLED 实际可见区是 **72×40 像素**（约 12 个 ASCII 字符 × 5 行）。固件 0.3.7 起开放两条命令，SDK 侧为 `display_show` / `display_clear`：
+
+```rust,no_run
+use reai_card_sdk::{DisplayShowRequest, DISPLAY_BITMAP_BYTES, DyjDevice};
+
+async fn show(device: &DyjDevice, bitmap: [u8; DISPLAY_BITMAP_BYTES]) -> reai_card_sdk::Result<()> {
+    // 文本：设备内置 5x8 字体，仅可打印 ASCII
+    device.display_show(&DisplayShowRequest::text(["UPLOADING", "1/3"])).await?;
+    // 点阵：72x40 单色位图（按列字节，bit0 = 页顶），中文/二维码/图形由你渲染好传入
+    device
+        .display_show(&DisplayShowRequest::bitmap(bitmap.to_vec()).persistent(true))
+        .await?;
+    device.display_clear().await
+}
+```
+
+- 非常显内容 `timeoutMs`（默认 5 秒）后自动清屏；充电 / 录音 / 电量等系统界面照常覆盖自定义内容。
+- 点阵布局与固件字体渲染同序：`display_buffer[page][col]`，每字节一列 8 个像素、bit0 在页顶。`dyj_web` 的「屏幕画布」面板可以直接手绘或输入中文（canvas 渲染成点阵发送），所见即所得。
+- 老固件（<0.3.7）会回「未知命令」——该帧约 530 字节，旧 256 字节接收缓冲也装不下。
 
 ## 固件升级
 
@@ -355,8 +406,8 @@ make web                                # 网页控制台 http://127.0.0.1:8787
 ## 已知限制与路线图
 
 - **Windows 未验证**：btleplug 支持 Windows，但本 SDK 未在 Windows 上跑过真机。
-- **云上传（STA 模式上传录音到服务器）暂未启用**：`upload_file_via_sta` 等 API 已实现，但需要 STA 模式 + 接收服务器（固件侧上传走 WebSocket 且要求先 `AUTH_ACTIVE` 换取 token），后续版本再启用。
-- **WiFi 模块在线 OTA**：`check_wifi_ota` / `update_wifi_firmware` 要求 STA 已连接，从 `wifi_api_base_url` + `wifi_ota_info_path`（默认 `/ota/info?mod=wifi`）拉取 `{version, versionCode, url}`。**已于 2026-10-21 真机验证完整下载升级**；**热点本地升级**（`AccessPointClient::upload_firmware`）与**主控 DFU**（`update_main_firmware`）同日真机通过。
+- **STA 上传需新固件配套**：HTTP POST 上传（`upload_file_via_sta_to`）要求 WiFi ≥0.0.10；`upload_url` 配置键回落还需要主控 ≥0.3.7。每次显式传 `url` 时仅要求 WiFi ≥0.0.10。屏幕命令 `display_show` 需主控 ≥0.3.7。
+- **WiFi 模块在线 OTA**：`check_wifi_ota` / `update_wifi_firmware` 要求 STA 已连接，从 `api_url` + `ota_path`（默认 `/ota/info?mod=wifi`）拉取 `{version, versionCode, url}`。**已于 2026-10-21 真机验证完整下载升级**；**热点本地升级**（`AccessPointClient::upload_firmware`）与**主控 DFU**（`update_main_firmware`）同日真机通过。
 - **主控 DFU 平台风险已确认可控**：经 `OTA` 进 bootloader 时蓝牙地址不变，macOS 的 GATT 缓存用"断开重连一次"兜底有效；无响应写丢包由 PRN 回执 + 对象 CRC 重试兜底（默认 PRN=4，见 `DfuOptions`）。
 - **AP_\* 透传**：当前固件 v0.3.x 不透传 `AP_START/AP_STOP/AP_STATUS`，相关 API 保留给未来固件。
 - **BLE 取走大文件**：固件以 200 B/25 ms 发送，MB 级文件请走热点快传。

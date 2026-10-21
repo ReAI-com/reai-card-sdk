@@ -1312,10 +1312,11 @@ dependencies = [
 
 [[package]]
 name = "reai-card-sdk"
-version = "0.0.3"
+version = "0.0.4"
 dependencies = [
  "async-trait",
  "axum",
+ "base64",
  "btleplug",
  "chrono",
  "crc32fast",

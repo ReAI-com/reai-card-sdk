@@ -17,7 +17,8 @@ use std::time::Duration;
 
 use reai_card_sdk::{
     ControlAction, ControlBindings, ControlInput, DeviceEvent, DeviceManager, DfuOptions,
-    DfuPackage, DfuProgress, DfuStage, DyjDevice, LedState, OtaInfo, OtaModule,
+    DfuPackage, DfuProgress, DfuStage, DisplayShowRequest, DyjDevice, LedState, OtaInfo, OtaModule,
+    SdkError,
 };
 use serde_json::Value;
 
@@ -86,14 +87,17 @@ fn usage() {
   ap start|stop|status              ESP32 热点与快传入口
   ap ota-check                      热点模式读 WiFi 模块当前固件版本（需已连热点）
   ap ota-upload <fw.bin>            热点模式本地升级 WiFi 模块（multipart 上传，成功后 ESP32 3s 自重启）
-  uploads list|upload <name>|delete <name>|clear
+  uploads list|upload <name> [url]|upload-all [url]|delete <name>|clear
+  display text <行1>|<行2> ...      OLED 显示 ASCII 文本（0.3.7+，每行≤12字符、最多5行）
+  display bitmap <360字节.bin>      OLED 显示 72×40 点阵（纵向字节，bit0=页顶）
+  display clear                     清屏
   config get <key> | config set <key> <value> | config del <key>
   controls list                      读六个按键/开关输入的绑定表
   controls set <input> <action>      input: btn_single|btn_double|btn_long_press|btn_long_release|switch_on|switch_off
                                      action: none|record_start|record_stop|record_toggle|record_mark
   controls clear <input> | controls preset recorder | controls reset
   led on|off|toggle
-  ota check|start|status            ESP32 在线 OTA（需 STA 已连 + wifi_api_base_url 服务）
+  ota check|start|status            ESP32 在线 OTA（需 STA 已连 + api_url 服务）
   ota update [secs]                 check→update→跟进 OTA_WIFI_PROCESS 到 SUCCESS/FAILED（默认上限 600s）
   ota info <api_base_url> main|wifi 查服务器最新版本（不需要设备）
   dfu                               仅让主控进 DFU 模式（之后广播 DFU_DYJ）
@@ -200,6 +204,33 @@ async fn run(globals: &Globals, command: &[String]) -> reai_card_sdk::Result<()>
             let state: LedState = required(rest, 0, "state (on/off/toggle)")?.parse()?;
             print_json(serde_json::to_value(device.set_led(state).await?)?)
         }
+        "display" => match rest.first().map(String::as_str) {
+            Some("clear") => print_json(serde_json::to_value(device.display_clear().await?)?),
+            Some("text") => {
+                let lines: Vec<String> = rest[1..]
+                    .iter()
+                    .flat_map(|line| line.split('|'))
+                    .map(str::to_owned)
+                    .collect();
+                print_json(serde_json::to_value(
+                    device
+                        .display_show(&DisplayShowRequest::text(lines))
+                        .await?,
+                )?)
+            }
+            Some("bitmap") => {
+                let bytes = tokio::fs::read(&rest[1]).await?;
+                print_json(serde_json::to_value(
+                    device
+                        .display_show(&DisplayShowRequest::bitmap(bytes))
+                        .await?,
+                )?)
+            }
+            _ => Err(SdkError::InvalidCommand(
+                "用法: display text <行1>|<行2> | display bitmap <360字节.bin> | display clear"
+                    .into(),
+            )),
+        },
         "ota" => ota(&device, rest).await,
         "auth" => auth(&device, rest).await,
         "restart" => print_json(serde_json::to_value(device.restart().await?)?),
@@ -611,8 +642,24 @@ async fn uploads(device: &DyjDevice, rest: &[String]) -> reai_card_sdk::Result<(
         }
         "upload" => {
             let name = required(rest, 1, "name")?;
+            let url = rest.get(2).map(String::as_str);
             println!("uploading {name} (blocks until the device finishes the HTTP upload) ...");
-            print_json(serde_json::to_value(device.upload_file(name).await?)?)
+            print_json(serde_json::to_value(
+                device.upload_file_via_sta_to(name, url).await?,
+            )?)
+        }
+        "upload-all" => {
+            let url = rest.get(1).map(String::as_str);
+            let results = device.upload_all_via_sta(url).await?;
+            for (name, outcome) in &results {
+                match outcome {
+                    Ok(_) => println!("✅ {name}"),
+                    Err(error) => println!("❌ {name}: {error}"),
+                }
+            }
+            let ok = results.iter().filter(|(_, r)| r.is_ok()).count();
+            println!("{}/{} uploaded", ok, results.len());
+            Ok(())
         }
         "delete" => print_json(serde_json::to_value(
             device.delete_upload(required(rest, 1, "name")?).await?,
