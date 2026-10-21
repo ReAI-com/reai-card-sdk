@@ -355,9 +355,9 @@ make web                                # 网页控制台 http://127.0.0.1:8787
 ## 已知限制与路线图
 
 - **Windows 未验证**：btleplug 支持 Windows，但本 SDK 未在 Windows 上跑过真机。
-- **云上传（STA 模式上传到服务器）暂未启用**：`upload_file_via_sta` 等 API 已实现，但需要 STA 模式 + 接收服务器，当前固件默认热点模式，后续版本再启用。
-- **WiFi 模块在线 OTA 与云上传同源**：`check_wifi_ota` / `update_wifi_firmware` 要求 STA 已连接，且从 `wifi_api_base_url` + `wifi_ota_info_path`（默认 `/ota/info?mod=wifi`）拉取 `{version, versionCode, url}`；没有该服务时无法真机验证，API 已实现、与云上传一并延后。**热点本地升级**（`AccessPointClient::upload_firmware`）和**主控 DFU**（`update_main_firmware`）都不依赖服务器，见[固件升级](#固件升级)。
-- **主控 DFU 的两个平台风险待真机确认**：经 `OTA` 进 bootloader 时蓝牙地址不变，macOS 可能沿用缓存的 GATT 表（SDK 会断开重连一次）；无响应写可能被系统静默丢弃（SDK 用 PRN 回执 + 对象 CRC 重试兜底）。
+- **云上传（STA 模式上传录音到服务器）暂未启用**：`upload_file_via_sta` 等 API 已实现，但需要 STA 模式 + 接收服务器（固件侧上传走 WebSocket 且要求先 `AUTH_ACTIVE` 换取 token），后续版本再启用。
+- **WiFi 模块在线 OTA**：`check_wifi_ota` / `update_wifi_firmware` 要求 STA 已连接，从 `wifi_api_base_url` + `wifi_ota_info_path`（默认 `/ota/info?mod=wifi`）拉取 `{version, versionCode, url}`。**已于 2026-10-21 真机验证完整下载升级**；**热点本地升级**（`AccessPointClient::upload_firmware`）与**主控 DFU**（`update_main_firmware`）同日真机通过。
+- **主控 DFU 平台风险已确认可控**：经 `OTA` 进 bootloader 时蓝牙地址不变，macOS 的 GATT 缓存用"断开重连一次"兜底有效；无响应写丢包由 PRN 回执 + 对象 CRC 重试兜底（默认 PRN=4，见 `DfuOptions`）。
 - **AP_\* 透传**：当前固件 v0.3.x 不透传 `AP_START/AP_STOP/AP_STATUS`，相关 API 保留给未来固件。
 - **BLE 取走大文件**：固件以 200 B/25 ms 发送，MB 级文件请走热点快传。
 - **crates.io**：暂以 git tag 方式分发，发布到 crates.io 待定。
