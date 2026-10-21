@@ -114,7 +114,7 @@ async fn watch(device: &DyjDevice) {
 | `Button(ButtonEvent)` | 按键单击 / 双击 / 长按 / 长按松开 | `gesture`、设备随之执行的 `action` |
 | `ToggleSwitch(ToggleSwitchEvent)` | 侧边开关拨到 on / off | `position`、`action` |
 | `RecordStatus(RecordStatus)` | 录音开始 / 停止 / 出错 | `is_recording`、`reason`（app / button / switch / auto）、出错时的 `error` 码 |
-| `Power(PowerEvent)` | `SHUTDOWN` 之后、低电关机前 | `ShutdownImminent { seconds }`；另有 `DeviceWakeup` / `StartupComplete` |
+| `Power(PowerEvent)` | `SHUTDOWN` 之后、低电关机前；插拔充电器（0.3.7+） | `ShutdownImminent { seconds }`；另有 `DeviceWakeup` / `StartupComplete` / `Charging { charging, level }` |
 | `AccessPointReady` | ESP32 上电后 AP + HTTP 服务起好 | 见 [WiFi 与热点](#wifi-与热点) |
 | `WifiNetwork` / `WifiOff` / `UploadComplete` / `WifiOtaProgress` | WiFi 扫描结果、模块请求断电、上传完成、OTA 进度 | 对应结构体 |
 | `Unhandled { command, payload }` | 认得命令但载荷解析不了（如未来固件的新手势），或 `type` 未知的裸 JSON（此时 `command` 为空） | 原始 JSON |
@@ -260,11 +260,11 @@ async fn prepare_ap(device: &DyjDevice) -> reai_card_sdk::Result<()> {
 - 电脑没加入热点时 HTTP 请求会在 5 秒内失败（建连超时），不会挂死。
 - 连路由器：`connect_wifi(ssid, password)`（最长约 12 秒）、`wifi_status()`（模块断电时直接返回 `status:"off"`）、`scan_wifi()`、`disconnect_wifi()`。热点激活时固件会跳过自动连路由器，两者互斥。
 - `start_access_point` / `stop_access_point` / `access_point_status` 需要带 `AP_` 透传的未来固件，v0.3.x 上调用会等到超时；当前固件用不到它们。
-- **ESP32 侧配置**（上传 / OTA 用，WiFi 0.0.10 短键）：`set_sta_api_base_url`（`api_url`）/ `set_wifi_upload_url`（`upload_url`）/ `set_wifi_ota_info_path`（`ota_path`）及对应读取（`None` = 未配置）。这些键经 nRF 透传，要求模块已上电；通用的 `set_config` / `config_value` / `delete_config` 对键长（≤31 字节）值长（≤63 字节）做本地校验。
+- **ESP32 侧配置**（上传 / OTA 用，WiFi 0.1.0 短键）：`set_sta_api_base_url`（`api_url`）/ `set_wifi_upload_url`（`upload_url`）/ `set_wifi_ota_info_path`（`ota_path`）及对应读取（`None` = 未配置）。这些键经 nRF 透传，要求模块已上电；通用的 `set_config` / `config_value` / `delete_config` 对键长（≤31 字节）值长（≤63 字节）做本地校验。
 - **WiFi 模块 OTA**：`check_wifi_ota()` 后 `update_wifi_firmware(wait)` 一步跟到 `Success`/`Failed`；需要 STA 已连且 `api_url` 服务可用（见[已知限制](#已知限制与路线图)）。主控进 DFU 用 `enter_dfu_mode()`。
 
 
-### STA 上传到服务器（WiFi 0.0.10+）
+### STA 上传到服务器（WiFi 0.1.0+）
 
 设备在 STA 在线时把 SD 卡上的录音直接 HTTP POST 到你指定的地址，成功后自动删除源文件（`.apm` + `.txt`）：
 
@@ -406,7 +406,7 @@ make web                                # 网页控制台 http://127.0.0.1:8787
 ## 已知限制与路线图
 
 - **Windows 未验证**：btleplug 支持 Windows，但本 SDK 未在 Windows 上跑过真机。
-- **STA 上传需新固件配套**：HTTP POST 上传（`upload_file_via_sta_to`）要求 WiFi ≥0.0.10；`upload_url` 配置键回落还需要主控 ≥0.3.7。每次显式传 `url` 时仅要求 WiFi ≥0.0.10。屏幕命令 `display_show` 需主控 ≥0.3.7。
+- **STA 上传需新固件配套**：HTTP POST 上传（`upload_file_via_sta_to`）要求 WiFi ≥0.1.0；`upload_url` 配置键回落还需要主控 ≥0.3.7。每次显式传 `url` 时仅要求 WiFi ≥0.1.0。屏幕命令 `display_show` 需主控 ≥0.3.7。
 - **WiFi 模块在线 OTA**：`check_wifi_ota` / `update_wifi_firmware` 要求 STA 已连接，从 `api_url` + `ota_path`（默认 `/ota/info?mod=wifi`）拉取 `{version, versionCode, url}`。**已于 2026-10-21 真机验证完整下载升级**；**热点本地升级**（`AccessPointClient::upload_firmware`）与**主控 DFU**（`update_main_firmware`）同日真机通过。
 - **主控 DFU 平台风险已确认可控**：经 `OTA` 进 bootloader 时蓝牙地址不变，macOS 的 GATT 缓存用"断开重连一次"兜底有效；无响应写丢包由 PRN 回执 + 对象 CRC 重试兜底（默认 PRN=4，见 `DfuOptions`）。
 - **AP_\* 透传**：当前固件 v0.3.x 不透传 `AP_START/AP_STOP/AP_STATUS`，相关 API 保留给未来固件。

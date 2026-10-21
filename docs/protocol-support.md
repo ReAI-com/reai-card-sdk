@@ -92,7 +92,7 @@ AP mode is the firmware default: every `WIFI_OPEN` power-up auto-starts the Soft
 
 Recording names carry the capture time. Each `.apm` has a sibling `.txt` (`{"timestamp":<unix s>,"synced":<bool>}`); the firmware derives `synced_<unix>.apm` (clock was synced) or `nosync_<unix>.apm` (clock was not — the value is not wall-clock time) and surfaces that name both in the `FILE_UPLOAD` start frame (`name`) and in the AP download's `Content-Disposition` filename (`AccessPointDownloadedFile::suggested_name`). `RecordingStamp::parse` decodes either; when the `.txt` is missing the firmware falls back to the raw `XXXXXXXX.APM` name and parsing yields `None`. There is no need to download the `.txt` separately.
 
-### STA upload protocol (WiFi 0.0.10)
+### STA upload protocol (WiFi 0.1.0)
 
 `UPLOAD_FILE {"name": "<SD file>", "url": "<base URL>"}` streams the file to the server over **plain HTTP POST** (the 0.0.9 hand-rolled WebSocket upload and its `auth/exchange` token gate are removed):
 
@@ -114,7 +114,7 @@ Precedence is deliberately boring: the custom frame is just another transient sc
 
 ### Device KV configuration
 
-`CONFIG_SET/GET/DEL` is one command family backed by two stores. The nRF parses the request first (`handler_sys.c`, buffers `key[32]` / `value[64]`) and then routes it: a key that **starts with `wifi_` or ends with `_wifi`**, or — since main 0.3.7 / WiFi 0.0.10 — is exactly `upload_url`, `api_url` or `ota_path`, is forwarded unchanged over UART to the ESP32 (`Preferences`, prefix `cfg_`), anything else lands in the nRF's own `setting_kv` (16 slots shared with every key, 32-byte keys / 64-byte values). The SDK exposes the same rule as `config_key_routes_to_wifi_module(key)` and applies it in three places:
+`CONFIG_SET/GET/DEL` is one command family backed by two stores. The nRF parses the request first (`handler_sys.c`, buffers `key[32]` / `value[64]`) and then routes it: a key that **starts with `wifi_` or ends with `_wifi`**, or — since main 0.3.7 / WiFi 0.1.0 — is exactly `upload_url`, `api_url` or `ota_path`, is forwarded unchanged over UART to the ESP32 (`Preferences`, prefix `cfg_`), anything else lands in the nRF's own `setting_kv` (16 slots shared with every key, 32-byte keys / 64-byte values). The SDK exposes the same rule as `config_key_routes_to_wifi_module(key)` and applies it in three places:
 
 - **Powered-module pre-check.** Routed keys need the ESP32 powered; otherwise the UART frame is never answered. `set_config`/`get_config`/`config_value`/`delete_config` fail fast with `WifiModulePoweredDown` for routed keys when `STATE_INFO.wifiOpen` is false.
 - **"Missing key" normalisation.** The two stores disagree: nRF answers `code 3 "not found"`, the ESP32 answers `{"key":…,"value":""}` (`Setting::getConfig(key, "")`). `config_value` returns `Ok(None)` for both (an empty string on a routed key counts as unset); `get_config` returns the raw response and therefore still errors on the nRF side.
@@ -130,11 +130,11 @@ Known keys on v0.3.x / WiFi v0.0.9:
 | `switch_on`, `switch_off` | nRF | host (`set_control_action`) | side switch position → `ControlAction` |
 | `low_power_mode` | nRF | firmware | deep-sleep flag used at boot; surfaced as `STATE_INFO.lowPowerMode`. Read-only for the host. |
 | `wifi_ver`, `wifi_ver_code` | nRF | firmware (`WIFI_SYNC`) | cached ESP32 version; surfaced as `BASE_INFO.wifiVersion/wifiVersionCode`. Despite the `wifi_` prefix these are stored on the nRF (the firmware writes them internally, bypassing the routing rule) — reading them from the host **is** routed to the ESP32 and returns `""`. |
-| `api_url` | ESP32 | host (`set_sta_api_base_url`) | `http://`/`https://` base URL for auth and OTA info (WiFi 0.0.10; ≤63 bytes like every config value) |
-| `upload_url` | ESP32 | host (`set_wifi_upload_url`) | default upload **base** URL for `UPLOAD_FILE` when the request carries no `url` (WiFi 0.0.10) |
+| `api_url` | ESP32 | host (`set_sta_api_base_url`) | `http://`/`https://` base URL for auth and OTA info (WiFi 0.1.0; ≤63 bytes like every config value) |
+| `upload_url` | ESP32 | host (`set_wifi_upload_url`) | default upload **base** URL for `UPLOAD_FILE` when the request carries no `url` (WiFi 0.1.0) |
 | `ota_path` | ESP32 | host (`set_wifi_ota_info_path`) | relative OTA-info route; firmware default `/ota/info?mod=wifi` when unset |
 
-**NVS key-length rule (and the v0.0.9 bug it explains).** ESP32 NVS rejects keys longer than 15 bytes, and `Setting::setConfig` prepends the `cfg_` prefix, so a config key may be at most **11 bytes**. The pre-0.0.10 keys `wifi_api_base_url`, `wifi_ws_base_url`, `wifi_file_upload_path`, `wifi_ota_info_path` (17–21 bytes, 20–25 with prefix) were therefore **never persistable**: `CONFIG_SET` on them always answered `code 1 "配置设置失败"` and every read silently fell back to the firmware defaults. WiFi 0.0.10 renames them to the short forms above (nothing to migrate — the old keys never held data), adds `upload_url`, and turns an over-long key into an explicit failure in `Setting::setConfig`. On main controllers older than 0.3.7 the short keys are *not* in the forwarding set and would be stored locally on the nRF instead — the `upload_url` fallback therefore needs main ≥0.3.7; the per-request `url` in `UPLOAD_FILE` works with any WiFi version that understands it (older firmware ignores the field).
+**NVS key-length rule (and the v0.0.9 bug it explains).** ESP32 NVS rejects keys longer than 15 bytes, and `Setting::setConfig` prepends the `cfg_` prefix, so a config key may be at most **11 bytes**. The pre-0.1.0 keys `wifi_api_base_url`, `wifi_ws_base_url`, `wifi_file_upload_path`, `wifi_ota_info_path` (17–21 bytes, 20–25 with prefix) were therefore **never persistable**: `CONFIG_SET` on them always answered `code 1 "配置设置失败"` and every read silently fell back to the firmware defaults. WiFi 0.1.0 renames them to the short forms above (nothing to migrate — the old keys never held data), adds `upload_url`, and turns an over-long key into an explicit failure in `Setting::setConfig`. On main controllers older than 0.3.7 the short keys are *not* in the forwarding set and would be stored locally on the nRF instead — the `upload_url` fallback therefore needs main ≥0.3.7; the per-request `url` in `UPLOAD_FILE` works with any WiFi version that understands it (older firmware ignores the field).
 
 Slot budget on the nRF: 16 total, 3 used by firmware-internal keys, 6 by the control bindings → 7 free for application keys. ESP32 keys do not consume nRF slots.
 
@@ -209,18 +209,20 @@ The event receiver emits typed `DeviceEvent`s for `BTN_CLICK` (`ButtonEvent { ge
 
 `RECORD_STATUS` pushes carry `reason` (`app`, `button`, `switch`, `auto` for the 10-minute auto-split, `unknown`) and, for `RECORD_EVT_ERROR`, an `error` code with `isRecording: false`. The same command name answers the `record_status()` query; that response has no `reason` and is also broadcast on the event channel.
 
-### Protocol deviation: unframed power notifications
+### Power notifications: format fixed in 0.3.7, charging event added
 
-The protocol defines one wire format for everything the device sends, including unsolicited events: `NAME:json\r\n` (`BTN_CLICK:{...}\r\n`, `RECORD_STATUS:{...}\r\n`, …), produced by `app_protocol.c respond()`. The power manager does **not** follow it. `power_mgmt_event_handler` in `main.c` writes three messages straight to `ble_uart_send`, **without** a command name and **without** the `\r\n` terminator: `{"type":"shutdown_imminent","seconds":5}` (right after the `SHUTDOWN` response, and before a low-battery/timer shutdown), `{"type":"device_wakeup"}` and `{"type":"startup_complete"}` (normally emitted before any BLE link exists, so rarely observed). A line-oriented parser glues the first one to whatever frame follows and loses both — in practice, any command answered during the 5-second shutdown countdown would time out.
+The protocol defines one wire format for everything the device sends, including unsolicited events: `NAME:json\r\n`. Up to v0.3.6 the power manager did **not** follow it — `power_mgmt_event_handler` in `main.c` wrote three messages straight to `ble_uart_send` without a command name and without the `\r\n` terminator (`{"type":"shutdown_imminent","seconds":5}`, `{"type":"device_wakeup"}`, `{"type":"startup_complete"}`). A line-oriented parser glues the first one to whatever frame follows and loses both — in practice, any command answered during the 5-second shutdown countdown would time out.
+
+**Fixed in main 0.3.7**: the three notices now go through `app_protocol_send_event("POWER", json)` and arrive as ordinary `POWER:{...}\r\n` frames. **0.3.7 also adds a charging notification**: the charging-state edge (plug in / unplug, sampled every 5 s) pushes `POWER:{"type":"charging","charging":<bool>,"level":<pct>}`.
 
 The SDK accepts both shapes and surfaces them as the same `DeviceEvent::Power(PowerEvent)`:
 
 | Shape | Who sends it | How the SDK handles it |
 | --- | --- | --- |
-| Raw `{"type":...}` with no name and no CRLF | v0.3.x firmware (current) | `FrameDecoder` treats a buffer starting with `{` as a raw JSON object, cuts it at the JSON boundary as soon as it is complete (no newline needed), and resumes line parsing on the remaining bytes. Unknown `type` → `Unhandled` with an empty `command`; malformed raw JSON is dropped up to the next newline so the stream resynchronizes. |
-| Framed `POWER:{"type":...}\r\n` | a future firmware that fixes the deviation | ordinary text frame; `event_from_frame` maps command `POWER` to `PowerEvent`, unknown `type` → `Unhandled { command: "POWER" }`. |
+| Raw `{"type":...}` with no name and no CRLF | firmware ≤ v0.3.6 | `FrameDecoder` treats a buffer starting with `{` as a raw JSON object, cuts it at the JSON boundary as soon as it is complete (no newline needed), and resumes line parsing on the remaining bytes. Unknown `type` → `Unhandled` with an empty `command`; malformed raw JSON is dropped up to the next newline so the stream resynchronizes. |
+| Framed `POWER:{"type":...}\r\n` | firmware ≥ 0.3.7 | ordinary text frame; `event_from_frame` maps command `POWER` to `PowerEvent`, unknown `type` → `Unhandled { command: "POWER" }`. |
 
-Firmware-side fix (recorded, **not applied** — the v0.3.x firmware is frozen): replace the three `ble_uart_send(...)` calls in `power_mgmt_event_handler` with `app_protocol_send_event("POWER", json)` so the notices go through `respond()` and get the standard name + CRLF framing. Both SDK paths stay valid before and after that change.
+`PowerEvent` variants: `ShutdownImminent { seconds }`, `DeviceWakeup`, `StartupComplete`, `Charging { charging: bool, level: Option<u8> }` (the latter only from ≥0.3.7).
 
 Event availability caveat: with the current ESP32 firmware the `UPLOAD_COMPLETE` notification is only sent from the automatic-upload loop, which is disabled (`UploadManager::loop` returns immediately). The `UPLOAD_FILE` command therefore reports completion through its own (delayed) response, not through `UPLOAD_COMPLETE`; treat `DeviceEvent::UploadComplete` as reserved for future firmware. `WIFI_AP_START` is emitted by the ESP32 boot flow once its AP and HTTP server are both up.
 

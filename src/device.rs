@@ -620,7 +620,7 @@ impl DyjDevice {
         self.upload_file_via_sta_to(name, None).await
     }
     /// Same as [`Self::upload_file_via_sta`], with an explicit target base URL
-    /// (WiFi 0.0.10+；旧固件会忽略 `url` 并回落 token 门控的旧链路).
+    /// (WiFi 0.1.0+；旧固件会忽略 `url` 并回落 token 门控的旧链路).
     pub async fn upload_file_via_sta_to(
         &self,
         name: &str,
@@ -653,7 +653,7 @@ impl DyjDevice {
         }
         Ok(results)
     }
-    /// 持久化默认上传基址（`upload_url`，需主控 ≥0.3.7 + WiFi ≥0.0.10；值 ≤63 字节）。
+    /// 持久化默认上传基址（`upload_url`，需主控 ≥0.3.7 + WiFi ≥0.1.0；值 ≤63 字节）。
     pub async fn set_wifi_upload_url(&self, url: &str) -> Result<CommandResponse> {
         self.set_config("upload_url", url).await
     }
@@ -1365,8 +1365,8 @@ fn event_from_frame(frame: &TextFrame) -> Option<DeviceEvent> {
         "WIFI_AP_START" => serde_json::from_value(frame.payload.clone())
             .ok()
             .map(DeviceEvent::AccessPointReady),
-        // 现固件把电源通知当裸 JSON 发（见 event_from_raw）；若将来按协议格式封装成
-        // `POWER:{json}`，这里映射到同一个事件，应用无需关心固件版本。
+        // 0.3.7 起电源通知按标准事件框架 `POWER:{json}` 发送；旧固件的裸 JSON 形态
+        // 见 event_from_raw，两者映射到同一个事件，应用无需关心固件版本。
         "POWER" => Some(
             serde_json::from_value::<PowerEvent>(frame.payload.clone())
                 .map(DeviceEvent::Power)
@@ -1494,7 +1494,7 @@ pub const CONFIG_KEY_MAX_BYTES: usize = 31;
 pub const CONFIG_VALUE_MAX_BYTES: usize = 63;
 
 /// 该配置键是否由 nRF 透传给 ESP32。与固件 `strip_wifi_key` 规则一致：
-/// `wifi_` 前缀 / `_wifi` 后缀，外加 WiFi 0.0.10 起的短键
+/// `wifi_` 前缀 / `_wifi` 后缀，外加 WiFi 0.1.0 起的短键
 /// `upload_url` / `api_url` / `ota_path`（NVS 键名 15 字符硬限所致）。
 pub fn config_key_routes_to_wifi_module(key: &str) -> bool {
     matches!(key, "upload_url" | "api_url" | "ota_path")
@@ -2224,6 +2224,30 @@ mod tests {
             }
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn charging_event_parses_from_power_frame() {
+        let transport = Arc::new(MockTransport::new());
+        let device = DyjDevice::from_transport(transport.clone()).await.unwrap();
+        let mut events = device.subscribe_events();
+        transport.reply(b"POWER:{\"type\":\"charging\",\"charging\":true,\"level\":80}\r\n");
+        transport.reply(b"POWER:{\"type\":\"charging\",\"charging\":false}\r\n");
+        let _ = device.device_info().await.unwrap();
+        assert!(matches!(
+            events.recv().await.unwrap(),
+            DeviceEvent::Power(PowerEvent::Charging {
+                charging: true,
+                level: Some(80)
+            })
+        ));
+        assert!(matches!(
+            events.recv().await.unwrap(),
+            DeviceEvent::Power(PowerEvent::Charging {
+                charging: false,
+                level: None
+            })
+        ));
     }
 
     #[tokio::test]

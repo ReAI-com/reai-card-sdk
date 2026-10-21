@@ -176,8 +176,9 @@ impl std::str::FromStr for LedState {
     }
 }
 
-/// 电源管理通知。固件把它们当作**无命令封装**的裸 JSON 直接写到 BLE 上
-/// （`{"type":"shutdown_imminent","seconds":5}`），SDK 解码器会单独识别。
+/// 电源管理通知。0.3.7 前固件把它们当**无命令封装**的裸 JSON 直接写到 BLE 上
+/// （`{"type":"shutdown_imminent","seconds":5}`）；0.3.7 起按标准事件框架发送
+/// （`POWER:{json}`）。SDK 同时接受两种形态，映射成同一个事件。
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum PowerEvent {
@@ -188,6 +189,8 @@ pub enum PowerEvent {
     DeviceWakeup,
     /// 开机流程完成。
     StartupComplete,
+    /// 充电状态变化（0.3.7 新增：插入/拔出时推送，`level` 为当时电量百分比）。
+    Charging { charging: bool, level: Option<u8> },
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]

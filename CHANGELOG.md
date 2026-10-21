@@ -5,18 +5,19 @@
 
 ## 0.0.4（2026-10-21，未发布）
 
-配套固件 **WiFi 0.0.10（HTTP POST 上传）+ 主控 0.3.7（屏幕点阵显示）**，云上传启用、屏幕开放自定义内容。
+配套固件 **WiFi 0.1.0（HTTP POST 上传）+ 主控 0.3.7（屏幕点阵显示）**，云上传启用、屏幕开放自定义内容。
 
 **⚠️ 不兼容变更**（0.0.x 阶段、driver-v2 尚未接入）：
 
-- ESP32 配置短键随固件 0.0.10 重命名（旧长键因 NVS 15 字符限制**从来写不进去**，无数据可迁移）：`set_sta_api_base_url`/`sta_api_base_url` 改写 `api_url`；`set_wifi_ota_info_path`/`wifi_ota_info_path` 改写 `ota_path`；**删除** `set_sta_websocket_base_url`/`sta_websocket_base_url`、`set_sta_upload_path`/`sta_upload_path`（对应固件键与 WS 上传一并移除）。
+- ESP32 配置短键随固件 0.1.0 重命名（旧长键因 NVS 15 字符限制**从来写不进去**，无数据可迁移）：`set_sta_api_base_url`/`sta_api_base_url` 改写 `api_url`；`set_wifi_ota_info_path`/`wifi_ota_info_path` 改写 `ota_path`；**删除** `set_sta_websocket_base_url`/`sta_websocket_base_url`、`set_sta_upload_path`/`sta_upload_path`（对应固件键与 WS 上传一并移除）。
 - `upload_all_via_sta(url)` 返回 `Vec<(String, Result<CommandResponse>)>`（逐文件结果，单个失败不中断）。
 
 **新增**：
 
-- **STA 上传启用**：`upload_file_via_sta_to(name, url)` 把 `url` 直接放进 `UPLOAD_FILE` 请求（WiFi 0.0.10 改为标准 HTTP POST 流式上传到 `<url>/<生成的文件名>`，头带 `x-filename`/`x-filesize`/`x-format: adpcm`，已激活附 `x-device-id`/`authorization`；2xx 后设备删源文件；旧固件忽略 `url` 字段）；`set_wifi_upload_url`/`wifi_upload_url` 持久化默认基址（短键 `upload_url`，需主控 ≥0.3.7 透传）；`upload_all_via_sta` 一键传完待传列表。
+- **STA 上传启用**：`upload_file_via_sta_to(name, url)` 把 `url` 直接放进 `UPLOAD_FILE` 请求（WiFi 0.1.0 改为标准 HTTP POST 流式上传到 `<url>/<生成的文件名>`，头带 `x-filename`/`x-filesize`/`x-format: adpcm`，已激活附 `x-device-id`/`authorization`；2xx 后设备删源文件；旧固件忽略 `url` 字段）；`set_wifi_upload_url`/`wifi_upload_url` 持久化默认基址（短键 `upload_url`，需主控 ≥0.3.7 透传）；`upload_all_via_sta` 一键传完待传列表。
 - **屏幕自定义内容**（主控 ≥0.3.7）：`display_show(DisplayShowRequest)` / `display_clear()`。文本模式走设备 5×8 字体（可打印 ASCII，12 字符 × 5 行，本地校验）；点阵模式接受 72×40 单色位图（360 字节，按列字节 bit0=页顶，base64 一帧传输——固件接收缓冲/命令队列 256→1024 字节就是为它扩的）。`persistent`/`timeoutMs` 控制常显与自动清屏；充电/录音等系统界面照常覆盖。中文/图形由调用方渲染成点阵（dyj_web「屏幕画布」支持手绘与中文 `fillText`，所见即所得）。导出 `DISPLAY_BITMAP_BYTES`/`DISPLAY_MAX_LINES`/`DISPLAY_LINE_CHARS`/`DISPLAY_TIMEOUT_MAX_MS`。
 - `config_key_routes_to_wifi_module` 增加 `upload_url`/`api_url`/`ota_path` 精确匹配（与固件 `strip_wifi_key` 同步）。
+- **电源通知格式统一 + 充电事件**（主控 ≥0.3.7）：固件三处电源通知从裸 JSON 改为标准 `POWER:{json}` 框架（SDK 本就双向兼容，事件形态不变）；新增充电插拔推送 `POWER:{"type":"charging","charging":bool,"level":pct}` → `PowerEvent::Charging { charging, level }`（level 可为 None）。
 - dyj_cli：`display text <行1>|<行2>`、`display bitmap <360字节.bin>`、`display clear`、`uploads upload <name> [url]`、`uploads upload-all [url]`。
 - dyj_web：分组 06 改「STA 上传」（基址输入 + 全部上传）；新增分组 11「屏幕」与 72×40 画布面板；端点 `POST /api/display/show|clear`、`POST /api/upload/file|all`。
 
