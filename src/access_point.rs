@@ -199,7 +199,13 @@ impl AccessPointClient {
         file_name: &str,
     ) -> Result<AccessPointOtaUpload> {
         let size = firmware.len();
-        tracing::info!(target: "dyj.ap", "⬆️ 上传 WiFi 固件 {file_name}（{size} 字节），ESP32 写 flash 可能需要数分钟");
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(&firmware);
+        let local_sha = format!("{:x}", hasher.finalize());
+        tracing::info!(target: "dyj.ap", "⬆️ 上传 WiFi 固件 {file_name}（{size} 字节，sha256 {local_sha}），ESP32 写 flash 可能需要数分钟");
+        // 声明大小与哈希：设备侧逐块核对，任何截断/损坏都会被显式拒绝
+        // 而不是像 0.1.0 及以前那样把残缺镜像当成功写入（重启后被 bootloader 回退）
         let part = reqwest::multipart::Part::bytes(firmware)
             .file_name(file_name.to_owned())
             .mime_str("application/octet-stream")?;
@@ -207,6 +213,8 @@ impl AccessPointClient {
         let response = self
             .client
             .post(self.endpoint("api/ota/upload")?)
+            .header("x-firmware-size", size)
+            .header("x-firmware-sha256", &local_sha)
             .multipart(form)
             .timeout(OTA_UPLOAD_TIMEOUT)
             .send()
@@ -226,7 +234,19 @@ impl AccessPointClient {
                 message,
             });
         }
-        tracing::info!(target: "dyj.ap", "✅ WiFi 固件已写入 {} 字节，ESP32 将在 3 秒后重启", body.size.unwrap_or(size as u64));
+        if let Some(device_sha) = body.sha256.as_deref()
+            && !device_sha.eq_ignore_ascii_case(&local_sha)
+        {
+            tracing::error!(target: "dyj.ap", "❌ 设备回传的固件 sha256 与本地不一致: {device_sha} != {local_sha}");
+            return Err(SdkError::Device {
+                command: "POST /api/ota/upload".to_owned(),
+                code: i32::from(status.as_u16()),
+                message: format!(
+                    "firmware sha256 mismatch: device {device_sha}, local {local_sha}"
+                ),
+            });
+        }
+        tracing::info!(target: "dyj.ap", "✅ WiFi 固件已写入并校验 {} 字节，ESP32 将在 3 秒后重启", body.size.unwrap_or(size as u64));
         Ok(body)
     }
 
@@ -260,6 +280,7 @@ mod tests {
     };
 
     use super::AccessPointClient;
+    use crate::SdkError;
     use crate::types::AccessPointInfo;
 
     #[test]
@@ -378,7 +399,15 @@ mod tests {
                 request.windows(4).any(|w| w == [0xE9, 1, 2, 3]),
                 "body must carry the firmware bytes"
             );
-            let body = r#"{"success":true,"message":"OTA update successful, device will restart in 3 seconds","size":4,"restart":true}"#;
+            // 0.1.1 固件据此核对截断/损坏：声明大小与 sha256
+            assert!(text.contains("x-firmware-size: 4"), "{text}");
+            assert!(
+                text.contains(&format!("x-firmware-sha256: {SHA_E9_1_2_3}")),
+                "{text}"
+            );
+            let body = format!(
+                r#"{{"success":true,"message":"OTA update successful, device will restart in 3 seconds","size":4,"sha256":"{SHA_E9_1_2_3}","restart":true}}"#
+            );
             write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
         });
 
@@ -390,7 +419,36 @@ mod tests {
         server.join().unwrap();
         assert!(result.success);
         assert_eq!(result.size, Some(4));
+        assert_eq!(result.sha256.as_deref(), Some(SHA_E9_1_2_3));
         assert_eq!(result.restart, Some(true));
+    }
+
+    /// sha256 of bytes [0xE9, 1, 2, 3]
+    const SHA_E9_1_2_3: &str = "48314ba341d50021f3c906e658d737c4713b22fb3582af97f797c30599f85c95";
+
+    #[tokio::test]
+    async fn firmware_upload_rejects_device_sha256_mismatch() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let _ = read_full_request(&mut socket);
+            // 设备声称成功但哈希对不上（模拟 0.1.1 之前那种"写了残缺镜像也回 200"的场景被对账抓住）
+            let body = r#"{"success":true,"size":4,"sha256":"0000000000000000000000000000000000000000000000000000000000000000","restart":true}"#;
+            write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+        });
+
+        let error = AccessPointClient::new("127.0.0.1", port)
+            .unwrap()
+            .upload_firmware(vec![0xE9, 1, 2, 3], "fw.bin")
+            .await
+            .unwrap_err();
+        match error {
+            SdkError::Device { message, .. } => {
+                assert!(message.contains("sha256 mismatch"), "{message}")
+            }
+            other => panic!("unexpected {other:?}"),
+        }
     }
 
     #[tokio::test]

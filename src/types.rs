@@ -304,6 +304,8 @@ pub struct AccessPointOtaUpload {
     pub message: Option<String>,
     /// 写入的固件字节数。
     pub size: Option<u64>,
+    /// 设备侧对写入数据计算的 sha256（WiFi 0.1.1 起；与本地固件哈希对账）。
+    pub sha256: Option<String>,
     pub restart: Option<bool>,
     pub error: Option<String>,
 }
