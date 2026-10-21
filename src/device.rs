@@ -1174,8 +1174,9 @@ fn spawn_notification_worker(
 ) {
     tokio::spawn(async move {
         let mut decoder = FrameDecoder::default();
-        // ADPCM 解码状态跨整段录音连续，必须放在 worker 里而不是每个订阅者各自解码。
-        let mut audio_decoder = AdpcmDecoder::new();
+        // ADPCM 解码状态跨整段录音连续，必须放在 worker 里而不是每个订阅者各自解码；
+        // 每段录音开始时随固件编码器一起复位（见 RealtimeAudioDecoder）。
+        let mut audio_decoder = RealtimeAudioDecoder::default();
         while let Some(next) = stream.next().await {
             match next {
                 Ok(bytes) if bytes.first() == Some(&0) => {
@@ -1219,6 +1220,7 @@ fn spawn_notification_worker(
                             }
                             _ => {}
                         }
+                        audio_decoder.observe_frame(&frame);
                         if let Some(event) = event_from_frame(&frame) {
                             tracing::info!(target: "dyj.event", "🎛️ 硬件事件 cmd={} payload={}", frame.command, frame.payload);
                             let _ = events.send(event);
@@ -1242,6 +1244,82 @@ fn spawn_notification_worker(
         tracing::warn!(target: "dyj.proto", "🔌 通知流已结束，设备连接断开");
         let _ = incoming.send(Inbound::Disconnected);
     });
+}
+
+/// 实时音频解码器 + 录音段边界跟踪。
+///
+/// 固件只在每段录音开始（`RECORD_START`，按键/开关/自动分段触发的开始同理）时复位
+/// ADPCM 编码器，段内状态连续。解码器若整条连接只建一次，同一连接内第二段录音的开头
+/// 会带着上一段残留的 predictor/step 解码，出现一段杂音；所以要在同一边界复位解码器。
+///
+/// 只在「开始」边界复位一次，段内绝不复位（否则会在连续音频中间制造可听断点）：
+/// - 明确的开始信号——`RECORD_START` 成功应答（`code == 0`）或带 `reason` 的
+///   `RECORD_STATUS` 推送且 `isRecording == true`——在「未录音」时复位；若已在录音但本段
+///   还没解码过音频（同一次开始的应答与推送先后到达）复位也无损，照样复位；已在录音且
+///   本段已有音频时视为重复信号，不复位。
+/// - 不带 `reason` 的 `RECORD_STATUS` 查询应答只说明「此刻在录」，不是开始边界：仅当
+///   上次停止/复位以来还没解码过音频时才复位（此时复位无损）；已有音频在流（例如连上时
+///   设备已在录音，漏看了开始边界）则只记状态、不复位。
+/// - `RECORD_STOP` 成功应答与 `isRecording == false` 的状态帧（推送或应答）记为停止。
+/// - `RECORD`（切换）的应答分不清开始还是停止，不作为边界，依赖随后的状态推送。
+#[derive(Default)]
+struct RealtimeAudioDecoder {
+    decoder: AdpcmDecoder,
+    /// worker 视角下设备是否在录音；连接时未知，按未录音处理。
+    recording: bool,
+    /// 自上次停止或复位以来是否解码过音频。
+    decoded_in_segment: bool,
+}
+
+impl RealtimeAudioDecoder {
+    fn decode_chunk(&mut self, adpcm: &[u8], out: &mut Vec<i16>) {
+        self.decoder.decode_chunk(adpcm, out);
+        self.decoded_in_segment = true;
+    }
+
+    fn observe_frame(&mut self, frame: &TextFrame) {
+        let succeeded = || frame.payload.get("code").and_then(Value::as_i64) == Some(0);
+        match frame.command.as_str() {
+            "RECORD_START" if succeeded() => self.on_start_edge(),
+            "RECORD_STOP" if succeeded() => self.on_stop(),
+            "RECORD_STATUS" => {
+                // 失败应答（只有 code/message）解析不出状态，不改变边界判断。
+                let Ok(status) = serde_json::from_value::<RecordStatus>(frame.payload.clone())
+                else {
+                    return;
+                };
+                match (status.is_recording, status.reason.is_some()) {
+                    (false, _) => self.on_stop(),
+                    (true, true) => self.on_start_edge(),
+                    (true, false) => {
+                        if !self.decoded_in_segment {
+                            self.reset("录音状态查询应答（本段尚无音频）");
+                        }
+                        self.recording = true;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn on_start_edge(&mut self) {
+        if !self.recording || !self.decoded_in_segment {
+            self.reset("录音开始");
+        }
+        self.recording = true;
+    }
+
+    fn on_stop(&mut self) {
+        self.recording = false;
+        self.decoded_in_segment = false;
+    }
+
+    fn reset(&mut self, why: &str) {
+        tracing::debug!(target: "dyj.audio", "🎙️ 复位 ADPCM 解码器：{why}");
+        self.decoder = AdpcmDecoder::new();
+        self.decoded_in_segment = false;
+    }
 }
 
 fn event_from_frame(frame: &TextFrame) -> Option<DeviceEvent> {
@@ -1557,6 +1635,8 @@ mod tests {
         announced_file_size: AtomicU64,
         wifi_open: AtomicBool,
         silent: AtomicBool,
+        /// 模拟固件录音状态：RECORD_START 置位、RECORD_STOP 复位，RECORD_STATUS 查询据此应答。
+        recording: AtomicBool,
     }
 
     impl MockTransport {
@@ -1572,6 +1652,7 @@ mod tests {
                 announced_file_size: AtomicU64::new(3),
                 wifi_open: AtomicBool::new(false),
                 silent: AtomicBool::new(false),
+                recording: AtomicBool::new(false),
             }
         }
 
@@ -1634,7 +1715,22 @@ mod tests {
                     self.reply(&[0, b'c']);
                     self.reply(b"FILE_UPLOAD:{\"state\":\"end\"}\r\n");
                 }
-                "RECORD_START" => self.reply(b"RECORD_START:{\"code\":0}\r\n"),
+                "RECORD_START" => {
+                    self.recording.store(true, Ordering::Relaxed);
+                    self.reply(b"RECORD_START:{\"code\":0}\r\n");
+                }
+                "RECORD_STOP" => {
+                    self.recording.store(false, Ordering::Relaxed);
+                    self.reply(b"RECORD_STOP:{\"code\":0}\r\n");
+                }
+                // 查询应答不带 reason（与固件一致）。
+                "RECORD_STATUS" => {
+                    let recording = self.recording.load(Ordering::Relaxed);
+                    self.reply(
+                        format!("RECORD_STATUS:{{\"isRecording\":{recording},\"realtimeEnabled\":true}}\r\n")
+                            .as_bytes(),
+                    );
+                }
                 "RECORD_MARK" => self.reply(b"RECORD_MARK:{\"code\":0,\"filename\":\"059F19DF.APM\",\"timestamp\":53}\r\n"),
                 "AP_START" => self.reply(b"AP_START:{\"code\":0,\"ip\":\"192.168.4.1\",\"webPort\":80}\r\n"),
                 "AP_STATUS" => self.reply(b"AP_STATUS:{\"status\":\"active\",\"active\":true,\"ip\":\"192.168.4.1\",\"webServerRunning\":true,\"webPort\":80}\r\n"),
@@ -2537,6 +2633,96 @@ mod tests {
         );
         assert!(commands.contains(&"RECORD_START".to_owned()));
         assert!(commands.contains(&"RECORD_STOP".to_owned()));
+    }
+
+    /// 两段不同信号各自从全新编码器编码（对应固件每次 RECORD_START 复位编码器）。
+    fn two_segments() -> (Vec<u8>, Vec<u8>) {
+        use crate::audio::test_support::{AdpcmEncoder, sine};
+        let first = AdpcmEncoder::new().encode_buffer(&sine(440.0, 320));
+        let second = AdpcmEncoder::new().encode_buffer(&sine(1000.0, 320));
+        (first, second)
+    }
+
+    /// 前提自检：若解码器沿用上一段状态，第二段解码结果确实与全新解码不同，
+    /// 否则下面的回归测试证明不了任何事。
+    fn assert_carry_over_would_differ(first: &[u8], second: &[u8]) {
+        let mut carried = crate::audio::AdpcmDecoder::new();
+        carried.decode(first);
+        assert_ne!(
+            carried.decode(second),
+            crate::audio::AdpcmDecoder::new().decode(second)
+        );
+    }
+
+    #[tokio::test]
+    async fn second_recording_on_same_connection_decodes_from_fresh_state() {
+        let transport = Arc::new(MockTransport::new());
+        let device = DyjDevice::from_transport(transport.clone()).await.unwrap();
+        let mut audio = device.subscribe_audio();
+        let (first, second) = two_segments();
+        assert_carry_over_would_differ(&first, &second);
+
+        device.start_recording().await.unwrap();
+        transport.reply(&[&[0_u8], &first[..]].concat());
+        assert_eq!(
+            audio.recv().await.unwrap().samples,
+            crate::audio::AdpcmDecoder::new().decode(&first)
+        );
+        device.stop_recording().await.unwrap();
+
+        // 同一连接内第二段录音：首块必须与全新解码器的结果逐样本一致。
+        device.start_recording().await.unwrap();
+        transport.reply(&[&[0_u8], &second[..]].concat());
+        assert_eq!(
+            audio.recv().await.unwrap().samples,
+            crate::audio::AdpcmDecoder::new().decode(&second)
+        );
+    }
+
+    #[tokio::test]
+    async fn device_triggered_recording_resets_decoder_on_status_push() {
+        let transport = Arc::new(MockTransport::new());
+        let device = DyjDevice::from_transport(transport.clone()).await.unwrap();
+        let mut audio = device.subscribe_audio();
+        let (first, second) = two_segments();
+        assert_carry_over_would_differ(&first, &second);
+
+        // 按键/开关在设备侧开停录音：只有带 reason 的 RECORD_STATUS 推送，没有 SDK 命令。
+        transport.reply(b"RECORD_STATUS:{\"isRecording\":true,\"realtimeEnabled\":true,\"reason\":\"button\"}\r\n");
+        transport.reply(&[&[0_u8], &first[..]].concat());
+        audio.recv().await.unwrap();
+        transport.reply(b"RECORD_STATUS:{\"isRecording\":false,\"realtimeEnabled\":true,\"reason\":\"button\"}\r\n");
+        transport.reply(b"RECORD_STATUS:{\"isRecording\":true,\"realtimeEnabled\":true,\"reason\":\"switch\"}\r\n");
+        transport.reply(&[&[0_u8], &second[..]].concat());
+        assert_eq!(
+            audio.recv().await.unwrap().samples,
+            crate::audio::AdpcmDecoder::new().decode(&second)
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_recording_signals_mid_segment_do_not_reset_decoder() {
+        let transport = Arc::new(MockTransport::new());
+        let device = DyjDevice::from_transport(transport.clone()).await.unwrap();
+        let mut audio = device.subscribe_audio();
+        let pcm = crate::audio::test_support::sine(440.0, 960);
+        let encoded = crate::audio::test_support::AdpcmEncoder::new().encode_buffer(&pcm);
+
+        device.start_recording().await.unwrap();
+        transport.reply(&[&[0_u8], &encoded[..160]].concat());
+        let mut whole = audio.recv().await.unwrap().samples;
+        // 录音进行中：查询应答（无 reason）与迟到的开始推送都说「在录」，都不是新段的开始。
+        let status = device.record_status().await.unwrap();
+        assert!(status.is_recording);
+        transport.reply(&[&[0_u8], &encoded[160..320]].concat());
+        whole.extend(audio.recv().await.unwrap().samples);
+        transport.reply(
+            b"RECORD_STATUS:{\"isRecording\":true,\"realtimeEnabled\":true,\"reason\":\"app\"}\r\n",
+        );
+        transport.reply(&[&[0_u8], &encoded[320..]].concat());
+        whole.extend(audio.recv().await.unwrap().samples);
+
+        assert_eq!(whole, crate::audio::AdpcmDecoder::new().decode(&encoded));
     }
 
     #[tokio::test]
