@@ -627,6 +627,13 @@ impl DyjDevice {
         url: Option<&str>,
     ) -> Result<CommandResponse> {
         self.require_wifi_module("UPLOAD_FILE").await?;
+        // ESP32 的 SD.exists 不补前导 "/"（"a.APM" 会拼成 "/sda.APM"），而 UPLOAD_LIST
+        // 回的名字不带 "/"；这里统一补上，让 ≤0.1.0 固件也能按列表名上传
+        let name = if name.starts_with('/') {
+            name.to_owned()
+        } else {
+            format!("/{name}")
+        };
         let mut payload = json!({"name": name});
         if let Some(url) = url {
             payload["url"] = json!(url);
@@ -2628,7 +2635,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             sent,
-            "UPLOAD_FILE:{\"name\":\"1A2B3C4D.apm\",\"url\":\"https://dyj2.dev.reai.com/api/upload/DYJ001\"}"
+            "UPLOAD_FILE:{\"name\":\"/1A2B3C4D.apm\",\"url\":\"https://dyj2.dev.reai.com/api/upload/DYJ001\"}"
         );
     }
 

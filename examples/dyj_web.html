@@ -466,6 +466,11 @@ async function doConnect() {
     $('connState').textContent = '已连接';
     // 设备音源在 WS 建立时订阅：连接新设备后重建音频通道
     reopenAudioSocket();
+    // 用设备 ID 预填 STA 上传基址（接收端按 /upload/<deviceId>/<文件名> 落盘）
+    const info = await cmd('BASE_INFO');
+    if (info?.deviceId && !$('upUrl').value.trim()) {
+      $('upUrl').value = `https://dyj2.dev.reai.com/api/upload/${info.deviceId}`;
+    }
     refreshCards();
   } finally { setBusy(false); }
 }
