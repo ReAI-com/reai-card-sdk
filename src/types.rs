@@ -563,9 +563,7 @@ fn split_recording_name(name: &str) -> Option<(bool, i64, &str)> {
     } else {
         (false, stem.strip_prefix("nosync_")?)
     };
-    let digits_end = rest
-        .find('_')
-        .unwrap_or(rest.len());
+    let digits_end = rest.find('_').unwrap_or(rest.len());
     let timestamp = rest[..digits_end].parse::<i64>().ok()?;
     Some((synced, timestamp, &rest[digits_end..]))
 }
@@ -600,7 +598,11 @@ impl RecordingSegmentName {
 
         let Some(tail) = tail.strip_prefix('_') else {
             // 旧格式没有尾部标记
-            return Some(Self { stamp, session: None, seq: None });
+            return Some(Self {
+                stamp,
+                session: None,
+                seq: None,
+            });
         };
         let mut parts = tail.splitn(2, '_');
         let session = parts.next()?;
@@ -608,12 +610,22 @@ impl RecordingSegmentName {
 
         // 会话编号：8 位十六进制（大小写均可，规范输出为大写）
         if session.len() != 8 || !session.chars().all(|c| c.is_ascii_hexdigit()) {
-            return Some(Self { stamp, session: None, seq: None });
+            return Some(Self {
+                stamp,
+                session: None,
+                seq: None,
+            });
         }
         let seq = match seq {
             Some(seq) if !seq.is_empty() => match seq.parse::<u32>() {
                 Ok(seq) => Some(seq),
-                Err(_) => return Some(Self { stamp, session: None, seq: None }),
+                Err(_) => {
+                    return Some(Self {
+                        stamp,
+                        session: None,
+                        seq: None,
+                    });
+                }
             },
             _ => None,
         };
@@ -636,7 +648,10 @@ pub fn is_valid_session_id(session: &str) -> bool {
 /// 不传则固件自行随机生成，实际值以后续 `RECORD_STATUS` 推送为准。
 pub fn new_session_id() -> String {
     let bytes = uuid::Uuid::new_v4().into_bytes();
-    format!("{:08X}", u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+    format!(
+        "{:08X}",
+        u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+    )
 }
 
 #[cfg(test)]
@@ -702,9 +717,10 @@ mod recording_stamp_tests {
 
     #[test]
     fn file_entry_marker_requires_both_fields() {
-        let entry: FileEntry =
-            serde_json::from_str(r#"{"index":0,"name":"A1B2C3D4.APM","session":"A1B2C3D4","seq":3}"#)
-                .unwrap();
+        let entry: FileEntry = serde_json::from_str(
+            r#"{"index":0,"name":"A1B2C3D4.APM","session":"A1B2C3D4","seq":3}"#,
+        )
+        .unwrap();
         assert_eq!(entry.recording_marker(), Some(("A1B2C3D4", 3)));
 
         // 旧固件条目（无新字段）→ None；start_at 缺省也为 None
