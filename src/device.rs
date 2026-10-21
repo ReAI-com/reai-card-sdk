@@ -233,10 +233,35 @@ impl DyjDevice {
     }
 
     /// 开始录音（nRF 写 SD 卡，要求 WiFi 模块未上电，否则固件回 `SD卡未挂载`）。
+    ///
+    /// 会话编号由固件随机生成，实际值见随后的 `RECORD_STATUS` started 推送
+    /// （[`RecordStatus::session`]，主控 0.3.8 起）；指定编号用
+    /// [`Self::start_recording_with_session`]。
     pub async fn start_recording(&self) -> Result<CommandResponse> {
         self.require_sd_on_nrf("RECORD_START").await?;
         self.request_success("RECORD_START", None, NORMAL_TIMEOUT)
             .await
+    }
+
+    /// 开始录音并指定本次录音的会话编号（主控 0.3.8 起；编号可用
+    /// [`crate::types::new_session_id`] 生成，便于 App 侧提前把录音与本地记录绑定）。
+    ///
+    /// `session` 必须是 8 位十六进制，不合法时本地直接报错、不发命令——固件对非法值同样
+    /// 拒绝而非静默换随机值，避免两边各持不同编号。成功响应与 started 推送都带设备实际
+    /// 生效的 `session`；旧固件忽略该参数（随机生成），以推送为准。
+    pub async fn start_recording_with_session(&self, session: &str) -> Result<CommandResponse> {
+        if !crate::types::is_valid_session_id(session) {
+            return Err(SdkError::InvalidCommand(format!(
+                "session 必须是 8 位十六进制: {session:?}"
+            )));
+        }
+        self.require_sd_on_nrf("RECORD_START").await?;
+        self.request_success(
+            "RECORD_START",
+            Some(json!({ "session": session.to_ascii_uppercase() })),
+            NORMAL_TIMEOUT,
+        )
+        .await
     }
     pub async fn stop_recording(&self) -> Result<CommandResponse> {
         self.request_success("RECORD_STOP", None, NORMAL_TIMEOUT)
@@ -308,6 +333,20 @@ impl DyjDevice {
         self.require_sd_on_nrf("FILE_LIST").await?;
         let payload = folder.map(|folder| json!({"folder": folder}));
         self.collect_indexed("FILE_LIST", payload).await
+    }
+
+    /// BLE 侧流式文件列表：每收到一条立即回调 `on_entry`（边读边显示），固件发完
+    /// （`index:-1`）才返回。其余约束同 [`Self::list_files`]；固件会持续发完整列表，
+    /// 回调不能提前中断。
+    pub async fn list_files_stream(
+        &self,
+        folder: Option<&str>,
+        on_entry: impl FnMut(FileEntry),
+    ) -> Result<()> {
+        self.require_sd_on_nrf("FILE_LIST").await?;
+        let payload = folder.map(|folder| json!({"folder": folder}));
+        self.collect_indexed_with("FILE_LIST", payload, on_entry)
+            .await
     }
     pub async fn delete_file(&self, filename: &str) -> Result<CommandResponse> {
         self.require_sd_on_nrf("FILE_DELETE").await?;
@@ -1070,12 +1109,31 @@ impl DyjDevice {
         command: &str,
         payload: Option<Value>,
     ) -> Result<Vec<T>> {
+        let mut results = Vec::new();
+        self.collect_indexed_with(command, payload, |item: T| {
+            results.push(item);
+        })
+        .await?;
+        Ok(results)
+    }
+
+    /// 逐条接收固件的索引列表（`FILE_LIST` / `FILE_CLEAR` / `UPLOAD_LIST`），每收到一条立即
+    /// 交给 `on_entry`，直到固件发来 `index:-1` 才返回。 [`Self::collect_indexed`] 基于它实现。
+    ///
+    /// 注意：固件会持续把列表发完，无法提前中断（中途放弃会让剩余帧污染后续命令的入站流），
+    /// `on_entry` 只是"边收边用"，流式用于边读边显示，不是取消机制。
+    async fn collect_indexed_with<T: DeserializeOwned, F: FnMut(T)>(
+        &self,
+        command: &str,
+        payload: Option<Value>,
+        mut on_entry: F,
+    ) -> Result<()> {
         let command = command.to_ascii_uppercase();
         let _command = self.core.command_gate.lock().await;
         let mut incoming = self.core.incoming.lock().await;
         discard_stale_inbound(&mut incoming, &command)?;
         self.write_command(&command, payload).await?;
-        let mut results = Vec::new();
+        let mut count = 0usize;
         loop {
             if let Inbound::Text(frame) =
                 receive_next(&mut incoming, NORMAL_TIMEOUT, &command).await?
@@ -1085,11 +1143,12 @@ impl DyjDevice {
                 }
                 ensure_success(&frame.command, &frame.payload)?;
                 if frame.payload.get("index").and_then(Value::as_i64) == Some(-1) {
-                    tracing::info!(target: "dyj.device", "📋 列表收集完成 cmd={command} 共{}条", results.len());
-                    return Ok(results);
+                    tracing::info!(target: "dyj.device", "📋 列表收集完成 cmd={command} 共{count}条");
+                    return Ok(());
                 }
                 tracing::debug!(target: "dyj.device", "📋 列表条目 cmd={command} item={}", frame.payload);
-                results.push(serde_json::from_value(frame.payload)?);
+                on_entry(serde_json::from_value(frame.payload)?);
+                count += 1;
             }
         }
     }

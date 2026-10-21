@@ -92,6 +92,17 @@ AP mode is the firmware default: every `WIFI_OPEN` power-up auto-starts the Soft
 
 Recording names carry the capture time. Each `.apm` has a sibling `.txt` (`{"timestamp":<unix s>,"synced":<bool>}`); the firmware derives `synced_<unix>.apm` (clock was synced) or `nosync_<unix>.apm` (clock was not — the value is not wall-clock time) and surfaces that name both in the `FILE_UPLOAD` start frame (`name`) and in the AP download's `Content-Disposition` filename (`AccessPointDownloadedFile::suggested_name`). `RecordingStamp::parse` decodes either; when the `.txt` is missing the firmware falls back to the raw `XXXXXXXX.APM` name and parsing yields `None`. There is no need to download the `.txt` separately.
 
+### Recording session markers (main 0.3.8 / WiFi 0.1.2)
+
+Long recordings are segmented every 10 minutes into sibling `XXXXXXXX.APM` files, which gave the host no way to tell which slices belong to one recording. From main 0.3.8 every recording has a **session id** (8 uppercase hex) and each segment a **sequence number** (1-based):
+
+- The session starts with `RECORD_START` and ends with any stop; manual stop → start is a new session. Auto-segmentation and pause/resume continue the same session with the next `seq`.
+- The host may pin the id: `RECORD_START {"session":"A1B2C3D4"}` (`start_recording_with_session`, generate with `new_session_id()`). Non-8-hex values are rejected locally and by the firmware — never silently replaced by a random id. Without the field (buttons, switch, `RECORD`, old hosts) the firmware generates one.
+- The `.txt` sidecar becomes `{"timestamp":<unix s>,"synced":<bool>,"session":"A1B2C3D4","seq":3}` (extra fields; old parsers ignore them). The generated upload/download name extends to `synced_<unix>_<session>_<seq>.apm` — falls back to the plain `synced_<unix>.apm` when the `.txt` lacks markers (old files keep working).
+- `FILE_LIST` entries for `.apm` files gain `"session"` / `"seq"` / `"start_at"` (segment start time; `created_at` remains the FAT mtime, i.e. segment **end**) and `"synced"` (whether the clock was synced at capture). Entries without a readable `.txt` (old files, `.txt` deleted) simply omit the fields — group by marker when present, fall back to time heuristics otherwise. The `.TXT` sidecars themselves are no longer listed (their content is folded into the `.apm` entry; `FILE_UPLOAD`/`FILE_DELETE` by name still work). The AP `/api/files` entries carry the same fields (`startAt` camelCase) and have always listed `.apm` only.
+- The `RECORD_STATUS` started/stopped pushes and the `RECORD_START` success response include the effective `session` — how a host learns the id when recording was triggered by button/switch.
+- SDK helpers: `FileEntry::recording_marker()` / `AccessPointFileEntry::recording_marker()` → `(session, seq)`; `FileEntry::recording_name()` / `AccessPointFileEntry::recording_name()` derive the generated display name (`synced_<unix>_<session>_<seq>.apm`, exactly what upload/download will produce) from the entry fields while `name` stays the raw card name for requests; `RecordingSegmentName::parse` decodes the extended upload names; `list_files_stream(folder, on_entry)` yields entries one by one (the firmware always sends the full list; streaming is for display, not cancellation).
+
 ### STA upload protocol (WiFi 0.1.0)
 
 `UPLOAD_FILE {"name": "<SD file>", "url": "<base URL>"}` streams the file to the server over **plain HTTP POST** (the 0.0.9 hand-rolled WebSocket upload and its `auth/exchange` token gate are removed):

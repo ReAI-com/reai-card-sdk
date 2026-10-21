@@ -504,12 +504,34 @@ async function listFiles() {
   } finally { setBusy(false); }
 }
 
+// 录音显示名：按固件上传名同款规则从条目字段派生（主控 0.3.8 / WiFi 0.1.2 起，
+// 列表接口带 start_at/synced/session/seq）；旧固件或无标记文件返回 null。
+// AP 列表字段是 camelCase（startAt），两处都兼容。
+function recordingName(f) {
+  const start = f.start_at ?? f.startAt;
+  if (start == null || f.synced == null) return null;
+  let name = `${f.synced ? 'synced' : 'nosync'}_${start}`;
+  if (f.session && f.seq != null) name += `_${f.session}_${String(f.seq).padStart(2, '0')}`;
+  return name + '.apm';
+}
+
+function fmtTime(ts) {
+  if (ts == null) return '-';
+  const d = new Date(ts * 1000), p = n => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+}
+
 function renderFiles(files) {
   if (!files.length) { $('fileTable').textContent = '目录为空'; return; }
-  let html = '<table><tr><th>#</th><th>名称</th><th>大小</th><th>目录</th><th>操作</th></tr>';
+  let html = '<table><tr><th>#</th><th>名称</th><th>会话</th><th>开始时间</th><th>大小</th><th>操作</th></tr>';
   files.forEach(f => {
-    html += `<tr><td>${f.index}</td><td>${esc(f.name ?? '-')}</td><td>${f.size ?? '-'}</td>
-      <td>${f.is_dir === 1 ? '是' : '否'}</td>
+    const rname = recordingName(f);
+    const nameCell = rname
+      ? `${esc(rname)}<br><span style="font-size:11px;color:#999">${esc(f.name ?? '')}</span>`
+      : esc(f.name ?? '-');
+    const session = f.session ? `${esc(f.session)} #${f.seq ?? '?'}` : '-';
+    html += `<tr><td>${f.index ?? '-'}</td><td>${nameCell}</td><td>${session}</td>
+      <td>${fmtTime(f.start_at ?? f.startAt)}</td><td>${f.size ?? '-'}</td>
       <td>
         <button onclick="takeFile('${esc(f.name ?? '')}')">取走</button>
         <button class="danger" onclick="delFileByName('${esc(f.name ?? '')}')">删除</button>

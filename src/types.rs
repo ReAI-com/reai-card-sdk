@@ -124,6 +124,9 @@ pub struct RecordStatus {
     pub reason: Option<RecordReason>,
     /// 仅录音出错的推送携带：固件错误码（此时 `is_recording == false`）。
     pub error: Option<u32>,
+    /// 本次录音的会话编号（主控 0.3.8 起 started/stopped 推送携带）。
+    /// 按键/开关触发录音时，App 靠它拿到设备生成的会话编号；旧固件为 `None`。
+    pub session: Option<String>,
 }
 
 /// `RECORD_MARK` 的结果：在当前录音文件的第 `offset_secs` 秒打了一个标记。
@@ -201,6 +204,53 @@ pub struct FileEntry {
     #[serde(rename = "is_dir")]
     pub is_dir: Option<u8>,
     pub created_at: Option<i64>,
+    /// 录音会话编号（8 位大写十六进制；主控 0.3.8 起，`.apm` 条目带同名 `.txt` 时携带）。
+    /// 旧固件 / 旧文件为 `None`，调用方按时间启发式兜底。
+    pub session: Option<String>,
+    /// 该会话内的段序号，从 1 递增（每 10 分钟自动切片、暂停恢复都会递增；手动停止再开始是新会话）。
+    pub seq: Option<u32>,
+    /// 段开始时间的 Unix 秒（来自同名 `.txt` 的 `timestamp`）。`created_at` 是 FAT 修改时间
+    ///（`.apm` 即切片结束时间），需要开始时间时用这个。
+    pub start_at: Option<i64>,
+    /// 录音时设备时钟是否已同步（与 `start_at` 同时携带；`false` 时时间不是真实日期）。
+    pub synced: Option<bool>,
+}
+
+impl FileEntry {
+    /// 本条目的录音会话标记 `(session, seq)`；旧固件或旧文件（无标记）返回 `None`。
+    pub fn recording_marker(&self) -> Option<(&str, u32)> {
+        Some((self.session.as_deref()?, self.seq?))
+    }
+
+    /// 派生的录音显示名，与固件上传/下载时生成的名字同规则：
+    /// `synced_<unix>_<会话>_<段序号2位>.apm`（无会话标记时退回 `synced_<unix>.apm`）。
+    /// 列表里的 [`FileEntry::name`] 始终是卡上原始名（上传/删除请求用），
+    /// 展示用这个；旧文件（无 `start_at`/`synced`）返回 `None`。
+    pub fn recording_name(&self) -> Option<String> {
+        Some(generated_recording_name(
+            self.synced?,
+            self.start_at?,
+            self.session.as_deref(),
+            self.seq,
+        ))
+    }
+}
+
+/// 按固件同款规则拼出录音生成名：`<synced|nosync>_<unix秒>.apm`，
+/// 带会话标记时 `<前缀>_<unix秒>_<会话>_<段序号2位>.apm`（段序号补零 2 位便于排序）。
+pub fn generated_recording_name(
+    synced: bool,
+    timestamp: i64,
+    session: Option<&str>,
+    seq: Option<u32>,
+) -> String {
+    let prefix = if synced { "synced" } else { "nosync" };
+    match (session, seq) {
+        (Some(session), Some(seq)) => {
+            format!("{prefix}_{timestamp}_{session}_{seq:02}.apm")
+        }
+        _ => format!("{prefix}_{timestamp}.apm"),
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
@@ -256,6 +306,32 @@ pub struct AccessPointFileEntry {
     pub size_formatted: Option<String>,
     pub timestamp: Option<i64>,
     pub date: Option<String>,
+    /// 录音会话编号（语义同 [`FileEntry::session`]；WiFi 0.1.2 起 `/api/files` 携带）。
+    pub session: Option<String>,
+    /// 该会话内的段序号（语义同 [`FileEntry::seq`]）。
+    pub seq: Option<u32>,
+    /// 段开始时间的 Unix 秒（来自同名 `.txt`；仅当条目带标记时有意义）。
+    #[serde(rename = "startAt")]
+    pub start_at: Option<i64>,
+    /// 录音时设备时钟是否已同步（WiFi 0.1.2 起 `/api/files` 携带）。
+    pub synced: Option<bool>,
+}
+
+impl AccessPointFileEntry {
+    /// 本条目的录音会话标记 `(session, seq)`；旧固件或旧文件（无标记）返回 `None`。
+    pub fn recording_marker(&self) -> Option<(&str, u32)> {
+        Some((self.session.as_deref()?, self.seq?))
+    }
+
+    /// 派生的录音显示名，规则与语义同 [`FileEntry::recording_name`]。
+    pub fn recording_name(&self) -> Option<String> {
+        Some(generated_recording_name(
+            self.synced?,
+            self.start_at?,
+            self.session.as_deref(),
+            self.seq,
+        ))
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
@@ -465,33 +541,110 @@ pub enum DeviceEvent {
 /// BLE 取走时 `FILE_UPLOAD` 的 start 帧 `name`、AP 下载时 `Content-Disposition` 的
 /// filename 都遵循该规则（`.txt` 缺失时固件退回原名，此时解析得到 `None`）。
 /// `synced == false` 表示录音时设备时钟未同步，`timestamp` 不能当真实日期用。
+///
+/// 主控 0.3.8 起，`.txt` 带会话标记时名字扩展为
+/// `synced_<unix秒>_<会话8hex>_<段序号>.apm`；[`RecordingStamp::parse`] 忽略尾部标记仍然可用，
+/// 完整解析见 [`RecordingSegmentName`]。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RecordingStamp {
     pub timestamp: i64,
     pub synced: bool,
 }
 
+/// 拆出 `synced_` / `nosync_` 前缀后的时间戳与剩余尾部（如 `A1B2C3D4_02`）。
+fn split_recording_name(name: &str) -> Option<(bool, i64, &str)> {
+    let stem = name.rsplit('/').next().unwrap_or(name);
+    let stem = stem
+        .strip_suffix(".apm")
+        .or_else(|| stem.strip_suffix(".APM"))
+        .unwrap_or(stem);
+    let (synced, rest) = if let Some(rest) = stem.strip_prefix("synced_") {
+        (true, rest)
+    } else {
+        (false, stem.strip_prefix("nosync_")?)
+    };
+    let digits_end = rest
+        .find('_')
+        .unwrap_or(rest.len());
+    let timestamp = rest[..digits_end].parse::<i64>().ok()?;
+    Some((synced, timestamp, &rest[digits_end..]))
+}
+
 impl RecordingStamp {
     /// 从固件文件名解析；不符合规则（如原始 `XXXXXXXX.APM`）返回 `None`。
+    /// 带会话标记的扩展名也能解析（尾部标记被忽略，完整解析用 [`RecordingSegmentName::parse`]）。
     pub fn parse(name: &str) -> Option<Self> {
-        let stem = name.rsplit('/').next().unwrap_or(name);
-        let stem = stem
-            .strip_suffix(".apm")
-            .or_else(|| stem.strip_suffix(".APM"))
-            .unwrap_or(stem);
-        let (synced, digits) = if let Some(rest) = stem.strip_prefix("synced_") {
-            (true, rest)
-        } else {
-            (false, stem.strip_prefix("nosync_")?)
-        };
-        let timestamp = digits.parse::<i64>().ok()?;
+        let (synced, timestamp, _) = split_recording_name(name)?;
         Some(Self { timestamp, synced })
     }
 }
 
+/// 带会话标记的录音名解析结果：`(session, seq)` + 基础时间戳。
+///
+/// 兼容两种格式：
+/// - `synced_<unix秒>.apm`（旧固件）→ `session`/`seq` 为 `None`
+/// - `synced_<unix秒>_<会话8hex>_<段序号>.apm`（主控 0.3.8 / WiFi 0.1.2 起）
+///
+/// 尾部不符合标记格式时同样降级为 `None`（不整体失败），便于对旧文件宽松处理。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordingSegmentName {
+    pub stamp: RecordingStamp,
+    pub session: Option<String>,
+    pub seq: Option<u32>,
+}
+
+impl RecordingSegmentName {
+    pub fn parse(name: &str) -> Option<Self> {
+        let (synced, timestamp, tail) = split_recording_name(name)?;
+        let stamp = RecordingStamp { timestamp, synced };
+
+        let Some(tail) = tail.strip_prefix('_') else {
+            // 旧格式没有尾部标记
+            return Some(Self { stamp, session: None, seq: None });
+        };
+        let mut parts = tail.splitn(2, '_');
+        let session = parts.next()?;
+        let seq = parts.next();
+
+        // 会话编号：8 位十六进制（大小写均可，规范输出为大写）
+        if session.len() != 8 || !session.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Some(Self { stamp, session: None, seq: None });
+        }
+        let seq = match seq {
+            Some(seq) if !seq.is_empty() => match seq.parse::<u32>() {
+                Ok(seq) => Some(seq),
+                Err(_) => return Some(Self { stamp, session: None, seq: None }),
+            },
+            _ => None,
+        };
+        Some(Self {
+            stamp,
+            session: Some(session.to_ascii_uppercase()),
+            seq,
+        })
+    }
+}
+
+/// 校验会话编号格式：恰好 8 位十六进制（发送给固件前使用；固件对非法值直接拒绝）。
+pub fn is_valid_session_id(session: &str) -> bool {
+    session.len() == 8 && session.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// 生成一个新的会话编号（8 位大写十六进制，取自 UUID v4）。
+///
+/// 用 [`crate::DyjDevice::start_recording_with_session`] 发起录音时由调用方生成传入；
+/// 不传则固件自行随机生成，实际值以后续 `RECORD_STATUS` 推送为准。
+pub fn new_session_id() -> String {
+    let bytes = uuid::Uuid::new_v4().into_bytes();
+    format!("{:08X}", u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+}
+
 #[cfg(test)]
 mod recording_stamp_tests {
-    use super::RecordingStamp;
+    use super::{
+        AccessPointFileEntry, FileEntry, RecordingSegmentName, RecordingStamp, is_valid_session_id,
+        new_session_id,
+    };
 
     #[test]
     fn parses_firmware_timestamp_names() {
@@ -516,6 +669,112 @@ mod recording_stamp_tests {
         assert_eq!(RecordingStamp::parse("059F19DF.APM"), None);
         assert_eq!(RecordingStamp::parse("synced_abc.apm"), None);
         assert_eq!(RecordingStamp::parse("recording.wav"), None);
+    }
+
+    #[test]
+    fn parses_extended_segment_names() {
+        // 新格式：synced_<ts>_<session8>_<seq>.apm（主控 0.3.8 起）
+        let name = RecordingSegmentName::parse("synced_1792392529_A1B2C3D4_02.apm").unwrap();
+        assert_eq!(name.stamp.timestamp, 1792392529);
+        assert!(name.stamp.synced);
+        assert_eq!(name.session.as_deref(), Some("A1B2C3D4"));
+        assert_eq!(name.seq, Some(2));
+
+        // 小写会话编号规范成大写
+        let name = RecordingSegmentName::parse("/nosync_42_a1b2c3d4_1.apm").unwrap();
+        assert!(!name.stamp.synced);
+        assert_eq!(name.session.as_deref(), Some("A1B2C3D4"));
+        assert_eq!(name.seq, Some(1));
+
+        // 旧格式：session/seq 为 None，但整体解析成功
+        let name = RecordingSegmentName::parse("synced_1792392529.apm").unwrap();
+        assert_eq!(name.session, None);
+        assert_eq!(name.seq, None);
+
+        // 尾部不是合法标记：降级为 None 而不是失败
+        let name = RecordingSegmentName::parse("synced_1792392529_hello.apm").unwrap();
+        assert_eq!(name.session, None);
+        assert_eq!(name.seq, None);
+
+        // 原始设备名仍然整体失败
+        assert_eq!(RecordingSegmentName::parse("059F19DF.APM"), None);
+    }
+
+    #[test]
+    fn file_entry_marker_requires_both_fields() {
+        let entry: FileEntry =
+            serde_json::from_str(r#"{"index":0,"name":"A1B2C3D4.APM","session":"A1B2C3D4","seq":3}"#)
+                .unwrap();
+        assert_eq!(entry.recording_marker(), Some(("A1B2C3D4", 3)));
+
+        // 旧固件条目（无新字段）→ None；start_at 缺省也为 None
+        let entry: FileEntry =
+            serde_json::from_str(r#"{"index":0,"name":"059F19DF.APM","size":10,"is_dir":0}"#)
+                .unwrap();
+        assert_eq!(entry.recording_marker(), None);
+        assert_eq!(entry.session, None);
+        assert_eq!(entry.start_at, None);
+    }
+
+    #[test]
+    fn recording_name_matches_firmware_rule() {
+        // 完整条目 → 与固件上传名一致
+        let entry: FileEntry = serde_json::from_str(
+            r#"{"index":0,"name":"A1B2C3D4.APM","start_at":1792392529,"synced":true,"session":"A1B2C3D4","seq":1}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            entry.recording_name().as_deref(),
+            Some("synced_1792392529_A1B2C3D4_01.apm")
+        );
+
+        // 未同步时钟 → nosync 前缀；seq 补零 2 位
+        let entry: FileEntry = serde_json::from_str(
+            r#"{"index":1,"name":"059F19DF.APM","start_at":42,"synced":false,"session":"059F19DF","seq":12}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            entry.recording_name().as_deref(),
+            Some("nosync_42_059F19DF_12.apm")
+        );
+
+        // 旧 txt（有时间戳无会话标记）→ 旧格式名
+        let entry: FileEntry = serde_json::from_str(
+            r#"{"index":2,"name":"059F19DF.APM","start_at":1792392529,"synced":true}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            entry.recording_name().as_deref(),
+            Some("synced_1792392529.apm")
+        );
+
+        // 缺 synced / start_at → None（不给猜测的前缀）
+        let entry: FileEntry = serde_json::from_str(
+            r#"{"index":3,"name":"059F19DF.APM","start_at":42,"session":"059F19DF","seq":1}"#,
+        )
+        .unwrap();
+        assert_eq!(entry.recording_name(), None);
+
+        // AP 条目同样可派生
+        let ap: AccessPointFileEntry = serde_json::from_str(
+            r#"{"name":"A1B2C3D4.APM","size":1,"startAt":1792392529,"synced":true,"session":"A1B2C3D4","seq":3}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            ap.recording_name().as_deref(),
+            Some("synced_1792392529_A1B2C3D4_03.apm")
+        );
+    }
+
+    #[test]
+    fn session_id_helpers() {
+        assert!(is_valid_session_id("A1B2C3D4"));
+        assert!(is_valid_session_id("00000000"));
+        assert!(!is_valid_session_id("A1B2C3D")); // 7 位
+        assert!(!is_valid_session_id("A1B2C3D4X")); // 9 位
+        assert!(!is_valid_session_id("A1B2C3D4 ")); // 含空格
+        let id = new_session_id();
+        assert!(is_valid_session_id(&id), "生成的编号应可通过校验: {id}");
     }
 }
 

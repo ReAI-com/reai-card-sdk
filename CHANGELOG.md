@@ -3,7 +3,22 @@
 版本号独立于主控固件（nRF `v0.3.x` / WiFi `v0.0.x`）；SDK 与固件的协议对应关系见
 [`docs/protocol-support.md`](docs/protocol-support.md)。
 
-## 0.0.4（2026-10-21，未发布）
+## 0.0.5（2026-10-21）
+
+配套固件 **主控 0.3.8 + WiFi 0.1.2（录音会话标记）**，同一次录音的各切片可被上位机识别与合并。tag `v0.0.5`。
+
+**真机验证状态**：会话标记核心链路已验证（FILE_LIST 条目带 `session`/`seq`/`start_at`/`synced`、显示名与上传名解析正确；首版固件"session 键名被当值提取"的解析 bug 已修并复验）。待完整回归：跨 10 分钟切片 seq 递增、按键触发推送拿编号、STA 云上传命名、`FILE_DELETE` 成对删除。
+
+**新增**：
+
+- **录音会话标记**（主控 ≥0.3.8 / WiFi ≥0.1.2）：每次录音有 8 位十六进制会话编号 + 段序号（1 起，10 分钟切片、暂停恢复递增；手动停止再开始是新会话）。`FileEntry` / `AccessPointFileEntry` 新增 `session` / `seq` / `start_at`（段开始 Unix 秒；BLE `created_at` 是切片结束的 FAT 时间）/ `synced` 四个可选字段，旧固件 / 旧文件为 `None`（按时间启发式兜底）；`recording_marker()` 返回 `(session, seq)`；**`recording_name()` 派生显示名**——按固件同款规则从条目字段拼出 `synced_<unix>_<会话>_<段序号2位>.apm`（旧文件退回 `synced_<unix>.apm`，无标记返回 `None`），列表 `name` 保持卡上原始名供上传/删除请求使用。
+- **`RECORD_START` 可指定会话编号**：`start_recording_with_session(session)`（8 位十六进制，本地与固件双重校验，非法直接报错不静默换随机值；`new_session_id()` 生成）。不带参数的 `start_recording` 及按键/开关触发由固件随机生成；`RECORD_START` 成功响应与 `RECORD_STATUS` started/stopped 推送都带实际生效的 `session`（`RecordStatus.session`，按键触发时 App 靠它拿到编号）。
+- **上传名带会话标记**：`.txt` 带标记时生成名扩展为 `synced_<unix>_<会话>_<段序号>.apm`（BLE `FILE_UPLOAD` start 帧、AP 下载 `Content-Disposition`、STA 云上传同名规则），云接收端可按名分组；`RecordingSegmentName::parse` 解析新旧两种格式（旧格式降级 `session`/`seq` 为 `None`，`RecordingStamp::parse` 不受影响）。
+- **流式文件列表**：`list_files_stream(folder, on_entry)` 每收到一条立即回调（边读边显示），固件发完（`index:-1`）才返回；`list_files` 基于它实现，行为不变。注意固件总是发完整列表，流式不能提前取消。
+- **`FILE_DELETE` 成对删除**（主控 ≥0.3.8）：删 `.APM` 时同步删同名 `.TXT`，不再留孤儿旁车文件（`.mrk` 暂不处理）。
+- **BLE `FILE_LIST` 不再返回 `.TXT` 旁车文件**（主控 ≥0.3.8）：其内容已并入 `.APM` 条目字段，列表里只剩录音文件（与 AP 列表一致）；按名 `take_file`/`delete_file` 仍可操作 `.TXT`。
+
+## 0.0.4（2026-10-21）
 
 配套固件 **WiFi 0.1.0（HTTP POST 上传）+ 主控 0.3.7（屏幕点阵显示）**，云上传启用、屏幕开放自定义内容。
 
