@@ -344,6 +344,7 @@ impl DyjDevice {
         self.core.file_transfer_active.store(true, Ordering::SeqCst);
         let _transfer_guard = FlagGuard(&self.core.file_transfer_active);
         let mut incoming = self.core.incoming.lock().await;
+        discard_stale_inbound(&mut incoming, "FILE_UPLOAD")?;
         self.write_command("FILE_UPLOAD", Some(json!({"name": name})))
             .await?;
 
@@ -585,6 +586,7 @@ impl DyjDevice {
         self.require_wifi_module("WIFI_SCAN").await?;
         let _command = self.core.command_gate.lock().await;
         let mut incoming = self.core.incoming.lock().await;
+        discard_stale_inbound(&mut incoming, "WIFI_SCAN")?;
         self.write_command("WIFI_SCAN", None).await?;
         let mut started = false;
         let mut networks = Vec::new();
@@ -1043,10 +1045,12 @@ impl DyjDevice {
         let command = command.to_ascii_uppercase();
         let _command = self.core.command_gate.lock().await;
         let mut incoming = self.core.incoming.lock().await;
+        discard_stale_inbound(&mut incoming, &command)?;
         self.write_command(&command, payload).await?;
         loop {
             if let Inbound::Text(frame) = receive_next(&mut incoming, wait, &command).await?
                 && frame.command == command
+                && !is_unsolicited_push(&frame)
             {
                 tracing::debug!(target: "dyj.proto", "📥 响应内容 cmd={} body={}", frame.command, frame.payload);
                 return Ok(frame.payload);
@@ -1062,6 +1066,7 @@ impl DyjDevice {
         let command = command.to_ascii_uppercase();
         let _command = self.core.command_gate.lock().await;
         let mut incoming = self.core.incoming.lock().await;
+        discard_stale_inbound(&mut incoming, &command)?;
         self.write_command(&command, payload).await?;
         let mut results = Vec::new();
         loop {
@@ -1091,6 +1096,7 @@ impl DyjDevice {
         let command = command.to_ascii_uppercase();
         let _command = self.core.command_gate.lock().await;
         let mut incoming = self.core.incoming.lock().await;
+        discard_stale_inbound(&mut incoming, &command)?;
         self.write_command(&command, payload).await?;
         let mut results = Vec::with_capacity(expected_count);
         while results.len() < expected_count {
@@ -1401,6 +1407,41 @@ fn redacted_payload(payload: &Value) -> String {
         }
         other => other.to_string(),
     }
+}
+
+/// 写命令前排空应答队列里的积压项。
+///
+/// worker 把每个文本帧都送进应答队列（事件另走广播），空闲时设备主动推送的帧
+/// （如带 `reason` 的 `RECORD_STATUS`）和上一个请求超时后才到的迟到应答会一直积压，
+/// 被下一次同名请求当成自己的应答取走，之后每次错位一拍。持有 `incoming` 锁时
+/// 积压项必然早于本次请求，不可能是它的应答，直接丢弃；只有连接已断要立刻失败。
+fn discard_stale_inbound(
+    incoming: &mut mpsc::UnboundedReceiver<Inbound>,
+    command: &str,
+) -> Result<()> {
+    loop {
+        match incoming.try_recv() {
+            Ok(Inbound::Disconnected) | Err(mpsc::error::TryRecvError::Disconnected) => {
+                return Err(SdkError::Disconnected);
+            }
+            Ok(Inbound::Text(frame)) => {
+                tracing::debug!(target: "dyj.proto", "🧹 丢弃积压帧 cmd={command} stale={} body={}", frame.command, frame.payload);
+            }
+            Ok(Inbound::Binary(bytes)) => {
+                tracing::debug!(target: "dyj.proto", "🧹 丢弃积压二进制块 cmd={command} {}字节", bytes.len());
+            }
+            Ok(Inbound::Fault(message)) => {
+                tracing::debug!(target: "dyj.proto", "🧹 丢弃积压解析错误 cmd={command} {message}");
+            }
+            Err(mpsc::error::TryRecvError::Empty) => return Ok(()),
+        }
+    }
+}
+
+/// 与查询应答同名的主动推送：`RECORD_STATUS` 推送带 `reason`，查询应答不带。
+/// 请求等待期间设备可能恰好推送一条，不能当作本次查询的应答。
+fn is_unsolicited_push(frame: &TextFrame) -> bool {
+    frame.command == "RECORD_STATUS" && frame.payload.get("reason").is_some()
 }
 
 async fn receive_next(
@@ -2723,6 +2764,47 @@ mod tests {
         whole.extend(audio.recv().await.unwrap().samples);
 
         assert_eq!(whole, crate::audio::AdpcmDecoder::new().decode(&encoded));
+    }
+
+    #[tokio::test]
+    async fn record_status_skips_push_queued_while_idle() {
+        let transport = Arc::new(MockTransport::new());
+        let device = DyjDevice::from_transport(transport.clone()).await.unwrap();
+        // 空闲时设备推送一条带 reason 的状态（按键开始录音），没有请求在等它。
+        transport.reply(b"RECORD_STATUS:{\"isRecording\":true,\"realtimeEnabled\":true,\"reason\":\"button\"}\r\n");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // 修复前：这条推送被当成查询应答取走，真实应答留在队列里给下一次，之后每次错位一拍。
+        for _ in 0..2 {
+            let status = device.record_status().await.unwrap();
+            assert_eq!(status.reason, None);
+            assert!(!status.is_recording);
+        }
+    }
+
+    #[tokio::test]
+    async fn record_status_skips_push_arriving_while_waiting() {
+        let transport = Arc::new(MockTransport::new());
+        let device = DyjDevice::from_transport(transport.clone()).await.unwrap();
+        transport.go_silent();
+        let handle = tokio::spawn(async move { device.record_status().await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        // 等待应答期间先到一条推送，再到真实应答。
+        transport.reply(b"RECORD_STATUS:{\"isRecording\":true,\"realtimeEnabled\":true,\"reason\":\"switch\"}\r\n");
+        transport.reply(b"RECORD_STATUS:{\"isRecording\":true,\"realtimeEnabled\":false}\r\n");
+        let status = handle.await.unwrap().unwrap();
+        assert_eq!(status.reason, None);
+        assert!(!status.realtime_enabled);
+    }
+
+    #[tokio::test]
+    async fn stale_frame_queued_before_request_is_not_taken_as_reply() {
+        let transport = Arc::new(MockTransport::new());
+        let device = DyjDevice::from_transport(transport.clone()).await.unwrap();
+        // 模拟上一次请求超时后才到的迟到应答。
+        transport.reply(b"BASE_INFO:{\"version\":\"stale\",\"versionCode\":1,\"deviceId\":\"DYJ1\",\"deviceName\":\"DYJ\",\"timestamp\":1}\r\n");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(device.device_info().await.unwrap().version, "0.3.6");
     }
 
     #[tokio::test]
