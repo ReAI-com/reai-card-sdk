@@ -41,6 +41,9 @@ struct AppState {
     device: RwLock<Option<DyjDevice>>,
     /// 串行化 connect/disconnect，避免两个浏览器标签页同时重连。
     link_lock: Mutex<()>,
+    /// 当前事件转发任务（每次 connect 一个）。换设备时 abort 旧的，
+    /// 否则任务随旧设备事件通道存活而叠加——同一事件在网页上出现 2/3… 份。
+    forwarder: Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// 设备主动上报：(命令名, payload)。日志走 `common::log_sender` 的独立广播。
     events: broadcast::Sender<(String, serde_json::Value)>,
     downloads: PathBuf,
@@ -90,6 +93,7 @@ async fn main() {
         manager,
         device: RwLock::new(None),
         link_lock: Mutex::new(()),
+        forwarder: Mutex::new(None),
         events,
         downloads,
         recording: Mutex::new(None),
@@ -221,11 +225,17 @@ async fn connect(
         .iter()
         .find(|device| device.id == id)
         .ok_or_else(|| ApiError(reai_card_sdk::SdkError::DeviceNotFound(id.to_owned())))?;
+
+    // 换设备前先收尾旧的。SDK 的 DyjDevice 被 drop 时刻意不断开 BLE（移动端后台
+    // /重连语义），不显式 disconnect 会让旧 worker 与事件转发任务继续收发——
+    // 每重连一次就叠一个副本，同一事件在网页上出现 2/3… 份（真机踩过：2×→重连后 3×）。
+    let _ = teardown_device(&state).await;
+
     let device = state.manager.connect(found).await?;
 
     let mut event_rx = device.subscribe_events();
     let event_tx = state.events.clone();
-    tokio::spawn(async move {
+    let forwarder = tokio::spawn(async move {
         loop {
             match event_rx.recv().await {
                 Ok(event) => {
@@ -237,6 +247,10 @@ async fn connect(
             }
         }
     });
+    // 旧转发任务在旧设备断开后会自然退出（Closed），这里再兜底 abort
+    if let Some(old) = state.forwarder.lock().await.replace(forwarder) {
+        old.abort();
+    }
 
     *state.device.write().await = Some(device);
     tracing::info!(target: "dyj.device", "✅ 网页端已连接 id={id}");
@@ -245,14 +259,20 @@ async fn connect(
 
 async fn disconnect(State(state): State<Arc<AppState>>) -> ApiResult<Json<serde_json::Value>> {
     let _link = state.link_lock.lock().await;
-    // 录音会话先于设备断开收尾，避免设备没了之后 SDK 后台还在重试停录。
+    teardown_device(&state).await?;
+    Ok(Json(serde_json::json!({"connected": false})))
+}
+
+/// 断开当前设备并收尾：先停录音会话（避免 SDK 后台重试停录），再断 BLE——
+/// 断开会结束通知流，worker 与事件转发任务随之退出。connect 换设备时同样调用。
+async fn teardown_device(state: &Arc<AppState>) -> Result<(), ApiError> {
     if let Some(session) = state.recording.lock().await.take() {
         let _ = session.stop().await;
     }
     if let Some(device) = state.device.write().await.take() {
         device.disconnect().await?;
     }
-    Ok(Json(serde_json::json!({"connected": false})))
+    Ok(())
 }
 
 async fn command(
