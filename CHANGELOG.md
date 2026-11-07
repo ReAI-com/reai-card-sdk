@@ -3,6 +3,20 @@
 版本号独立于主控固件（nRF `v0.3.x` / WiFi `v0.0.x`）；SDK 与固件的协议对应关系见
 [`docs/protocol-support.md`](docs/protocol-support.md)。
 
+## 0.0.6（未发布，实施中）
+
+配套固件 **主控 0.3.9 + WiFi 0.1.3（事件绑定扩展 + 设备侧一键同步 + WiFi 凭据管理）**。
+固件 issue：ReAI-com/dyj-hd-v2#9；协议设计见固件仓 `docs/SYNC_UPLOAD.md` / `docs/ACTION_CONFIG.md`。
+
+**计划新增**（实施完成后逐项勾验）：
+
+- **绑定输入扩展**（主控 ≥0.3.9）：`ControlInput` 新增 `Charge(ChargeEdge::{On, Off})` → KV 键 `charge_on` / `charge_off`（充电插拔边沿，5 秒采样；开机即插充电器判一次 charge_on 边沿），`ALL` 6 → 8；`ControlBindings` 新增 `charge_on` / `charge_off` 字段与预设 `auto_sync()`（仅 `charge_on: SyncUpload`，示例性质）；`RecordReason` 新增 `charge`。
+- **新动作 `sync_upload`**：`ControlAction` 新增 `SyncUpload`——设备侧一键同步（开 WiFi → 自动连已存凭据 → 上传全部待传文件 → 关 WiFi，无需上位机在线），可绑定到任意输入。
+- **同步事件**：`SYNC_STATUS` / `UPLOAD_PROGRESS` / `WIFI_AUTOCONNECT` 三种帧映射为 `DeviceEvent::Sync(SyncEvent)`（状态 `opening/connecting/uploading/closing/done/error` + 触发来源 + 逐文件进度 + 错误码）；`sync_status()` 查询（idle 时带 `lastState`/`lastError`，中途重连用）。
+- **`start_sync()`**：触发设备侧同步，响应仅表示受理（busy → 错误）；进度走事件订阅。同步期间勿并发调用 WiFi/上传方法（ESP32 被 `UPLOAD_ALL` 阻塞）。
+- **WiFi 凭据管理**（WiFi ≥0.1.3）：`list_wifi_credentials()`（流式，**不含密码**，`WifiCredential { ssid, last_used }`，0.1.3 起为真实 Unix 秒）/ `delete_wifi_credential(ssid)`。
+- dyj_cli：`sync start|status`、`creds list|del <ssid>`，`controls` 接受充电输入与 `sync_upload`；dyj_web：绑定下拉 + 充电输入与 `sync_upload`、一键同步按钮与进度、已保存 WiFi 列表。
+
 ## 0.0.5（2026-10-21）
 
 配套固件 **主控 0.3.8 + WiFi 0.1.2（录音会话标记）**，同一次录音的各切片可被上位机识别与合并。tag `v0.0.5`。

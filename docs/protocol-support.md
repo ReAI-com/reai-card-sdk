@@ -60,7 +60,7 @@ This powered-down short-circuit is not unique to `WIFI_STATUS`: every UART-passt
 
 The nRF stores one action per physical input in its KV settings (`setting_kv`, 16 slots shared with every other key, 32-byte keys / 64-byte values). When an input fires, `main.c` reads the key, reports the event **with the bound action** (`BTN_CLICK {"key","action"}` / `TOGGLE_SWITCH {"state","action"}`) and then performs the action itself on the device (deferred to the main loop because the button timer callback cannot touch the SD card or PDM). The host must not replay the action.
 
-Division of responsibility: the SDK's job here is to deliver the typed events (`DeviceEvent::Button` / `ToggleSwitch`, plus the `RECORD_STATUS` push with `reason: button|switch`). The binding methods (`control_action` / `set_control_action` / `clear_control_action` / `control_bindings` / `apply_control_bindings`) are only a typed pass-through over `CONFIG_GET/SET/DEL` for the six keys below — **optional**: whether, when and with which defaults the bindings are written is the application's decision, and the SDK ships no default binding (`ControlBindings::recorder()` is an example preset, nothing more).
+Division of responsibility: the SDK's job here is to deliver the typed events (`DeviceEvent::Button` / `ToggleSwitch`, plus the `RECORD_STATUS` push with `reason: button|switch|charge`). The binding methods (`control_action` / `set_control_action` / `clear_control_action` / `control_bindings` / `apply_control_bindings`) are only a typed pass-through over `CONFIG_GET/SET/DEL` for the eight keys below — **optional**: whether, when and with which defaults the bindings are written is the application's decision, and the SDK ships no default binding (`ControlBindings::recorder()` / `auto_sync()` are example presets, nothing more).
 
 | Input | KV key | Reported as |
 | --- | --- | --- |
@@ -70,8 +70,10 @@ Division of responsibility: the SDK's job here is to deliver the typed events (`
 | button released after a long press | `btn_long_release` | `BTN_CLICK key=long_release` (always paired with the preceding `long_press`) |
 | side switch moved to on | `switch_on` | `TOGGLE_SWITCH state=on` |
 | side switch moved to off | `switch_off` | `TOGGLE_SWITCH state=off` |
+| charging started (plug in, main 0.3.9) | `charge_on` | `POWER {"type":"charging","charging":true,…,"action":…}` |
+| charging stopped (unplug, main 0.3.9) | `charge_off` | `POWER {"type":"charging","charging":false,…,"action":…}` |
 
-Action vocabulary (`ControlAction`): `none`, `record_start`, `record_stop`, `record_toggle`, `record_mark`. A missing key is treated by the firmware as `none`; `CONFIG_GET`/`CONFIG_DEL` on a missing key answer `code 3 "not found"`, which `control_action` maps to `ControlAction::None` and `clear_control_action` treats as success. Any other string is stored and echoed verbatim but performs nothing on v0.3.x; the SDK carries it as `ControlAction::Other`. `record_mark` outside a recording is a no-op on the device. Actions bound this way surface in `RECORD_STATUS` pushes with `reason: "button"` / `"switch"`.
+Action vocabulary (`ControlAction`): `none`, `record_start`, `record_stop`, `record_toggle`, `record_mark`, `sync_upload` (main 0.3.9, see *Device-side sync upload* below). A missing key is treated by the firmware as `none`; `CONFIG_GET`/`CONFIG_DEL` on a missing key answer `code 3 "not found"`, which `control_action` maps to `ControlAction::None` and `clear_control_action` treats as success. Any other string is stored and echoed verbatim but performs nothing on v0.3.x; the SDK carries it as `ControlAction::Other`. `record_mark` outside a recording is a no-op on the device. Actions bound this way surface in `RECORD_STATUS` pushes with `reason: "button"` / `"switch"` / `"charge"` (0.3.9 adds `charge`; pre-0.3.9 SDKs see it as `RecordReason::Other("charge")`). Charging edges are sampled every 5 s; a device booted with the charger already plugged reports one charge-start edge (documented, intended — that is the plug-in-to-sync scenario). Binding keys occupy 8 of the 16 KV slots (0.3.9).
 
 ### AP and STA file retrieval
 
@@ -113,6 +115,24 @@ Long recordings are segmented every 10 minutes into sibling `XXXXXXXX.APM` files
 - `UPLOAD_LIST` / `UPLOAD_DELETE` / `UPLOAD_CLEAR` are unchanged. The automatic upload loop stays disabled in firmware; uploads happen only on `UPLOAD_FILE`.
 
 The reference receiver is `dyj2.dev.reai.com` (`tools/uploadServer/` in the firmware repo): it validates `x-filesize`, stores under `uploads/<deviceId>/`, and answers `{"ok":true,"size":…,"sha256":…}` for host-side verification.
+
+### Device-side sync upload (main 0.3.9 / WiFi 0.1.3)
+
+`sync_upload` is a bindable action that makes the **device** run the whole cloud-sync flow with no host attached: power the WiFi module → auto-connect a saved credential → upload every pending `.APM` → power the module off (SD handed back, paused recording resumed). Trigger sources converge into one nRF state machine (`handler_sync`): any bound input, or the BLE command `SYNC_START`. Full specification: firmware repo `docs/SYNC_UPLOAD.md`.
+
+- `start_sync()` sends `SYNC_START`; the response only means *accepted* (`code 1 message "busy"` maps to an error). Progress is observed on the event channel as `DeviceEvent::Sync(SyncEvent)` — states `opening → connecting → uploading → closing → done|error`, with `trigger` (`app|button|switch|charge`), `current` (raw card name), `done`/`total` and a string `error` code (`sd_switch_failed` / `wifi_open_timeout` / `no_credentials` / `connect_failed` / `upload_url_missing` / `upload_failed`).
+- `sync_status()` queries the same state; when idle it carries `lastState`/`lastError` — how a host that reconnects mid-sync catches up.
+- The underlying frames (`SYNC_STATUS`, `UPLOAD_PROGRESS`, `WIFI_AUTOCONNECT`, `UPLOAD_ALL`) are intercepted by the nRF and still forwarded verbatim to BLE; unknown-frame consumers see them as typed `Sync` events, older SDKs as `Unhandled`.
+- Prerequisites the app must ensure once: at least one saved WiFi credential (any successful `connect_wifi`) and the `upload_url` config key. Failure keeps the failing files on the card; successful files are deleted as usual.
+- Do **not** call WiFi/upload methods while a sync is running — the ESP32 is blocked inside `UPLOAD_ALL` (same as a long `UPLOAD_FILE`) and the sync machine owns the module. There is no `SYNC_STOP` in this firmware generation.
+
+### WiFi credential management (WiFi 0.1.3)
+
+Credentials are stored inside the ESP32 (NVS namespace `wifi_creds_v2`, max 5, saved automatically on every successful `connect_wifi`, LRU-evicted). They never leave the module — `WIFI_CRED_LIST` answers **without passwords**:
+
+- `list_wifi_credentials()` → `Vec<WifiCredential { ssid, last_used: Option<i64> }>`; the UART answer is streamed one entry per frame (`index`, `-1` terminator). `last_used` is a Unix-second timestamp since WiFi 0.1.3 (previously uptime-seconds that reset on every power cycle, which broke "newest first"); `0`/absent means the clock was not synced when it was saved.
+- `delete_wifi_credential(ssid)` → `WIFI_CRED_DEL`; `code 1 not_found` maps to an error. Auto-connect skips deleted networks; an in-flight attempt is unaffected.
+- Auto-connect itself is async on the ESP32. With the AP auto-start enabled (the default), **no auto-connect happens at boot** — the module only connects when told: either `WIFI_CONNECT` (which also saves the credential) or the `WIFI_AUTOCONNECT` passthrough command. Every auto-connect attempt ends with a `WIFI_AUTOCONNECT` result frame (`{"code":0,"ssid",…}` / `{"code":1,"message":"no_credentials|all_failed"}`), surfaced as part of the `Sync` event flow. `sync_upload`'s CONNECTING stage uses exactly this command.
 
 ### Custom display content (DISPLAY_SHOW / DISPLAY_CLEAR, main 0.3.7)
 
@@ -216,9 +236,9 @@ Field observation (2026-10-20, main v0.3.3 + unknown WiFi firmware): after `WIFI
 
 ## Events
 
-The event receiver emits typed `DeviceEvent`s for `BTN_CLICK` (`ButtonEvent { gesture, action }`), `TOGGLE_SWITCH` (`ToggleSwitchEvent { position, action }`), `RECORD_STATUS` (`RecordStatus` with `reason` and, on failure, `error`), `WIFI_LIST`, `WIFI_OFF`, `UPLOAD_COMPLETE`, `OTA_WIFI_PROCESS` and `WIFI_AP_START`. `WIFI_LIST` may also be consumed by a currently running `scan_wifi` call; event observers still receive it. A `BTN_CLICK`/`TOGGLE_SWITCH` whose `key`/`state` the SDK does not know (a future firmware gesture) is delivered as `DeviceEvent::Unhandled { command, payload }` rather than dropped.
+The event receiver emits typed `DeviceEvent`s for `BTN_CLICK` (`ButtonEvent { gesture, action }`), `TOGGLE_SWITCH` (`ToggleSwitchEvent { position, action }`), `RECORD_STATUS` (`RecordStatus` with `reason` and, on failure, `error`), `WIFI_LIST`, `WIFI_OFF`, `UPLOAD_COMPLETE`, `OTA_WIFI_PROCESS` and `WIFI_AP_START`. From main 0.3.9 / WiFi 0.1.3 the sync-related frames `SYNC_STATUS`, `UPLOAD_PROGRESS` and `WIFI_AUTOCONNECT` map to `DeviceEvent::Sync(SyncEvent)` (see *Device-side sync upload* above). `WIFI_LIST` may also be consumed by a currently running `scan_wifi` call; event observers still receive it. A `BTN_CLICK`/`TOGGLE_SWITCH` whose `key`/`state` the SDK does not know (a future firmware gesture) is delivered as `DeviceEvent::Unhandled { command, payload }` rather than dropped.
 
-`RECORD_STATUS` pushes carry `reason` (`app`, `button`, `switch`, `auto` for the 10-minute auto-split, `unknown`) and, for `RECORD_EVT_ERROR`, an `error` code with `isRecording: false`. The same command name answers the `record_status()` query; that response has no `reason` and is also broadcast on the event channel.
+`RECORD_STATUS` pushes carry `reason` (`app`, `button`, `switch`, `charge` — charging-edge bindings since main 0.3.9, `auto` for the 10-minute auto-split, `unknown`) and, for `RECORD_EVT_ERROR`, an `error` code with `isRecording: false`. The same command name answers the `record_status()` query; that response has no `reason` and is also broadcast on the event channel.
 
 ### Power notifications: format fixed in 0.3.7, charging event added
 
@@ -233,7 +253,7 @@ The SDK accepts both shapes and surfaces them as the same `DeviceEvent::Power(Po
 | Raw `{"type":...}` with no name and no CRLF | firmware ≤ v0.3.6 | `FrameDecoder` treats a buffer starting with `{` as a raw JSON object, cuts it at the JSON boundary as soon as it is complete (no newline needed), and resumes line parsing on the remaining bytes. Unknown `type` → `Unhandled` with an empty `command`; malformed raw JSON is dropped up to the next newline so the stream resynchronizes. |
 | Framed `POWER:{"type":...}\r\n` | firmware ≥ 0.3.7 | ordinary text frame; `event_from_frame` maps command `POWER` to `PowerEvent`, unknown `type` → `Unhandled { command: "POWER" }`. |
 
-`PowerEvent` variants: `ShutdownImminent { seconds }`, `DeviceWakeup`, `StartupComplete`, `Charging { charging: bool, level: Option<u8> }` (the latter only from ≥0.3.7).
+`PowerEvent` variants: `ShutdownImminent { seconds }`, `DeviceWakeup`, `StartupComplete`, `Charging { charging: bool, level: Option<u8> }` (the latter only from ≥0.3.7; main 0.3.9 adds an `action` field to charging frames carrying the `charge_on`/`charge_off` binding — parsed as `PowerEvent::Charging`, surfaced alongside `DeviceEvent::Sync` when the bound action is `sync_upload`).
 
 Event availability caveat: with the current ESP32 firmware the `UPLOAD_COMPLETE` notification is only sent from the automatic-upload loop, which is disabled (`UploadManager::loop` returns immediately). The `UPLOAD_FILE` command therefore reports completion through its own (delayed) response, not through `UPLOAD_COMPLETE`; treat `DeviceEvent::UploadComplete` as reserved for future firmware. `WIFI_AP_START` is emitted by the ESP32 boot flow once its AP and HTTP server are both up.
 
