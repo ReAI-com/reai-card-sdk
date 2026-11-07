@@ -61,7 +61,9 @@ pub enum RecordReason {
     Switch,
     /// 设备自动行为，例如录满 10 分钟自动分段。
     Auto,
-    /// 固件未能归类。
+    /// 充电边沿（`charge_on`/`charge_off`）绑定的动作（主控 0.3.9 起）。
+    Charge,
+    /// 设备自动行为之外的未知来源。
     Unknown,
     /// 未来固件新增的来源，原字符串保留。
     Other(String),
@@ -74,6 +76,7 @@ impl RecordReason {
             Self::Button => "button",
             Self::Switch => "switch",
             Self::Auto => "auto",
+            Self::Charge => "charge",
             Self::Unknown => "unknown",
             Self::Other(name) => name,
         }
@@ -85,6 +88,7 @@ impl RecordReason {
             "button" => Self::Button,
             "switch" => Self::Switch,
             "auto" => Self::Auto,
+            "charge" => Self::Charge,
             "unknown" => Self::Unknown,
             other => Self::Other(other.to_owned()),
         }
@@ -194,6 +198,166 @@ pub enum PowerEvent {
     StartupComplete,
     /// 充电状态变化（0.3.7 新增：插入/拔出时推送，`level` 为当时电量百分比）。
     Charging { charging: bool, level: Option<u8> },
+}
+
+/// 一键同步的状态（`SYNC_STATUS` 事件的 `state` 字段）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SyncState {
+    /// WiFi 模块上电 / SD 切换中。
+    Opening,
+    /// 已存凭据自动连接中（`WIFI_AUTOCONNECT`）。
+    Connecting,
+    /// 批量上传中（`UPLOAD_ALL` / `UPLOAD_PROGRESS`）。
+    Uploading,
+    /// 收尾中：断模块电、SD 切回主控、恢复被暂停的录音。
+    Closing,
+    /// 全部完成。
+    Done,
+    /// 失败（`error` 字段给原因；失败文件保留在卡上，下次再传）。
+    Error,
+    /// 仅 `sync_status()` 查询返回：当前没有同步在跑。
+    Idle,
+}
+
+impl SyncState {
+    pub const fn wire_name(self) -> &'static str {
+        match self {
+            Self::Opening => "opening",
+            Self::Connecting => "connecting",
+            Self::Uploading => "uploading",
+            Self::Closing => "closing",
+            Self::Done => "done",
+            Self::Error => "error",
+            Self::Idle => "idle",
+        }
+    }
+
+    pub fn parse(text: &str) -> Option<Self> {
+        Some(match text {
+            "opening" => Self::Opening,
+            "connecting" => Self::Connecting,
+            "uploading" => Self::Uploading,
+            "closing" => Self::Closing,
+            "done" => Self::Done,
+            "error" => Self::Error,
+            "idle" => Self::Idle,
+            _ => return None,
+        })
+    }
+}
+
+/// 一键同步的触发来源（`SYNC_STATUS` 事件的 `trigger` 字段）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SyncTrigger {
+    App,
+    Button,
+    Switch,
+    Charge,
+}
+
+impl SyncTrigger {
+    pub fn parse(text: &str) -> Option<Self> {
+        Some(match text {
+            "app" => Self::App,
+            "button" => Self::Button,
+            "switch" => Self::Switch,
+            "charge" => Self::Charge,
+            _ => return None,
+        })
+    }
+}
+
+/// 一键同步的进度/结果事件。
+///
+/// 同一结构承载三种来源（都归入 [`DeviceEvent::Sync`](crate::types::DeviceEvent::Sync)）：
+/// - `SYNC_STATUS` 状态推送与 `sync_status()` 查询响应（全字段）；
+/// - `UPLOAD_PROGRESS`（state 恒为 [`SyncState::Uploading`]，current/done/total）；
+/// - `WIFI_AUTOCONNECT` 结果帧（state 恒为 [`SyncState::Connecting`]，成功时 `message`
+///   为已连 SSID、`code` 为 0；失败时 `error` 为 `no_credentials`/`all_failed`）。
+///
+/// 旧字段一律缺席为 `None`：`current` 是正在上传的**卡上文件名**（8.3 名），
+/// `error` 的取值见固件 `docs/SYNC_UPLOAD.md`
+/// （`sd_switch_failed`/`wifi_open_timeout`/`no_credentials`/`connect_failed`/
+/// `upload_url_missing`/`upload_failed`）。`last_state`/`last_error` 仅在查询
+/// 响应且设备空闲时出现，是上一次同步的结果。
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize, Serialize)]
+pub struct SyncEvent {
+    pub state: Option<SyncState>,
+    pub trigger: Option<SyncTrigger>,
+    pub current: Option<String>,
+    pub done: Option<u32>,
+    pub total: Option<u32>,
+    /// 0 = 正常推进，1 = 出错（与协议 `code` 字段一致）。
+    pub code: Option<u32>,
+    pub error: Option<String>,
+    pub message: Option<String>,
+    pub last_state: Option<SyncState>,
+    pub last_error: Option<String>,
+}
+
+impl SyncEvent {
+    pub(crate) fn from_payload(payload: &Value) -> Self {
+        let state = payload
+            .get("state")
+            .and_then(Value::as_str)
+            .and_then(SyncState::parse);
+        let trigger = payload
+            .get("trigger")
+            .and_then(Value::as_str)
+            .and_then(SyncTrigger::parse);
+        let last_state = payload
+            .get("lastState")
+            .and_then(Value::as_str)
+            .and_then(SyncState::parse);
+        Self {
+            state,
+            trigger,
+            current: payload
+                .get("current")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            done: payload
+                .get("done")
+                .and_then(Value::as_u64)
+                .map(|v| v as u32),
+            total: payload
+                .get("total")
+                .and_then(Value::as_u64)
+                .map(|v| v as u32),
+            code: payload
+                .get("code")
+                .and_then(Value::as_u64)
+                .map(|v| v as u32),
+            error: payload
+                .get("error")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            message: payload
+                .get("message")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            last_state,
+            last_error: payload
+                .get("lastError")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+        }
+    }
+}
+
+/// 设备上已保存的 WiFi 凭据（`WIFI_CRED_LIST` 条目）。
+///
+/// 固件**不返回密码**——凭据密码不出 WiFi 模块。`last_used` 是最近一次成功
+/// 连接的 Unix 秒（WiFi 0.1.3 起；此前固件用 uptime 秒、跨断电无意义），
+/// `None`/`Some(0)` 表示时间未知（当时设备时钟未同步）。
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WifiCredential {
+    pub ssid: String,
+    #[serde(default)]
+    pub last_used: Option<i64>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
@@ -528,6 +692,9 @@ pub enum DeviceEvent {
     AccessPointReady(CommandResponse),
     /// 电源管理通知（关机倒计时等），见 [`PowerEvent`]。
     Power(PowerEvent),
+    /// 一键同步进度/结果（`SYNC_STATUS` / `UPLOAD_PROGRESS` /
+    /// `WIFI_AUTOCONNECT` 三种帧统一映射，主控 0.3.9 / WiFi 0.1.3 起）。
+    Sync(SyncEvent),
     /// 认得命令名但载荷无法按已知结构解析（如未来固件新增的按键手势），
     /// 或无命令封装且 `type` 未知的裸 JSON——后者 `command` 为空字符串。
     Unhandled {

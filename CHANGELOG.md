@@ -3,12 +3,14 @@
 版本号独立于主控固件（nRF `v0.3.x` / WiFi `v0.0.x`）；SDK 与固件的协议对应关系见
 [`docs/protocol-support.md`](docs/protocol-support.md)。
 
-## 0.0.6（未发布，实施中）
+## 0.0.6（2026-11-07）
 
 配套固件 **主控 0.3.9 + WiFi 0.1.3（事件绑定扩展 + 设备侧一键同步 + WiFi 凭据管理）**。
 固件 issue：ReAI-com/dyj-hd-v2#9；协议设计见固件仓 `docs/SYNC_UPLOAD.md` / `docs/ACTION_CONFIG.md`。
 
-**计划新增**（实施完成后逐项勾验）：
+配套固件分支 `feature/sync-upload-bindings`（主控 0.3.9 / WiFi 0.1.3，编译通过，待真机验收）。
+
+**新增**：
 
 - **绑定输入扩展**（主控 ≥0.3.9）：`ControlInput` 新增 `Charge(ChargeEdge::{On, Off})` → KV 键 `charge_on` / `charge_off`（充电插拔边沿，5 秒采样；开机即插充电器判一次 charge_on 边沿），`ALL` 6 → 8；`ControlBindings` 新增 `charge_on` / `charge_off` 字段与预设 `auto_sync()`（仅 `charge_on: SyncUpload`，示例性质）；`RecordReason` 新增 `charge`。
 - **新动作 `sync_upload`**：`ControlAction` 新增 `SyncUpload`——设备侧一键同步（开 WiFi → 自动连已存凭据 → 上传全部待传文件 → 关 WiFi，无需上位机在线），可绑定到任意输入。

@@ -138,6 +138,10 @@ async fn main() {
         .route("/api/display/clear", post(display_clear))
         .route("/api/upload/file", post(upload_file_to))
         .route("/api/upload/all", post(upload_all))
+        .route("/api/sync/start", post(sync_start))
+        .route("/api/sync/status", get(sync_status))
+        .route("/api/creds", get(creds_list))
+        .route("/api/creds/delete", post(creds_delete))
         // 固件上传：ESP32 .bin 约 1.3MB，nrfutil .zip 约 170KB；默认 2MB 限制不够
         .layer(DefaultBodyLimit::max(16 * 1024 * 1024))
         .with_state(state);
@@ -1121,6 +1125,11 @@ async fn controls_preset(
                 .apply_control_bindings(&ControlBindings::recorder())
                 .await?
         }
+        "auto_sync" => {
+            device
+                .apply_control_bindings(&ControlBindings::auto_sync())
+                .await?
+        }
         "factory" => {
             for input in ControlInput::ALL {
                 device.clear_control_action(input).await?;
@@ -1131,6 +1140,43 @@ async fn controls_preset(
     Ok(Json(serde_json::to_value(
         device.control_bindings().await?,
     )?))
+}
+
+// ===== 一键同步 / WiFi 凭据（主控 0.3.9 / WiFi 0.1.3） =====
+
+/// 触发设备侧一键同步；受理后进度经 `/api/stream` 的 SYNC_STATUS 事件推送。
+async fn sync_start(State(state): State<Arc<AppState>>) -> ApiResult<Json<serde_json::Value>> {
+    let device = current_device(&state).await?;
+    let response = device.start_sync().await?;
+    Ok(Json(serde_json::to_value(response)?))
+}
+
+/// 查询同步状态（空闲时带上次结果，重连后补看用）。
+async fn sync_status(State(state): State<Arc<AppState>>) -> ApiResult<Json<serde_json::Value>> {
+    let device = current_device(&state).await?;
+    Ok(Json(serde_json::to_value(device.sync_status().await?)?))
+}
+
+/// 设备上已保存的 WiFi 凭据（不含密码）。
+async fn creds_list(State(state): State<Arc<AppState>>) -> ApiResult<Json<serde_json::Value>> {
+    let device = current_device(&state).await?;
+    Ok(Json(serde_json::to_value(
+        device.list_wifi_credentials().await?,
+    )?))
+}
+
+/// `{ssid}`：删除一条已保存凭据。
+async fn creds_delete(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<serde_json::Value>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let device = current_device(&state).await?;
+    let ssid = body
+        .get("ssid")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| invalid_body("缺少 ssid 字段"))?;
+    device.delete_wifi_credential(ssid).await?;
+    Ok(Json(serde_json::json!({ "deleted": ssid })))
 }
 
 /// `DeviceEvent` → (命令名, payload)，前端据此渲染事件卡片。
@@ -1148,6 +1194,7 @@ fn describe_event(event: DeviceEvent) -> (String, serde_json::Value) {
         DeviceEvent::WifiOtaProgress(progress) => ("OTA_WIFI_PROCESS".into(), value(progress)),
         DeviceEvent::AccessPointReady(response) => ("WIFI_AP_START".into(), value(response)),
         DeviceEvent::Power(power) => ("POWER".into(), value(power)),
+        DeviceEvent::Sync(event) => ("SYNC_STATUS".into(), value(event)),
         DeviceEvent::Unhandled { command, payload } if command.is_empty() => {
             ("RAW".into(), payload)
         }

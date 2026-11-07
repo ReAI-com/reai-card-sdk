@@ -241,6 +241,16 @@
         <input id="ssid" placeholder="SSID"><input id="pwd" placeholder="密码">
         <button onclick="wifiConnect()">连接</button>
         <button onclick="cmd('WIFI_DISCONNECT')">断开</button>
+        <button onclick="wifiAutoConnect()">自动重连（0.1.3+）</button>
+      </div>
+      <div class="row">
+        <button onclick="credsList()">已存凭据（0.1.3+）</button>
+        <input id="delSsid" placeholder="要删除的 SSID">
+        <button class="danger" onclick="credsDel()">删除凭据</button>
+      </div>
+      <div class="row" style="color:var(--faint);font-size:11px;line-height:1.5">
+        连接成功自动保存（最多 5 条，满员淘汰最旧）；凭据不含密码、不出模块；
+        AP 热点自启时上电不会自动连 STA，用「自动重连」显式发起（设备侧一键同步内部同样如此）。
       </div>
     </div>
     <div class="group"><h3><span class="no">05</span>热点快传</h3>
@@ -267,7 +277,10 @@
       <div class="row">
         <button onclick="listUploads()">待传列表</button>
         <button class="primary" onclick="runUploadAll()">全部上传</button>
+        <button class="primary" onclick="syncStart()">⚡ 一键同步（0.3.9+）</button>
+        <button onclick="syncStatus()">同步状态</button>
       </div>
+      <div class="row" id="syncState" style="color:var(--dim);font-size:11px">设备自主完成：开WiFi→自动连已存凭据→传全部待传→关WiFi，进度看右侧 SYNC_STATUS 事件</div>
       <div class="row">
         <input id="upName" placeholder="文件名">
         <button class="danger" onclick="runUpload()">上传单个</button>
@@ -297,6 +310,8 @@
           <option value="btn_long_release">按键·长按松开</option>
           <option value="switch_on">开关·拨到 on</option>
           <option value="switch_off">开关·拨到 off</option>
+          <option value="charge_on">充电·插上（0.3.9+）</option>
+          <option value="charge_off">充电·拔出（0.3.9+）</option>
         </select>
         <select id="ctlAction">
           <option value="none">none（不动作）</option>
@@ -304,6 +319,7 @@
           <option value="record_stop">record_stop</option>
           <option value="record_toggle">record_toggle</option>
           <option value="record_mark">record_mark</option>
+          <option value="sync_upload">sync_upload·一键同步（0.3.9+）</option>
         </select>
       </div>
       <div class="row">
@@ -311,11 +327,13 @@
         <button onclick="ctlSet()">绑定</button>
         <button onclick="ctlClear()">解绑</button>
         <button onclick="ctlPreset('recorder')">预设·录音笔</button>
+        <button onclick="ctlPreset('auto_sync')">预设·插电同步</button>
         <button class="danger" onclick="ctlPreset('factory')">全部解绑</button>
       </div>
       <div class="row" style="color:var(--dim);font-size:11px;line-height:1.6">
-        动作在设备侧执行并持久化。按一下按键 / 拨开关，右侧「设备事件」应出现 BTN_CLICK / TOGGLE_SWITCH，
-        若绑定了录音动作还会跟一条 RECORD_STATUS（reason=button/switch）。
+        动作在设备侧执行并持久化。按一下按键 / 拨开关 / 插拔充电器，右侧「设备事件」应出现
+        BTN_CLICK / TOGGLE_SWITCH / POWER(charging)，若绑定了录音动作还会跟一条
+        RECORD_STATUS（reason=button/switch/charge）。充电边沿按 5 秒采样，开机即插充电器判一次“插上”。
         绑定表是否使用、默认绑什么由业务层决定；此分组只用于验证设备的配置通道。
       </div>
     </div>
@@ -796,9 +814,43 @@ async function ctlClear() {
   finally { setBusy(false); }
 }
 async function ctlPreset(name) {
-  if (name === 'factory' && !confirm('解除全部六个输入的绑定？')) return;
+  if (name === 'factory' && !confirm('解除全部八个输入的绑定？')) return;
   setBusy(true, '写入中…');
   try { await api('/api/controls/preset', {method:'POST', body:{name}}); }
+  finally { setBusy(false); }
+}
+
+// ---------- 一键同步 / WiFi 凭据（0.3.9 / 0.1.3） ----------
+async function syncStart() {
+  setBusy(true);
+  try {
+    await api('/api/sync/start', {method:'POST'});
+    $('syncState').textContent = '已受理，设备自主同步中——进度看右侧 SYNC_STATUS 事件';
+  } finally { setBusy(false); }
+}
+async function syncStatus() {
+  setBusy(true);
+  try {
+    const st = await api('/api/sync/status', {method:'GET'});
+    if ($('syncState')) {
+      $('syncState').textContent = '状态: ' + JSON.stringify(st);
+    }
+  } finally { setBusy(false); }
+}
+async function credsList() {
+  setBusy(true);
+  try { await api('/api/creds', {method:'GET'}); } finally { setBusy(false); }
+}
+async function credsDel() {
+  const ssid = $('delSsid').value.trim();
+  if (!ssid) return alert('先填要删除的 SSID');
+  setBusy(true);
+  try { await api('/api/creds/delete', {method:'POST', body:{ssid}}); }
+  finally { setBusy(false); }
+}
+async function wifiAutoConnect() {
+  setBusy(true);
+  try { await api('/api/command', {method:'POST', body:{command:'WIFI_AUTOCONNECT'}}); }
   finally { setBusy(false); }
 }
 

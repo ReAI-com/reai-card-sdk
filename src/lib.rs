@@ -20,8 +20,8 @@ pub mod types;
 pub use access_point::AccessPointClient;
 pub use audio::{AdpcmDecoder, CHANNELS, PcmChunk, SAMPLE_RATE_HZ, wav_bytes};
 pub use controls::{
-    ButtonEvent, ButtonGesture, ControlAction, ControlBindings, ControlInput, SwitchPosition,
-    ToggleSwitchEvent,
+    ButtonEvent, ButtonGesture, ChargeEdge, ControlAction, ControlBindings, ControlInput,
+    SwitchPosition, ToggleSwitchEvent,
 };
 pub use device::{
     CONFIG_KEY_MAX_BYTES, CONFIG_VALUE_MAX_BYTES, DISPLAY_BITMAP_BYTES, DISPLAY_LINE_CHARS,

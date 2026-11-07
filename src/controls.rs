@@ -115,33 +115,89 @@ impl FromStr for SwitchPosition {
     }
 }
 
-/// 可以绑定动作的一个输入：按键的某个手势，或开关的某个位置。
+/// 充电边沿（`POWER` charging 推送的 `charging` 字段；绑定键 `charge_on`/`charge_off`）。
 ///
-/// [`ButtonGesture`] / [`SwitchPosition`] 都能 `Into` 成它，所以绑定接口直接传
-/// `ButtonGesture::Single` 这类值即可。
+/// 固件每 5 秒采样充电状态，仅在插上/拔出的边沿触发；开机时已插着充电器
+/// 会在首次采样判为一次 [`ChargeEdge::On`]（预期行为，插电即同步场景）。
+/// 需要主控固件 ≥ 0.3.9：旧固件可以写入 KV 键但不会读取执行。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChargeEdge {
+    /// 插上充电器 / USB（充电开始）。
+    On,
+    /// 拔出充电器 / USB（充电停止）。
+    Off,
+}
+
+impl ChargeEdge {
+    pub const ALL: [Self; 2] = [Self::On, Self::Off];
+
+    /// 推送里的状态名（`charging` 字段语义，wire 名仅用于显示/解析）。
+    pub const fn wire_name(self) -> &'static str {
+        match self {
+            Self::On => "on",
+            Self::Off => "off",
+        }
+    }
+
+    /// 存放该边沿绑定动作的 KV 配置键。
+    pub const fn config_key(self) -> &'static str {
+        match self {
+            Self::On => "charge_on",
+            Self::Off => "charge_off",
+        }
+    }
+}
+
+impl fmt::Display for ChargeEdge {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.wire_name())
+    }
+}
+
+impl FromStr for ChargeEdge {
+    type Err = SdkError;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        Self::ALL
+            .into_iter()
+            .find(|edge| edge.wire_name() == text)
+            .ok_or_else(|| SdkError::InvalidFrame(format!("unknown charge edge `{text}`")))
+    }
+}
+
+/// 可以绑定动作的一个输入：按键的某个手势，开关的某个位置，或充电的某个边沿。
+///
+/// [`ButtonGesture`] / [`SwitchPosition`] / [`ChargeEdge`] 都能 `Into` 成它，所以
+/// 绑定接口直接传 `ButtonGesture::Single` 这类值即可。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ControlInput {
     Button(ButtonGesture),
     Switch(SwitchPosition),
+    /// 充电边沿（主控 0.3.9 起）。
+    Charge(ChargeEdge),
 }
 
 impl ControlInput {
-    /// 固件支持的全部六个输入，顺序与 [`ControlBindings`] 的字段一致。
-    pub const ALL: [Self; 6] = [
+    /// 固件支持的全部八个输入，顺序与 [`ControlBindings`] 的字段一致。
+    pub const ALL: [Self; 8] = [
         Self::Button(ButtonGesture::Single),
         Self::Button(ButtonGesture::Double),
         Self::Button(ButtonGesture::LongPress),
         Self::Button(ButtonGesture::LongRelease),
         Self::Switch(SwitchPosition::On),
         Self::Switch(SwitchPosition::Off),
+        Self::Charge(ChargeEdge::On),
+        Self::Charge(ChargeEdge::Off),
     ];
 
-    /// 存放绑定动作的 KV 配置键（`btn_*` / `switch_*`）。
+    /// 存放绑定动作的 KV 配置键（`btn_*` / `switch_*` / `charge_*`）。
     pub const fn config_key(self) -> &'static str {
         match self {
             Self::Button(gesture) => gesture.config_key(),
             Self::Switch(position) => position.config_key(),
+            Self::Charge(edge) => edge.config_key(),
         }
     }
 
@@ -165,6 +221,12 @@ impl From<SwitchPosition> for ControlInput {
     }
 }
 
+impl From<ChargeEdge> for ControlInput {
+    fn from(edge: ChargeEdge) -> Self {
+        Self::Charge(edge)
+    }
+}
+
 impl fmt::Display for ControlInput {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.config_key())
@@ -173,7 +235,7 @@ impl fmt::Display for ControlInput {
 
 /// 输入触发时设备执行的动作（KV 配置值，也是事件里的 `action` 字段）。
 ///
-/// 固件只认前五个；[`Other`](Self::Other) 用来无损携带未来固件新增的值——
+/// 固件只认前六个；[`Other`](Self::Other) 用来无损携带未来固件新增的值——
 /// 当前固件收到不认识的值会上报原字符串但不执行任何动作。
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 #[serde(from = "String", into = "String")]
@@ -187,17 +249,22 @@ pub enum ControlAction {
     RecordToggle,
     /// 录音中打一个标记点（未在录音时固件忽略）。
     RecordMark,
+    /// 一键同步：开 WiFi → 自动连已存凭据 → 上传全部待传文件 → 关 WiFi，
+    /// 全程设备侧执行、无需上位机在线（主控 ≥0.3.9，见
+    /// [`crate::DyjDevice::start_sync`]）。同步进行中再次触发会被忽略。
+    SyncUpload,
     Other(String),
 }
 
 impl ControlAction {
     /// 当前固件认识的全部动作。
-    pub const KNOWN: [Self; 5] = [
+    pub const KNOWN: [Self; 6] = [
         Self::None,
         Self::RecordStart,
         Self::RecordStop,
         Self::RecordToggle,
         Self::RecordMark,
+        Self::SyncUpload,
     ];
 
     /// 配置值 / 事件字段里的名字。
@@ -208,6 +275,7 @@ impl ControlAction {
             Self::RecordStop => "record_stop",
             Self::RecordToggle => "record_toggle",
             Self::RecordMark => "record_mark",
+            Self::SyncUpload => "sync_upload",
             Self::Other(name) => name,
         }
     }
@@ -295,7 +363,7 @@ fn action_field(payload: &Value) -> ControlAction {
         .unwrap_or_default()
 }
 
-/// 六个输入的完整绑定表，字段顺序与 [`ControlInput::ALL`] 一致。
+/// 八个输入的完整绑定表，字段顺序与 [`ControlInput::ALL`] 一致。
 ///
 /// `Default` 是全部 [`ControlAction::None`]（即出厂状态）。
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -306,6 +374,10 @@ pub struct ControlBindings {
     pub button_long_release: ControlAction,
     pub switch_on: ControlAction,
     pub switch_off: ControlAction,
+    /// 插上充电器绑定的动作（主控 ≥0.3.9；旧固件可写不执行）。
+    pub charge_on: ControlAction,
+    /// 拔出充电器绑定的动作（主控 ≥0.3.9）。
+    pub charge_off: ControlAction,
 }
 
 impl ControlBindings {
@@ -319,6 +391,23 @@ impl ControlBindings {
             button_long_release: ControlAction::None,
             switch_on: ControlAction::RecordStart,
             switch_off: ControlAction::RecordStop,
+            charge_on: ControlAction::None,
+            charge_off: ControlAction::None,
+        }
+    }
+
+    /// 自动同步预设（仅是建议）：插上充电器即一键同步；其余输入不绑定。
+    /// 前置：设备连过 WiFi（凭据已存）且配置过 `upload_url`。
+    pub fn auto_sync() -> Self {
+        Self {
+            button_single: ControlAction::None,
+            button_double: ControlAction::None,
+            button_long_press: ControlAction::None,
+            button_long_release: ControlAction::None,
+            switch_on: ControlAction::None,
+            switch_off: ControlAction::None,
+            charge_on: ControlAction::SyncUpload,
+            charge_off: ControlAction::None,
         }
     }
 
@@ -330,6 +419,8 @@ impl ControlBindings {
             ControlInput::Button(ButtonGesture::LongRelease) => &self.button_long_release,
             ControlInput::Switch(SwitchPosition::On) => &self.switch_on,
             ControlInput::Switch(SwitchPosition::Off) => &self.switch_off,
+            ControlInput::Charge(ChargeEdge::On) => &self.charge_on,
+            ControlInput::Charge(ChargeEdge::Off) => &self.charge_off,
         }
     }
 
@@ -352,6 +443,8 @@ impl ControlBindings {
             ControlInput::Button(ButtonGesture::LongRelease) => &mut self.button_long_release,
             ControlInput::Switch(SwitchPosition::On) => &mut self.switch_on,
             ControlInput::Switch(SwitchPosition::Off) => &mut self.switch_off,
+            ControlInput::Charge(ChargeEdge::On) => &mut self.charge_on,
+            ControlInput::Charge(ChargeEdge::Off) => &mut self.charge_off,
         }
     }
 }
@@ -376,11 +469,15 @@ mod tests {
                 position
             );
         }
+        for edge in ChargeEdge::ALL {
+            assert_eq!(edge.to_string().parse::<ChargeEdge>().unwrap(), edge);
+        }
         for action in ControlAction::KNOWN {
             assert_eq!(ControlAction::parse(action.wire_name()), action);
         }
         assert!("triple".parse::<ButtonGesture>().is_err());
         assert!("middle".parse::<SwitchPosition>().is_err());
+        assert!("plug".parse::<ChargeEdge>().is_err());
     }
 
     #[test]
@@ -397,12 +494,18 @@ mod tests {
                 "btn_long_press",
                 "btn_long_release",
                 "switch_on",
-                "switch_off"
+                "switch_off",
+                "charge_on",
+                "charge_off"
             ]
         );
         assert_eq!(
             ControlInput::from_config_key("switch_off"),
             Some(ControlInput::Switch(SwitchPosition::Off))
+        );
+        assert_eq!(
+            ControlInput::from_config_key("charge_on"),
+            Some(ControlInput::Charge(ChargeEdge::On))
         );
         assert_eq!(ControlInput::from_config_key("wifi_api_base_url"), None);
     }
@@ -488,6 +591,18 @@ mod tests {
         let recorder = ControlBindings::recorder();
         assert_eq!(recorder.switch_on, ControlAction::RecordStart);
         assert_eq!(recorder.switch_off, ControlAction::RecordStop);
-        assert_eq!(recorder.entries().count(), 6);
+        assert_eq!(recorder.entries().count(), 8);
+
+        // auto_sync 预设：仅 charge_on 绑一键同步，其余出厂态
+        let auto_sync = ControlBindings::auto_sync();
+        assert_eq!(auto_sync.charge_on, ControlAction::SyncUpload);
+        assert_eq!(auto_sync.charge_off, ControlAction::None);
+        assert_eq!(
+            auto_sync
+                .entries()
+                .filter(|(_, action)| **action != ControlAction::None)
+                .count(),
+            1
+        );
     }
 }

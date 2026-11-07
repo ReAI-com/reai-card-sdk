@@ -92,10 +92,12 @@ fn usage() {
   display bitmap <360字节.bin>      OLED 显示 72×40 点阵（纵向字节，bit0=页顶）
   display clear                     清屏
   config get <key> | config set <key> <value> | config del <key>
-  controls list                      读六个按键/开关输入的绑定表
-  controls set <input> <action>      input: btn_single|btn_double|btn_long_press|btn_long_release|switch_on|switch_off
-                                     action: none|record_start|record_stop|record_toggle|record_mark
-  controls clear <input> | controls preset recorder | controls reset
+  controls list                      读八个按键/开关/充电输入的绑定表（0.3.9+ 含充电）
+  controls set <input> <action>      input: btn_single|btn_double|btn_long_press|btn_long_release|switch_on|switch_off|charge_on|charge_off
+                                     action: none|record_start|record_stop|record_toggle|record_mark|sync_upload
+  controls clear <input> | controls preset recorder|auto_sync | controls reset
+  sync start|status                  设备侧一键同步（0.3.9+）：开WiFi→自动连→传全部待传→关WiFi；受理后进度走 events
+  creds list | creds del <ssid>      设备上已保存的 WiFi 凭据（0.1.3+，不含密码）
   led on|off|toggle
   ota check|start|status            ESP32 在线 OTA（需 STA 已连 + api_url 服务）
   ota update [secs]                 check→update→跟进 OTA_WIFI_PROCESS 到 SUCCESS/FAILED（默认上限 600s）
@@ -200,6 +202,8 @@ async fn run(globals: &Globals, command: &[String]) -> reai_card_sdk::Result<()>
         "uploads" => uploads(&device, rest).await,
         "config" => config(&device, rest).await,
         "controls" => controls(&device, rest).await,
+        "sync" => sync(&device, rest).await,
+        "creds" => creds(&device, rest).await,
         "led" => {
             let state: LedState = required(rest, 0, "state (on/off/toggle)")?.parse()?;
             print_json(serde_json::to_value(device.set_led(state).await?)?)
@@ -340,6 +344,7 @@ fn summarize(event: DeviceEvent) -> String {
         DeviceEvent::WifiOtaProgress(progress) => json(progress),
         DeviceEvent::AccessPointReady(response) => json(response),
         DeviceEvent::Power(power) => format!("power {}", json(power)),
+        DeviceEvent::Sync(event) => format!("sync {}", json(event)),
         DeviceEvent::Unhandled { command, payload } if command.is_empty() => {
             format!("raw:{payload}")
         }
@@ -685,6 +690,37 @@ async fn config(device: &DyjDevice, rest: &[String]) -> reai_card_sdk::Result<()
 }
 
 /// 按键 / 侧边开关绑定：固件在设备侧执行动作并上报事件，这里只改配置表。
+/// 设备侧一键同步（0.3.9+）：受理后进度经事件通道推送，可用 `events` 子命令观察。
+async fn sync(device: &DyjDevice, rest: &[String]) -> reai_card_sdk::Result<()> {
+    match required(rest, 0, "sync subcommand (start|status)")? {
+        "start" => {
+            let response = device.start_sync().await?;
+            print_json(serde_json::to_value(response)?)?;
+            println!("已受理：进度看 `events` 的 SYNC_STATUS，或 `sync status` 轮询");
+            Ok(())
+        }
+        "status" => print_json(serde_json::to_value(device.sync_status().await?)?),
+        other => Err(reai_card_sdk::SdkError::InvalidCommand(format!(
+            "未知 sync 子命令 `{other}`（支持 start|status）"
+        ))),
+    }
+}
+
+/// 设备上已保存的 WiFi 凭据（WiFi 0.1.3+，不含密码）。
+async fn creds(device: &DyjDevice, rest: &[String]) -> reai_card_sdk::Result<()> {
+    match required(rest, 0, "creds subcommand (list|del)")? {
+        "list" => print_json(serde_json::to_value(device.list_wifi_credentials().await?)?),
+        "del" => {
+            let ssid = required(rest, 1, "ssid")?;
+            let response = device.delete_wifi_credential(ssid).await?;
+            print_json(serde_json::to_value(response)?)
+        }
+        other => Err(reai_card_sdk::SdkError::InvalidCommand(format!(
+            "未知 creds 子命令 `{other}`（支持 list|del <ssid>）"
+        ))),
+    }
+}
+
 async fn controls(device: &DyjDevice, rest: &[String]) -> reai_card_sdk::Result<()> {
     fn input(text: &str) -> reai_card_sdk::Result<ControlInput> {
         ControlInput::from_config_key(text).ok_or_else(|| {

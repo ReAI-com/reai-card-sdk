@@ -27,7 +27,8 @@ use crate::{
     types::{
         AccessPointInfo, BatteryInfo, CommandResponse, DeviceEvent, DeviceInfo, DeviceState,
         FileEntry, LedState, ModuleCheck, OtaProgress, PowerEvent, RecordMark, RecordStatus,
-        StorageInfo, TakenFile, WifiNetwork, WifiOnlineOtaOutcome, WifiOtaCheck, WifiStatus,
+        StorageInfo, SyncEvent, SyncState, TakenFile, WifiCredential, WifiNetwork,
+        WifiOnlineOtaOutcome, WifiOtaCheck, WifiStatus,
     },
 };
 
@@ -715,6 +716,46 @@ impl DyjDevice {
     pub async fn clear_uploads(&self) -> Result<CommandResponse> {
         self.require_wifi_module("UPLOAD_CLEAR").await?;
         self.request_success("UPLOAD_CLEAR", None, NORMAL_TIMEOUT)
+            .await
+    }
+
+    /// 触发设备侧一键同步（主控 ≥0.3.9，由 nRF 本地处理，模块未上电也能受理）：
+    /// 开 WiFi → 自动连已存凭据 → 上传全部待传文件 → 关 WiFi，全程设备自主、
+    /// 无需上位机在线。**响应只表示受理**；进度经 `subscribe_events()` 的
+    /// [`DeviceEvent::Sync`] 观察（`SYNC_STATUS` 推送）。
+    ///
+    /// 同步进行中回 `busy`（[`SdkError`] 携带该 message）；同步期间不要并发调用
+    /// WiFi / 上传方法——ESP32 被 `UPLOAD_ALL` 阻塞（与单个 `UPLOAD_FILE` 一致），
+    /// 且本固件代没有中止命令（`SYNC_STOP` 挂账）。
+    pub async fn start_sync(&self) -> Result<CommandResponse> {
+        self.request_success("SYNC_START", None, NORMAL_TIMEOUT)
+            .await
+    }
+
+    /// 查询一键同步状态（主控 ≥0.3.9）。同步中返回当前进度；空闲时
+    /// `state == SyncState::Idle` 并可能附上一次结果（`last_state`/`last_error`），
+    /// 适合 BLE 重连后补看。`error` 的取值见固件 `docs/SYNC_UPLOAD.md`。
+    pub async fn sync_status(&self) -> Result<SyncEvent> {
+        let value = self
+            .request_value("SYNC_STATUS", Some(json!({})), NORMAL_TIMEOUT)
+            .await?;
+        Ok(SyncEvent::from_payload(&value))
+    }
+
+    /// 列出设备上已保存的 WiFi 凭据（WiFi ≥0.1.3，透传 ESP32）。
+    ///
+    /// **不含密码**——凭据密码不出 WiFi 模块。`last_used` 为最近一次成功连接的
+    /// Unix 秒（`None`/`Some(0)` = 时间未知）。最多 5 条，按最近使用降序。
+    pub async fn list_wifi_credentials(&self) -> Result<Vec<WifiCredential>> {
+        self.require_wifi_module("WIFI_CRED_LIST").await?;
+        self.collect_indexed("WIFI_CRED_LIST", None).await
+    }
+
+    /// 删除一条已保存的 WiFi 凭据（WiFi ≥0.1.3）。删除后自动连接不再尝试该
+    /// 网络；正在连接中的尝试不受影响。不存在时固件回 `not_found` 错误。
+    pub async fn delete_wifi_credential(&self, ssid: &str) -> Result<CommandResponse> {
+        self.require_wifi_module("WIFI_CRED_DEL").await?;
+        self.request_success("WIFI_CRED_DEL", Some(json!({"ssid": ssid})), NORMAL_TIMEOUT)
             .await
     }
     pub async fn activate(
@@ -1438,8 +1479,41 @@ fn event_from_frame(frame: &TextFrame) -> Option<DeviceEvent> {
                 .map(DeviceEvent::Power)
                 .unwrap_or_else(|_| unhandled()),
         ),
+        // 一键同步（主控 0.3.9 / WiFi 0.1.3）：状态推送、逐文件进度、自动连接
+        // 结果三种帧统一映射成 Sync 事件（规范见固件 docs/SYNC_UPLOAD.md）。
+        "SYNC_STATUS" => Some(DeviceEvent::Sync(SyncEvent::from_payload(&frame.payload))),
+        "UPLOAD_PROGRESS" => {
+            let mut event = SyncEvent::from_payload(&frame.payload);
+            event.state = Some(SyncState::Uploading);
+            Some(DeviceEvent::Sync(event))
+        }
+        "WIFI_AUTOCONNECT" => Some(DeviceEvent::Sync(auto_connect_sync_event(&frame.payload))),
         _ => None,
     }
+}
+
+/// `WIFI_AUTOCONNECT` 结果帧 → Sync 事件（state 恒为 Connecting）：
+/// 成功 `code:0` 时 `message` 带已连 SSID；失败 `code:1` 时 `error` 带
+/// `no_credentials`/`all_failed`。
+fn auto_connect_sync_event(payload: &Value) -> SyncEvent {
+    let ok = payload.get("code").and_then(Value::as_i64) == Some(0);
+    let mut event = SyncEvent {
+        state: Some(SyncState::Connecting),
+        code: Some(if ok { 0 } else { 1 }),
+        ..Default::default()
+    };
+    if ok {
+        event.message = payload
+            .get("ssid")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+    } else {
+        event.error = payload
+            .get("message")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+    }
+    event
 }
 
 /// 无命令封装的裸 JSON：现固件的电源管理直接写 BLE（`{"type":...}`），不走协议封装。
@@ -1742,6 +1816,7 @@ mod tests {
 
     use super::*;
     use crate::transport::{BleTransport, NotificationStream};
+    use crate::types::SyncTrigger;
 
     struct MockTransport {
         sent: tokio::sync::mpsc::UnboundedSender<Result<Vec<u8>>>,
@@ -1757,6 +1832,8 @@ mod tests {
         silent: AtomicBool,
         /// 模拟固件录音状态：RECORD_START 置位、RECORD_STOP 复位，RECORD_STATUS 查询据此应答。
         recording: AtomicBool,
+        /// 置位后 SYNC_START 回 code:1 busy（一键同步受理失败路径用）。
+        sync_busy: AtomicBool,
     }
 
     impl MockTransport {
@@ -1773,6 +1850,7 @@ mod tests {
                 wifi_open: AtomicBool::new(false),
                 silent: AtomicBool::new(false),
                 recording: AtomicBool::new(false),
+                sync_busy: AtomicBool::new(false),
             }
         }
 
@@ -1834,6 +1912,28 @@ mod tests {
                     self.reply(&[0, b'a', b'b']);
                     self.reply(&[0, b'c']);
                     self.reply(b"FILE_UPLOAD:{\"state\":\"end\"}\r\n");
+                }
+                "SYNC_START" => {
+                    if self.sync_busy.load(Ordering::Relaxed) {
+                        self.reply(b"SYNC_START:{\"code\":1,\"message\":\"busy\"}\r\n");
+                    } else {
+                        self.reply(b"SYNC_START:{\"code\":0,\"message\":\"sync started\"}\r\n");
+                    }
+                }
+                "SYNC_STATUS" => self.reply(
+                    b"SYNC_STATUS:{\"state\":\"idle\",\"code\":0,\"lastState\":\"done\",\"lastError\":\"\"}\r\n",
+                ),
+                "WIFI_CRED_LIST" => {
+                    self.reply(
+                        b"WIFI_CRED_LIST:{\"index\":0,\"ssid\":\"Office-5G\",\"lastUsed\":1761000100}\r\n",
+                    );
+                    self.reply(
+                        b"WIFI_CRED_LIST:{\"index\":1,\"ssid\":\"Home-2.4G\",\"lastUsed\":0}\r\n",
+                    );
+                    self.reply(b"WIFI_CRED_LIST:{\"index\":-1,\"message\":\"done\"}\r\n");
+                }
+                "WIFI_CRED_DEL" => {
+                    self.reply(b"WIFI_CRED_DEL:{\"code\":0,\"message\":\"ok\"}\r\n")
                 }
                 "RECORD_START" => {
                     self.recording.store(true, Ordering::Relaxed);
@@ -2303,6 +2403,111 @@ mod tests {
             }
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn sync_frames_map_into_sync_events() {
+        let transport = Arc::new(MockTransport::new());
+        let device = DyjDevice::from_transport(transport.clone()).await.unwrap();
+        let mut events = device.subscribe_events();
+        // 状态推送：全字段
+        transport
+            .reply(b"SYNC_STATUS:{\"state\":\"uploading\",\"trigger\":\"charge\",\"current\":\"A1B2C3D4.APM\",\"done\":1,\"total\":3,\"code\":0}\r\n");
+        // 逐文件进度帧（WiFi 0.1.3）
+        transport
+            .reply(b"UPLOAD_PROGRESS:{\"name\":\"A1B2C3D4.APM\",\"done\":2,\"total\":3,\"code\":1,\"message\":\"upload failed\"}\r\n");
+        // 自动连接结果帧：成功与失败各一
+        transport
+            .reply(b"WIFI_AUTOCONNECT:{\"code\":0,\"ssid\":\"Office-5G\",\"ip\":\"192.168.1.9\",\"lastUsed\":1761000100}\r\n");
+        transport.reply(b"WIFI_AUTOCONNECT:{\"code\":1,\"message\":\"no_credentials\"}\r\n");
+        let _ = device.device_info().await.unwrap();
+
+        let DeviceEvent::Sync(event) = events.recv().await.unwrap() else {
+            panic!("expected sync event");
+        };
+        assert_eq!(event.state, Some(SyncState::Uploading));
+        assert_eq!(event.trigger, Some(SyncTrigger::Charge));
+        assert_eq!(event.current.as_deref(), Some("A1B2C3D4.APM"));
+        assert_eq!(event.done, Some(1));
+        assert_eq!(event.total, Some(3));
+        assert_eq!(event.code, Some(0));
+
+        let DeviceEvent::Sync(event) = events.recv().await.unwrap() else {
+            panic!("expected sync event");
+        };
+        assert_eq!(event.state, Some(SyncState::Uploading));
+        assert_eq!(event.code, Some(1));
+        assert!(event.error.is_none());
+
+        let DeviceEvent::Sync(event) = events.recv().await.unwrap() else {
+            panic!("expected sync event");
+        };
+        // WIFI_AUTOCONNECT 成功帧：state=Connecting、message=ssid
+        assert_eq!(event.state, Some(SyncState::Connecting));
+        assert_eq!(event.code, Some(0));
+        assert_eq!(event.message.as_deref(), Some("Office-5G"));
+        assert!(event.error.is_none());
+
+        let DeviceEvent::Sync(event) = events.recv().await.unwrap() else {
+            panic!("expected sync event");
+        };
+        assert_eq!(event.state, Some(SyncState::Connecting));
+        assert_eq!(event.code, Some(1));
+        assert_eq!(event.error.as_deref(), Some("no_credentials"));
+    }
+
+    #[tokio::test]
+    async fn sync_start_and_status_round_trip() {
+        let transport = Arc::new(MockTransport::new());
+        let device = DyjDevice::from_transport(transport.clone()).await.unwrap();
+        // 受理成功
+        let response = device.start_sync().await.unwrap();
+        assert_eq!(response.code, Some(0));
+        assert!(
+            transport
+                .commands
+                .lock()
+                .await
+                .contains(&"SYNC_START".to_owned())
+        );
+        // 查询（mock 固件回 idle + 上次结果）
+        let status = device.sync_status().await.unwrap();
+        assert_eq!(status.state, Some(SyncState::Idle));
+        assert_eq!(status.last_state, Some(SyncState::Done));
+        // busy：同步进行中再触发 → ensure_success 报错并携带 busy
+        transport.sync_busy.store(true, Ordering::Relaxed);
+        let error = device.start_sync().await.unwrap_err();
+        assert!(error.to_string().contains("busy"), "got: {error}");
+    }
+
+    #[tokio::test]
+    async fn wifi_credentials_list_and_delete() {
+        let transport = Arc::new(MockTransport::new());
+        let device = DyjDevice::from_transport(transport.clone()).await.unwrap();
+        // 模块未上电：预检拦截
+        let error = device.list_wifi_credentials().await.unwrap_err();
+        assert!(
+            matches!(error, SdkError::WifiModulePoweredDown { ref command } if command == "WIFI_CRED_LIST")
+        );
+
+        transport.wifi_open.store(true, Ordering::Relaxed);
+        let creds = device.list_wifi_credentials().await.unwrap();
+        assert_eq!(creds.len(), 2);
+        assert_eq!(creds[0].ssid, "Office-5G");
+        assert_eq!(creds[0].last_used, Some(1_761_000_100));
+        assert_eq!(creds[1].ssid, "Home-2.4G");
+        assert_eq!(creds[1].last_used, Some(0));
+
+        let response = device.delete_wifi_credential("Home-2.4G").await.unwrap();
+        assert_eq!(response.code, Some(0));
+        assert!(
+            transport
+                .lines
+                .lock()
+                .await
+                .iter()
+                .any(|line| line == "WIFI_CRED_DEL:{\"ssid\":\"Home-2.4G\"}")
+        );
     }
 
     #[tokio::test]
