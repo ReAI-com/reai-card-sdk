@@ -272,15 +272,18 @@
     </div>
     <div class="group"><h3><span class="no">06</span>STA 上传</h3>
       <div class="row">
-        <input id="upUrl" placeholder="上传基址，如 https://dyj2.dev.reai.com/api/upload/<设备ID>" style="min-width:230px">
+        <input id="upUrl" placeholder="上传基址，如 https://dyj2.dev.reai.com/api/upload" style="min-width:230px">
+        <button onclick="uploadUrlLoad()">读设备配置</button>
+        <button class="primary" onclick="uploadUrlSave()">保存到设备</button>
       </div>
+      <div class="row" id="upUrlState" style="color:var(--faint);font-size:11px">未读取设备配置</div>
       <div class="row">
         <button onclick="listUploads()">待传列表</button>
         <button class="primary" onclick="runUploadAll()">全部上传</button>
         <button class="primary" onclick="syncStart()">⚡ 一键同步（0.3.9+）</button>
         <button onclick="syncStatus()">同步状态</button>
       </div>
-      <div class="row" id="syncState" style="color:var(--dim);font-size:11px">设备自主完成：开WiFi→自动连已存凭据→传全部待传→关WiFi，进度看右侧 SYNC_STATUS 事件</div>
+      <div class="row" id="syncState" style="color:var(--dim);font-size:11px">设备自主完成：开WiFi→自动连已存凭据→传全部待传→关WiFi，进度看右侧 SYNC_STATUS 事件；⚡ 用的是设备里保存的上传基址（上面「保存到设备」写入，≤63 字节），缺失报 upload_url_missing</div>
       <div class="row">
         <input id="upName" placeholder="文件名">
         <button class="danger" onclick="runUpload()">上传单个</button>
@@ -484,11 +487,20 @@ async function doConnect() {
     $('connState').textContent = '已连接';
     // 设备音源在 WS 建立时订阅：连接新设备后重建音频通道
     reopenAudioSocket();
-    // 用设备 ID 预填 STA 上传基址（接收端按 /upload/<deviceId>/<文件名> 落盘）
-    const info = await cmd('BASE_INFO');
-    if (info?.deviceId && !$('upUrl').value.trim()) {
-      $('upUrl').value = `https://dyj2.dev.reai.com/api/upload/${info.deviceId}`;
-    }
+    // 预填 STA 上传基址：优先设备里已保存的 upload_url，没有则用短形式建议值
+    //（不带设备 ID——服务端 /upload/<文件名> 形式按 x-device-id 头落盘，且长 URL
+    // 会超出 CONFIG 值 63 字节上限）
+    try {
+      const saved = await api('/api/upload/url', {method:'GET'});
+      if (saved?.saved) {
+        $('upUrl').value = saved.saved;
+        $('upUrlState').textContent = `设备已保存：${saved.saved}`;
+        $('upUrlState').style.color = 'var(--ok, green)';
+      } else {
+        $('upUrl').value = saved?.suggested ?? '';
+        $('upUrlState').textContent = '设备未配置上传基址（⚡一键同步会报 upload_url_missing），填写后点「保存到设备」';
+      }
+    } catch (_) { /* 未连接设备时静默 */ }
     refreshCards();
   } finally { setBusy(false); }
 }
@@ -835,6 +847,30 @@ async function syncStatus() {
     if ($('syncState')) {
       $('syncState').textContent = '状态: ' + JSON.stringify(st);
     }
+  } finally { setBusy(false); }
+}
+async function uploadUrlLoad() {
+  setBusy(true);
+  try {
+    const saved = await api('/api/upload/url', {method:'GET'});
+    if (saved?.saved) {
+      $('upUrl').value = saved.saved;
+      $('upUrlState').textContent = `设备已保存：${saved.saved}`;
+      $('upUrlState').style.color = 'var(--ok, green)';
+    } else {
+      $('upUrlState').textContent = '设备未配置上传基址（⚡一键同步会报 upload_url_missing）';
+    }
+  } finally { setBusy(false); }
+}
+async function uploadUrlSave() {
+  const url = $('upUrl').value.trim();
+  if (!url) return alert('先填上传基址');
+  if (url.length > 63) return alert(`基址 ${url.length} 字节，超过 CONFIG 值 63 字节上限\n（设备 ID 过长时用不带 ID 的短形式：https://dyj2.dev.reai.com/api/upload）`);
+  setBusy(true, '写入设备…');
+  try {
+    await api('/api/upload/url', {method:'POST', body:{url}});
+    $('upUrlState').textContent = `设备已保存：${url}`;
+    $('upUrlState').style.color = 'var(--ok, green)';
   } finally { setBusy(false); }
 }
 async function credsList() {

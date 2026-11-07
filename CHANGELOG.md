@@ -17,7 +17,7 @@
 - **同步事件**：`SYNC_STATUS` / `UPLOAD_PROGRESS` / `WIFI_AUTOCONNECT` 三种帧映射为 `DeviceEvent::Sync(SyncEvent)`（状态 `opening/connecting/uploading/closing/done/error` + 触发来源 + 逐文件进度 + 错误码）；`sync_status()` 查询（idle 时带 `lastState`/`lastError`，中途重连用）。
 - **`start_sync()`**：触发设备侧同步，响应仅表示受理（busy → 错误）；进度走事件订阅。同步期间勿并发调用 WiFi/上传方法（ESP32 被 `UPLOAD_ALL` 阻塞）。
 - **WiFi 凭据管理**（WiFi ≥0.1.3）：`list_wifi_credentials()`（流式，**不含密码**，`WifiCredential { ssid, last_used }`，0.1.3 起为真实 Unix 秒）/ `delete_wifi_credential(ssid)`。
-- dyj_cli：`sync start|status`、`creds list|del <ssid>`，`controls` 接受充电输入与 `sync_upload`；dyj_web：绑定下拉 + 充电输入与 `sync_upload`、一键同步按钮与进度、已保存 WiFi 列表。
+- dyj_cli：`sync start|status`、`creds list|del <ssid>`，`controls` 接受充电输入与 `sync_upload`；dyj_web：绑定下拉 + 充电输入与 `sync_upload`、一键同步按钮与进度、已保存 WiFi 列表、**上传基址管理**（06 组「读设备配置」/「保存到设备」读写 `upload_url`，连接后自动显示设备已存值；预填改为短形式 `https://dyj2.dev.reai.com/api/upload`——服务端 `/upload/<文件名>` 按 `x-device-id` 头落盘，带 27 位设备 ID 的长 URL 会超 CONFIG 值 63 字节上限）。
 
 ## 0.0.5（2026-10-21）
 

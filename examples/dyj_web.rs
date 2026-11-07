@@ -138,6 +138,7 @@ async fn main() {
         .route("/api/display/clear", post(display_clear))
         .route("/api/upload/file", post(upload_file_to))
         .route("/api/upload/all", post(upload_all))
+        .route("/api/upload/url", get(upload_url_get).post(upload_url_set))
         .route("/api/sync/start", post(sync_start))
         .route("/api/sync/status", get(sync_status))
         .route("/api/creds", get(creds_list))
@@ -1140,6 +1141,39 @@ async fn controls_preset(
     Ok(Json(serde_json::to_value(
         device.control_bindings().await?,
     )?))
+}
+
+// ===== 上传基址管理（CONFIG 键 upload_url，设备侧持久化） =====
+
+/// 读设备里保存的上传基址 + 短形式建议值。
+///
+/// 建议值刻意不带设备 ID：`/upload/<文件名>` 形式服务端会改用 `x-device-id`
+/// 请求头落盘（固件每次上传都带），而长 URL 对 27 位设备 ID 会超出 CONFIG 值
+/// 63 字节上限。见固件仓 docs/SYNC_UPLOAD.md。
+async fn upload_url_get(State(state): State<Arc<AppState>>) -> ApiResult<Json<serde_json::Value>> {
+    let device = current_device(&state).await?;
+    let saved = device.wifi_upload_url().await?;
+    Ok(Json(serde_json::json!({
+        "saved": saved,
+        "suggested": "https://dyj2.dev.reai.com/api/upload",
+    })))
+}
+
+/// `{url}`：把上传基址持久化到设备（`CONFIG_SET upload_url`，≤63 字节）。
+/// 设备侧一键同步（⚡）与「全部上传」不填 url 时都用这个值。
+async fn upload_url_set(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<serde_json::Value>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let device = current_device(&state).await?;
+    let url = body
+        .get("url")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| invalid_body("缺少 url 字段"))?;
+    let response = device.set_wifi_upload_url(url).await?;
+    Ok(Json(
+        serde_json::json!({ "saved": url, "response": response }),
+    ))
 }
 
 // ===== 一键同步 / WiFi 凭据（主控 0.3.9 / WiFi 0.1.3） =====
