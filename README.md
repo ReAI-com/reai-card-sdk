@@ -11,7 +11,7 @@ ReAI 录音卡（DYJ-HD v2）的异步 Rust SDK：通过 BLE 控制设备、接�
 - 运行时：Tokio；蓝牙后端 [btleplug](https://github.com/deviceplug/btleplug)
 - 平台：macOS / Linux 已真机验证，Windows 未验证（btleplug 本身支持，欢迎反馈）
 
-> 固件对应关系：主控 nRF52840 `v0.3.x` / WiFi 模块 ESP32-C3 `v0.0.9`。协议契约、超时表、固件行为细节见 [docs/protocol-support.md](docs/protocol-support.md)。
+> 固件对应关系：主控 nRF52840 `v0.3.x` / WiFi 模块 ESP32-C3 `v0.0.9`。协议契约、超时表、固件行为细节见 [docs/protocol-support.md](docs/protocol-support.md)。服务端（OTA / 上传）协议契约见 [docs/server-protocol.md](docs/server-protocol.md)。
 
 ## 目录
 
