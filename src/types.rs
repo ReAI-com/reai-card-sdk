@@ -295,6 +295,20 @@ pub struct SyncEvent {
     pub message: Option<String>,
     pub last_state: Option<SyncState>,
     pub last_error: Option<String>,
+    /// 连接成功的热点名（0.3.12 起的 `connecting` 推送 / `WIFI_AUTOCONNECT_TRY`）。
+    pub ssid: Option<String>,
+    /// 连接成功拿到的 IP（0.3.12 起的 `connecting` 推送）。
+    pub ip: Option<String>,
+    /// 正在处理的序号（1 起算）：`UPLOAD_START` 第 N 个文件 / `WIFI_AUTOCONNECT_TRY` 第 N 个凭据。
+    pub index: Option<u32>,
+    /// 总数：待上传文件数 / 已保存凭据数。
+    pub count: Option<u32>,
+    /// `UPLOAD_ALL` 总结帧：成功上传的文件数。
+    pub uploaded: Option<u32>,
+    /// `UPLOAD_ALL` 总结帧：失败的文件数（>0 时失败文件保留在卡上）。
+    pub failed: Option<u32>,
+    /// 空闲查询响应的错误补充说明（`lastMessage`，0.3.12 起）。
+    pub last_message: Option<String>,
 }
 
 impl SyncEvent {
@@ -341,6 +355,31 @@ impl SyncEvent {
             last_state,
             last_error: payload
                 .get("lastError")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            ssid: payload
+                .get("ssid")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            ip: payload.get("ip").and_then(Value::as_str).map(str::to_owned),
+            index: payload
+                .get("index")
+                .and_then(Value::as_u64)
+                .map(|v| v as u32),
+            count: payload
+                .get("count")
+                .and_then(Value::as_u64)
+                .map(|v| v as u32),
+            uploaded: payload
+                .get("uploaded")
+                .and_then(Value::as_u64)
+                .map(|v| v as u32),
+            failed: payload
+                .get("failed")
+                .and_then(Value::as_u64)
+                .map(|v| v as u32),
+            last_message: payload
+                .get("lastMessage")
                 .and_then(Value::as_str)
                 .map(str::to_owned),
         }

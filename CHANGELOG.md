@@ -3,6 +3,18 @@
 版本号独立于主控固件（nRF `v0.3.x` / WiFi `v0.0.x`）；SDK 与固件的协议对应关系见
 [`docs/protocol-support.md`](docs/protocol-support.md)。
 
+## 0.0.7（2026-11-11）
+
+配套固件 **主控 0.3.12 + WiFi 0.1.4（一键同步过程事件细化）**；协议设计见固件仓 `docs/SYNC_UPLOAD.md`。
+
+**新增**：
+
+- **一键同步过程事件细化**（主控 ≥0.3.12 / WiFi ≥0.1.4；均为可选字段/新帧，旧固件互配不炸）：
+  - `SyncEvent` 新增可选字段 `ssid` / `ip` / `index` / `count` / `uploaded` / `failed` / `last_message`——连接成功的 `connecting` 推送带热点名与 IP；空闲查询响应带 `lastMessage`。
+  - 新帧映射：`WIFI_AUTOCONNECT_TRY`（正在试第 N/M 个已存 WiFi，消除逐凭据尝试盲等）→ Connecting + `message`/`done`/`total`；`UPLOAD_START`（第 N/M 个文件开始上传）→ Uploading + `current`/`done`/`total`；`UPLOAD_ALL` 总结帧（此前被 SDK 静默丢弃）→ Closing + `uploaded`/`failed`/`total`。
+  - `WIFI_AUTOCONNECT` 成功事件补 `ssid`/`ip` 字段（`message` 仍带 SSID，旧消费方式不变）。
+  - `SYNC_STATUS` 的 `uploading` 帧透传失败原因细分（`message`：`HTTP 500` / `网络错误(-1)` 等，WiFi 0.1.4 起），`error`/`closing` 帧带失败细节 `message`（如 `autoconnect_timeout`，主控 0.3.12 起）。
+
 ## 0.0.6（2026-11-07）
 
 配套固件 **主控 0.3.9 + WiFi 0.1.3（事件绑定扩展 + 设备侧一键同步 + WiFi 凭据管理）**。

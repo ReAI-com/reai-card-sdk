@@ -1481,20 +1481,52 @@ fn event_from_frame(frame: &TextFrame) -> Option<DeviceEvent> {
         ),
         // 一键同步（主控 0.3.9 / WiFi 0.1.3）：状态推送、逐文件进度、自动连接
         // 结果三种帧统一映射成 Sync 事件（规范见固件 docs/SYNC_UPLOAD.md）。
+        // 0.3.12 / 0.1.4 起新增：UPLOAD_ALL 总结帧、UPLOAD_START 开始帧、
+        // WIFI_AUTOCONNECT_TRY 逐凭据帧（旧固件不产生，旧 SDK 静默丢弃）。
         "SYNC_STATUS" => Some(DeviceEvent::Sync(SyncEvent::from_payload(&frame.payload))),
         "UPLOAD_PROGRESS" => {
             let mut event = SyncEvent::from_payload(&frame.payload);
             event.state = Some(SyncState::Uploading);
             Some(DeviceEvent::Sync(event))
         }
+        // 每个文件开始上传前的一帧：`name/index(1 起算)/total`——name 映射到
+        // current（SYNC_STATUS 的 uploading 帧用 current 承载文件名，消费方一致）
+        "UPLOAD_START" => {
+            let mut event = SyncEvent::from_payload(&frame.payload);
+            event.state = Some(SyncState::Uploading);
+            event.current = frame
+                .payload
+                .get("name")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            event.done = event.index;
+            Some(DeviceEvent::Sync(event))
+        }
+        // UPLOAD_ALL 最终总结帧：`code:0` 恒定，成败看 `failed`（>0 时失败文件保留在卡上）
+        "UPLOAD_ALL" => {
+            let mut event = SyncEvent::from_payload(&frame.payload);
+            event.state = Some(SyncState::Closing);
+            event.code = event.code.or(Some(0));
+            Some(DeviceEvent::Sync(event))
+        }
         "WIFI_AUTOCONNECT" => Some(DeviceEvent::Sync(auto_connect_sync_event(&frame.payload))),
+        // 自动连接逐凭据尝试帧：`ssid/index(1 起算)/count`；message 同步带 ssid
+        // （与 WIFI_AUTOCONNECT 事件惯例一致，消费方无需区分读哪个字段）
+        "WIFI_AUTOCONNECT_TRY" => {
+            let mut event = SyncEvent::from_payload(&frame.payload);
+            event.state = Some(SyncState::Connecting);
+            event.message = event.ssid.clone();
+            event.done = event.index;
+            event.total = event.count;
+            Some(DeviceEvent::Sync(event))
+        }
         _ => None,
     }
 }
 
 /// `WIFI_AUTOCONNECT` 结果帧 → Sync 事件（state 恒为 Connecting）：
-/// 成功 `code:0` 时 `message` 带已连 SSID；失败 `code:1` 时 `error` 带
-/// `no_credentials`/`all_failed`。
+/// 成功 `code:0` 时 `ssid`/`ip` 字段带连接详情（`message` 亦带 SSID，兼容 0.0.6 消费方式）；
+/// 失败 `code:1` 时 `error` 带 `no_credentials`/`all_failed`。
 fn auto_connect_sync_event(payload: &Value) -> SyncEvent {
     let ok = payload.get("code").and_then(Value::as_i64) == Some(0);
     let mut event = SyncEvent {
@@ -1507,6 +1539,8 @@ fn auto_connect_sync_event(payload: &Value) -> SyncEvent {
             .get("ssid")
             .and_then(Value::as_str)
             .map(str::to_owned);
+        event.ssid = event.message.clone();
+        event.ip = payload.get("ip").and_then(Value::as_str).map(str::to_owned);
     } else {
         event.error = payload
             .get("message")
@@ -2442,10 +2476,12 @@ mod tests {
         let DeviceEvent::Sync(event) = events.recv().await.unwrap() else {
             panic!("expected sync event");
         };
-        // WIFI_AUTOCONNECT 成功帧：state=Connecting、message=ssid
+        // WIFI_AUTOCONNECT 成功帧：state=Connecting、message=ssid、ssid/ip 字段（0.0.7 起）
         assert_eq!(event.state, Some(SyncState::Connecting));
         assert_eq!(event.code, Some(0));
         assert_eq!(event.message.as_deref(), Some("Office-5G"));
+        assert_eq!(event.ssid.as_deref(), Some("Office-5G"));
+        assert_eq!(event.ip.as_deref(), Some("192.168.1.9"));
         assert!(event.error.is_none());
 
         let DeviceEvent::Sync(event) = events.recv().await.unwrap() else {
@@ -2454,6 +2490,51 @@ mod tests {
         assert_eq!(event.state, Some(SyncState::Connecting));
         assert_eq!(event.code, Some(1));
         assert_eq!(event.error.as_deref(), Some("no_credentials"));
+    }
+
+    #[tokio::test]
+    async fn sync_detail_frames_map_into_sync_events() {
+        let transport = Arc::new(MockTransport::new());
+        let device = DyjDevice::from_transport(transport.clone()).await.unwrap();
+        let mut events = device.subscribe_events();
+        // WiFi 0.1.4：逐凭据尝试帧（正在试第 2/3 个 WiFi）
+        transport.reply(b"WIFI_AUTOCONNECT_TRY:{\"ssid\":\"Home-5G\",\"index\":2,\"count\":3}\r\n");
+        // WiFi 0.1.4：文件开始上传帧（第 1/2 个文件）
+        transport.reply(b"UPLOAD_START:{\"name\":\"5E76DABB.APM\",\"index\":1,\"total\":2}\r\n");
+        // 主控 0.3.12：UPLOAD_ALL 总结帧（成败看 failed；主控转发后 SDK 此前直接丢弃）
+        transport
+            .reply("UPLOAD_ALL:{\"code\":0,\"uploaded\":1,\"failed\":1,\"total\":2,\"message\":\"部分文件上传失败（失败文件已保留）\"}\r\n".as_bytes());
+        let _ = device.device_info().await.unwrap();
+
+        // WIFI_AUTOCONNECT_TRY → Connecting + message=ssid + done=index/total=count
+        let DeviceEvent::Sync(event) = events.recv().await.unwrap() else {
+            panic!("expected sync event");
+        };
+        assert_eq!(event.state, Some(SyncState::Connecting));
+        assert_eq!(event.message.as_deref(), Some("Home-5G"));
+        assert_eq!(event.index, Some(2));
+        assert_eq!(event.done, Some(2));
+        assert_eq!(event.total, Some(3));
+
+        // UPLOAD_START → Uploading + current=name + done=index
+        let DeviceEvent::Sync(event) = events.recv().await.unwrap() else {
+            panic!("expected sync event");
+        };
+        assert_eq!(event.state, Some(SyncState::Uploading));
+        assert_eq!(event.current.as_deref(), Some("5E76DABB.APM"));
+        assert_eq!(event.done, Some(1));
+        assert_eq!(event.total, Some(2));
+        assert_eq!(event.code, None); // 开始帧没有 code 字段
+
+        // UPLOAD_ALL → Closing + uploaded/failed 字段可见
+        let DeviceEvent::Sync(event) = events.recv().await.unwrap() else {
+            panic!("expected sync event");
+        };
+        assert_eq!(event.state, Some(SyncState::Closing));
+        assert_eq!(event.code, Some(0));
+        assert_eq!(event.uploaded, Some(1));
+        assert_eq!(event.failed, Some(1));
+        assert_eq!(event.total, Some(2));
     }
 
     #[tokio::test]
