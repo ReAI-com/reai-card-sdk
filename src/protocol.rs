@@ -257,10 +257,9 @@ mod tests {
         use super::parse_text_frame;
         // 真机场景（issue #11 回归期）：UPLOAD_PROGRESS 带中文 message，
         // UART 掉字节砍在多字节序列中间 → 整帧非法 UTF-8
-        let valid = format!(
-            "UPLOAD_PROGRESS:{{\"name\":\"A1B2C3D4.APM\",\"done\":1,\"total\":2,\
-             \"code\":1,\"message\":\"网络错误(-1)\"}}\r\n"
-        );
+        let valid = "UPLOAD_PROGRESS:{\"name\":\"A1B2C3D4.APM\",\"done\":1,\"total\":2,\
+\"code\":1,\"message\":\"网络错误(-1)\"}\r\n"
+            .to_string();
         // 砍掉 "网"（3 字节 UTF-8）序列中间的 1 字节，模拟 UART 掉字节（字节级切除）
         let cut = valid.find('网').expect("message 应含中文") + 1;
         let mut corrupted = valid.into_bytes();
