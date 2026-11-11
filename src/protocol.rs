@@ -138,7 +138,18 @@ pub(crate) fn encode_command(command: &str, payload: Option<&Value>) -> Result<V
 }
 
 pub(crate) fn parse_text_frame(line: &[u8]) -> Result<TextFrame> {
-    let text = str::from_utf8(line).map_err(|_| SdkError::InvalidUtf8)?;
+    // 优先严格 UTF-8；不合法时退回 lossy 解码而不是整行丢弃：
+    // 固件 UART 丢字节（issue #11）最常砍在中文多字节序列中间，命令名与 JSON
+    // 结构（ASCII）通常完好，替换字符（U+FFFD）不破坏解析，能把帧救回来
+    let owned;
+    let text = match str::from_utf8(line) {
+        Ok(text) => text,
+        Err(_) => {
+            tracing::warn!(target: "dyj.proto", "⚠️ 帧含无效UTF-8，已用替换字符降级解析");
+            owned = String::from_utf8_lossy(line);
+            &*owned
+        }
+    };
     let (command, payload) = match text.split_once(':') {
         Some((command, json)) => (command.trim(), serde_json::from_str(json.trim())?),
         None => (text.trim(), Value::Object(Default::default())),
@@ -239,5 +250,29 @@ mod tests {
         assert!(fault.unwrap().contains("malformed raw JSON"));
         assert_eq!(frames.len(), 1);
         assert_eq!(text(&frames[0]).command, "STATE_INFO");
+    }
+
+    #[test]
+    fn corrupted_utf8_frame_is_salvaged_with_replacement_chars() {
+        use super::parse_text_frame;
+        // 真机场景（issue #11 回归期）：UPLOAD_PROGRESS 带中文 message，
+        // UART 掉字节砍在多字节序列中间 → 整帧非法 UTF-8
+        let valid = format!(
+            "UPLOAD_PROGRESS:{{\"name\":\"A1B2C3D4.APM\",\"done\":1,\"total\":2,\
+             \"code\":1,\"message\":\"网络错误(-1)\"}}\r\n"
+        );
+        // 砍掉 "网"（3 字节 UTF-8）序列中间的 1 字节，模拟 UART 掉字节（字节级切除）
+        let cut = valid.find('网').expect("message 应含中文") + 1;
+        let mut corrupted = valid.into_bytes();
+        corrupted.drain(cut..cut + 1);
+        assert!(std::str::from_utf8(&corrupted).is_err());
+
+        let frame = parse_text_frame(&corrupted).expect("lossy 解析应保住帧");
+        assert_eq!(frame.command, "UPLOAD_PROGRESS");
+        assert_eq!(frame.payload["name"], "A1B2C3D4.APM");
+        assert_eq!(frame.payload["done"], 1);
+        // 被砍的字以替换字符出现，帧不再被整行跳过
+        let message = frame.payload["message"].as_str().unwrap();
+        assert!(message.contains('\u{fffd}'), "message={message}");
     }
 }
