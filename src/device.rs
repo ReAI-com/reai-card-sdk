@@ -444,7 +444,18 @@ impl DyjDevice {
         let mut written = 0_u64;
         let mut next_milestone = FILE_PROGRESS_STEP;
         loop {
-            match receive_next(&mut incoming, FILE_IDLE_TIMEOUT, command).await? {
+            let msg = match receive_next(&mut incoming, FILE_IDLE_TIMEOUT, command).await {
+                Ok(msg) => msg,
+                Err(e) => {
+                    // 收尾诊断（0.3.16 end 帧丢失排查）：超时/断连时打印已收与预期差值
+                    if let Some(exp) = expected_size {
+                        tracing::error!(target: "dyj.file",
+                            "⏱️ {command} 终止诊断: 已收={written}/{exp}字节 差额={}", exp as i64 - written as i64);
+                    }
+                    return Err(e);
+                }
+            };
+            match msg {
                 Inbound::Binary(bytes) if expected_size.is_some() => {
                     writer.write_all(&bytes).await?;
                     written += bytes.len() as u64;
