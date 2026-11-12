@@ -188,6 +188,7 @@ async fn run(globals: &Globals, command: &[String]) -> reai_card_sdk::Result<()>
             Ok(())
         }
         "take" => take(&device, rest).await,
+        "take-oldest" => take_oldest(&device, rest).await,
         "delete" => {
             let name = required(rest, 0, "filename")?;
             print_json(serde_json::to_value(device.delete_file(name).await?)?)
@@ -499,6 +500,23 @@ async fn take(device: &DyjDevice, rest: &[String]) -> reai_card_sdk::Result<()> 
     let mut writer = tokio::fs::File::create(&part).await?;
     let result = device.take_file_to(name, &mut writer).await?;
     tokio::fs::rename(&part, output).await?;
+    println!(
+        "took {} bytes (device file `{}` removed) -> {output}",
+        result.bytes_written, result.name
+    );
+    Ok(())
+}
+
+/// `take-oldest [output]`：FILE_UPLOAD_OLDEST，设备自选最旧的（非正在录的）.APM。
+async fn take_oldest(device: &DyjDevice, rest: &[String]) -> reai_card_sdk::Result<()> {
+    let output = match rest.first() {
+        Some(path) => path.clone(),
+        None => "oldest.apm".to_owned(),
+    };
+    let part = format!("{output}.part");
+    let mut writer = tokio::fs::File::create(&part).await?;
+    let result = device.take_oldest_file_to(&mut writer).await?;
+    tokio::fs::rename(&part, &output).await?;
     println!(
         "took {} bytes (device file `{}` removed) -> {output}",
         result.bytes_written, result.name
