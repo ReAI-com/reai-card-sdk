@@ -5,8 +5,8 @@
 
 ## 0.0.8（2026-11-12）
 
-配套固件 **主控 0.3.13（录音分片时长可配 + FILE_UPLOAD_OLDEST）+ WiFi 0.1.4（无改动）**。
-**面向消费方的说明见 [`docs/release-0.0.8.md`](docs/release-0.0.8.md)**。固件分支 `feature/segment-upload-oldest`。
+配套固件 **主控 0.3.13（录音分片时长可配 + FILE_UPLOAD_OLDEST）+ WiFi 0.1.4（无改动）**；固件分支 `feature/segment-upload-oldest`。
+**面向消费方的说明见 [`docs/release-0.0.8.md`](docs/release-0.0.8.md)**。**真机回归通过**（60s 切片精确、录音中取最旧不影响录音、传完即删；回归脚本沉淀为 `examples/dyj_segment_test.rs` / `dyj_record_watch.rs`）。
 
 **新增**：
 
