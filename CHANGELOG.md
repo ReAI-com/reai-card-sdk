@@ -3,6 +3,16 @@
 版本号独立于主控固件（nRF `v0.3.x` / WiFi `v0.0.x`）；SDK 与固件的协议对应关系见
 [`docs/protocol-support.md`](docs/protocol-support.md)。
 
+## 0.0.9（2026-11-12）
+
+配套固件不变（主控 ≥0.3.13 / WiFi 0.1.4）。**纯工具与诊断增强，库 API 无变化**，0.0.8 消费方无需升级。
+
+**新增**：
+
+- `dyj_cli` 新增 `take-oldest [output]` 命令——`FILE_UPLOAD_OLDEST` 的命令行验证入口（设备自选最旧的（非正在录的）`.APM` 传回并删除）。
+- 新增 `dyj_take_probe` 探针示例：取最旧超时后于同一连接内探测链路/设备存活，用于 BLE 丢帧排查。
+- take 传输异常时打印**收尾诊断**：已收/预期字节差额——一行日志即可区分「数据缺失」与「仅 end 帧丢失」（0.3.17 `NRF_ERROR_RESOURCES` 丢帧根因即由此法定位，方法论见固件仓 `docs/updates/v0.3.17-wifi0.1.4.md`）。
+
 ## 0.0.8（2026-11-12）
 
 配套固件 **主控 0.3.13（录音分片时长可配 + FILE_UPLOAD_OLDEST）+ WiFi 0.1.4（无改动）**；固件分支 `feature/segment-upload-oldest`。
