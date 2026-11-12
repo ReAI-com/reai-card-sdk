@@ -109,6 +109,7 @@ async fn main() {
         .route("/api/command", post(command))
         .route("/api/files", get(files))
         .route("/api/take", post(take))
+        .route("/api/take-oldest", post(take_oldest))
         .route("/api/wifi/scan", get(wifi_scan))
         .route("/api/wifi/status", get(wifi_status))
         .route("/api/uploads", get(uploads))
@@ -311,6 +312,16 @@ async fn take(
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| invalid_body("缺少 name 字段"))?;
     let saved = device.take_file_to_dir(name, &state.downloads).await?;
+    saved_json(saved, want_wav(&body)).await
+}
+
+/// FILE_UPLOAD_OLDEST（主控 0.3.13）：设备自选最旧的（非正在录的）.APM 传回并删除。
+async fn take_oldest(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<serde_json::Value>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let device = current_device(&state).await?;
+    let saved = device.take_oldest_file_to_dir(&state.downloads).await?;
     saved_json(saved, want_wav(&body)).await
 }
 
