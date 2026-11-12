@@ -3,6 +3,18 @@
 版本号独立于主控固件（nRF `v0.3.x` / WiFi `v0.0.x`）；SDK 与固件的协议对应关系见
 [`docs/protocol-support.md`](docs/protocol-support.md)。
 
+## 0.0.8（2026-11-12）
+
+配套固件 **主控 0.3.13（录音分片时长可配 + FILE_UPLOAD_OLDEST）+ WiFi 0.1.4（无改动）**。
+**面向消费方的说明见 [`docs/release-0.0.8.md`](docs/release-0.0.8.md)**。固件分支 `feature/segment-upload-oldest`。
+
+**新增**：
+
+- **录音分片时长可配**（主控 ≥0.3.13）：`start_recording_with_duration(secs)` → `RECORD_START {"duration":<秒>}`；固件下限 10 秒（更低钳到 10），成功响应 `extra.duration` 带实际生效值。不带参数的 `start_recording` / `start_recording_with_session` 维持固件当前值（默认 600 秒）；旧固件忽略该参数，行为不变。
+- **蓝牙取最旧文件**（主控 ≥0.3.13）：`take_oldest_file_to(writer)` / `take_oldest_file_to_dir(dir)` → `FILE_UPLOAD_OLDEST`（无参帧）——设备自选 SD 上最旧的（跳过正在录写的）`.APM` 传回并删除源 `.APM/.TXT`，传输流程与 `take_file_to` 一致（start/binary/end + 字节校验 + 改名跟随）。SD 无可传文件时设备回 fail，源文件保留可重试；上传节奏完全由调用方控制。
+- **内部**：`take_file_to`/`take_file_to_dir` 的传输与落盘逻辑抽为 `take_file_core`/`take_to_dir_core`（帧匹配跟随命令字），新旧指令共用同一套状态机。
+- dyj_web：录音区新增分片秒数输入（RECORD_START 自动携带）、文件区新增「取最旧（0.3.13+）」按钮（`/api/take-oldest`）。
+
 ## 0.0.7（2026-11-11）
 
 配套固件 **主控 0.3.12 + WiFi 0.1.4（一键同步过程事件细化）**；协议设计见固件仓 `docs/SYNC_UPLOAD.md`。

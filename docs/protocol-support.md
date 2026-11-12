@@ -34,8 +34,8 @@ The wire protocol does not contain a request ID. The SDK consequently permits on
 | Group | Rust methods | Firmware command(s) |
 | --- | --- | --- |
 | Device | `device_info`, `state`, `sync_time`, `storage`, `battery` | `BASE_INFO`, `STATE_INFO`, `SYNC_TIME`, `STORAGE`, `BATTERY` |
-| Recording | `start_recording`, `stop_recording`, `toggle_recording`, `record_status`, `set_realtime_enabled`, `record_mark`, `start_realtime_recording`, `subscribe_audio` | `RECORD_*`, `RECORD` |
-| Files | `list_files`, `delete_file`, `clear_files`, `take_file_to` | `FILE_LIST`, `FILE_DELETE`, `FILE_CLEAR`, `FILE_UPLOAD` |
+| Recording | `start_recording`, `start_recording_with_session`, `start_recording_with_duration`, `stop_recording`, `toggle_recording`, `record_status`, `set_realtime_enabled`, `record_mark`, `start_realtime_recording`, `subscribe_audio` | `RECORD_*`, `RECORD` |
+| Files | `list_files`, `delete_file`, `clear_files`, `take_file_to`, `take_oldest_file_to` | `FILE_LIST`, `FILE_DELETE`, `FILE_CLEAR`, `FILE_UPLOAD`, `FILE_UPLOAD_OLDEST` (main ≥0.3.13) |
 | WiFi / AP control | `open_wifi`, `close_wifi`, `scan_wifi`, `connect_wifi`, `disconnect_wifi`, `wifi_status`, `start_access_point`, `stop_access_point`, `access_point_status` | `WIFI_*`, `AP_*` through nRF UART passthrough |
 | AP fast transfer | `AccessPointClient::{device_info,list_files,download_file_to,download_to_dir,delete_file}` | ESP32 HTTP `GET /api/files`, `GET /api/files/download`, `DELETE /api/files/delete` |
 | AP-mode WiFi OTA | `AccessPointClient::{ota_status,upload_firmware}` | ESP32 HTTP `GET /api/ota/check`, `POST /api/ota/upload` (multipart `firmware`) |
@@ -48,7 +48,9 @@ The wire protocol does not contain a request ID. The SDK consequently permits on
 | Lifecycle | `restart`, `shutdown`, `enter_dfu_mode` | `RESTART`, `SHUTDOWN`, `OTA` |
 | Escape hatch | `raw_command` | validated arbitrary command with a same-name response |
 
-`FILE_DELETE` uses firmware's real `{"filename":"..."}` request field. `FILE_UPLOAD` uses `{"name":"..."}`. This distinction is deliberate.
+`FILE_DELETE` uses firmware's real `{"filename":"..."}` request field. `FILE_UPLOAD` uses `{"name":"..."}`. This distinction is deliberate. `FILE_UPLOAD_OLDEST` (main ≥0.3.13) takes no payload: the device picks the oldest (by FAT mtime) `.APM` that is not currently being recorded, streams it with the same start/binary/end frames under the `FILE_UPLOAD_OLDEST` command name, and deletes the source `.APM`/`.TXT` afterwards; when there is nothing to send it replies with a fail frame and keeps every file. On main ≤0.3.12 the command word is unregistered — the firmware silently drops unknown commands (no response frame), so the SDK surfaces this as an idle timeout.
+
+`RECORD_START` accepts an optional `"duration"` field (main ≥0.3.13, `start_recording_with_duration`): segment length in seconds, firmware clamps to a 10 s minimum and echoes the effective value in the success response (`extra.duration`); older firmware ignores the field and keeps its 600 s default. The value persists only for that recording session's start — subsequent starts without the field fall back to the firmware's current setting.
 
 `WIFI_STATUS` is only answerable while the ESP32 is powered: the nRF forwards it over UART, and an unpowered module simply never replies. `wifi_status` therefore reads `STATE_INFO.wifiOpen` first and returns the powered-down state (`status: "off"`, `enabled: false`) without a wire round-trip. Status vocabulary: `off` (module powered down, synthesized by the SDK), `disabled` / `enabled` / `connected` (reported by the ESP32).
 

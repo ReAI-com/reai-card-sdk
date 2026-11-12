@@ -264,6 +264,27 @@ impl DyjDevice {
         )
         .await
     }
+    /// 开始录音并指定本次录音的分片时长（主控 0.3.13 起）。
+    ///
+    /// `duration_secs` 是单个录音文件的最大秒数，达到后固件自动切片；不带该参数的
+    /// [`Self::start_recording`] / [`Self::start_recording_with_session`] 维持固件当前值
+    /// （默认 600 秒）。固件下限 10 秒（更低按 10 处理），成功响应 `extra.duration`
+    /// 带实际生效值；旧固件忽略该参数（响应无 `duration` 字段），行为与
+    /// [`Self::start_recording`] 一致。
+    pub async fn start_recording_with_duration(&self, duration_secs: u32) -> Result<CommandResponse> {
+        if duration_secs == 0 {
+            return Err(SdkError::InvalidCommand(
+                "duration_secs 必须大于 0（要沿用固件当前值请用 start_recording）".into(),
+            ));
+        }
+        self.require_sd_on_nrf("RECORD_START").await?;
+        self.request_success(
+            "RECORD_START",
+            Some(json!({ "duration": duration_secs })),
+            NORMAL_TIMEOUT,
+        )
+        .await
+    }
     pub async fn stop_recording(&self) -> Result<CommandResponse> {
         self.request_success("RECORD_STOP", None, NORMAL_TIMEOUT)
             .await
@@ -374,26 +395,56 @@ impl DyjDevice {
         name: &str,
         writer: &mut W,
     ) -> Result<TakenFile> {
+        self.take_file_core("FILE_UPLOAD", Some(json!({"name": name})), writer, Some(name))
+            .await
+    }
+
+    /// 蓝牙取走 SD 卡上最旧的（非正在录的）.APM 文件（主控 0.3.13 起）。
+    ///
+    /// 设备侧选文件（按 FAT mtime，跳过正在录写的文件），上位机不指定名字；传输
+    /// 流程与 [`Self::take_file_to`] 完全一致（start/binary/end 三段式 + 传完删除
+    /// 源 .APM/.TXT），响应帧命令字为 `FILE_UPLOAD_OLDEST`。返回的
+    /// [`TakenFile::name`] 是设备 start 帧给出的改名结果
+    /// （`synced_/nosync_<时间戳>[_会话_段序号].apm`）。SD 上没有可传文件时设备回
+    /// fail（`无可上传文件`），源文件保留、可稍后重试；上传节奏完全由调用方控制。
+    pub async fn take_oldest_file_to<W: AsyncWrite + Unpin>(
+        &self,
+        writer: &mut W,
+    ) -> Result<TakenFile> {
+        self.take_file_core("FILE_UPLOAD_OLDEST", None, writer, None)
+            .await
+    }
+
+    /// 取文件传输内部状态机：发起 `(command, payload)` 并消费 start/binary/end 帧，
+    /// 帧匹配跟随 `command`（FILE_UPLOAD 与 FILE_UPLOAD_OLDEST 共用）。
+    /// `display_name` 仅用于日志；`result_name` 的兜底取 `display_name.unwrap_or(command)`。
+    async fn take_file_core<W: AsyncWrite + Unpin>(
+        &self,
+        command: &str,
+        payload: Option<Value>,
+        writer: &mut W,
+        display_name: Option<&str>,
+    ) -> Result<TakenFile> {
         if self.core.realtime_active.load(Ordering::SeqCst) {
-            tracing::warn!(target: "dyj.file", "⚠️ 实时录音进行中，拒绝取文件 name={name}");
+            tracing::warn!(target: "dyj.file", "⚠️ 实时录音进行中，拒绝取文件 command={command}");
             return Err(SdkError::RealtimeRecordingActive);
         }
-        self.require_sd_on_nrf("FILE_UPLOAD").await?;
-        tracing::info!(target: "dyj.file", "📄 请求取走文件 name={name}");
-        let _command = self.core.command_gate.lock().await;
+        self.require_sd_on_nrf(command).await?;
+        tracing::info!(target: "dyj.file", "📄 请求取走文件 command={command}");
+        let _command_gate = self.core.command_gate.lock().await;
         self.core.file_transfer_active.store(true, Ordering::SeqCst);
         let _transfer_guard = FlagGuard(&self.core.file_transfer_active);
         let mut incoming = self.core.incoming.lock().await;
-        discard_stale_inbound(&mut incoming, "FILE_UPLOAD")?;
-        self.write_command("FILE_UPLOAD", Some(json!({"name": name})))
-            .await?;
+        discard_stale_inbound(&mut incoming, command)?;
+        self.write_command(command, payload).await?;
 
         let mut expected_size = None;
-        let mut result_name = name.to_owned();
+        let mut result_name =
+            display_name.unwrap_or(command).to_owned();
         let mut written = 0_u64;
         let mut next_milestone = FILE_PROGRESS_STEP;
         loop {
-            match receive_next(&mut incoming, FILE_IDLE_TIMEOUT, "FILE_UPLOAD").await? {
+            match receive_next(&mut incoming, FILE_IDLE_TIMEOUT, command).await? {
                 Inbound::Binary(bytes) if expected_size.is_some() => {
                     writer.write_all(&bytes).await?;
                     written += bytes.len() as u64;
@@ -405,7 +456,7 @@ impl DyjDevice {
                         tracing::info!(target: "dyj.file", "📄 传输进度 name={result_name} 已传={written}/{total}字节 ({percent}%)");
                     }
                 }
-                Inbound::Text(frame) if frame.command == "FILE_UPLOAD" => {
+                Inbound::Text(frame) if frame.command == command => {
                     ensure_success(&frame.command, &frame.payload)?;
                     match frame.payload.get("state").and_then(Value::as_str) {
                         Some("start") => {
@@ -419,7 +470,7 @@ impl DyjDevice {
                         }
                         Some("end") => {
                             let expected = expected_size.ok_or_else(|| {
-                                SdkError::InvalidFrame("FILE_UPLOAD ended without start".into())
+                                SdkError::InvalidFrame(format!("{command} ended without start"))
                             })?;
                             if written != expected {
                                 tracing::error!(target: "dyj.file", "❌ 传输校验失败 name={result_name} 期望={expected} 实际={written}");
@@ -436,7 +487,9 @@ impl DyjDevice {
                             });
                         }
                         _ => {
-                            return Err(SdkError::InvalidFrame("invalid FILE_UPLOAD state".into()));
+                            return Err(SdkError::InvalidFrame(format!(
+                                "invalid {command} state"
+                            )));
                         }
                     }
                 }
@@ -463,12 +516,37 @@ impl DyjDevice {
         name: &str,
         dir: impl AsRef<Path>,
     ) -> Result<SavedRecording> {
+        let original = recording::base_name(name).to_owned();
+        self.take_to_dir_core(
+            dir,
+            "FILE_UPLOAD",
+            Some(json!({"name": name})),
+            &original,
+        )
+        .await
+    }
+
+    /// [`Self::take_oldest_file_to`] 的落盘版：设备自选最旧文件，取走后按固件改名
+    /// 结果落盘（设备选中的名字在 start 帧才知道，`.part` 临时名固定为
+    /// `oldest.part`，最终文件名以时间戳改名为准）。SD 无可传文件时设备回 fail。
+    pub async fn take_oldest_file_to_dir(&self, dir: impl AsRef<Path>) -> Result<SavedRecording> {
+        self.take_to_dir_core(dir, "FILE_UPLOAD_OLDEST", None, "oldest")
+            .await
+    }
+
+    /// `take_*_to_dir` 公共落盘流程：写 `.part` → 传输 → finalize 改名，失败清半截文件。
+    async fn take_to_dir_core(
+        &self,
+        dir: impl AsRef<Path>,
+        command: &str,
+        payload: Option<Value>,
+        original: &str,
+    ) -> Result<SavedRecording> {
         let dir = dir.as_ref();
         tokio::fs::create_dir_all(dir).await?;
-        let original = recording::base_name(name).to_owned();
-        let part = recording::part_path(dir, &original);
+        let part = recording::part_path(dir, original);
         let mut file = tokio::fs::File::create(&part).await?;
-        let result = match self.take_file_to(name, &mut file).await {
+        let result = match self.take_file_core(command, payload, &mut file, Some(original)).await {
             Ok(result) => result,
             Err(error) => {
                 drop(file);
@@ -480,7 +558,7 @@ impl DyjDevice {
         recording::finalize(
             dir,
             &part,
-            &original,
+            original,
             Some(&result.name),
             result.bytes_written,
         )

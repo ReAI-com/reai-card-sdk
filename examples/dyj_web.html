@@ -209,6 +209,7 @@
     </div>
     <div class="group"><h3><span class="no">02</span>录音</h3>
       <div class="row">
+        <input id="recDuration" type="number" min="10" placeholder="分片秒" style="width:72px">
         <button onclick="cmd('RECORD_START')">开始</button>
         <button onclick="cmd('RECORD_STOP')">停止</button>
         <button onclick="cmd('RECORD')">切换</button>
@@ -223,6 +224,7 @@
     <div class="group"><h3><span class="no">03</span>文件 BLE</h3>
       <div class="row">
         <button onclick="listFiles()">列表</button>
+        <button onclick="takeOldest()">取最旧（0.3.13+）</button>
         <button class="danger" onclick="clearFiles()">清空全部</button>
       </div>
       <div class="row">
@@ -517,6 +519,11 @@ async function doDisconnect() {
 async function cmd(command, payload) {
   setBusy(true);
   try {
+    // RECORD_START 带可选分片时长（秒，≥10；留空走固件当前值，默认 600）
+    if (command === 'RECORD_START' && payload == null) {
+      const secs = parseInt($('recDuration')?.value, 10);
+      if (Number.isFinite(secs) && secs > 0) payload = {duration: secs};
+    }
     return await api('/api/command', {method:'POST', body:{command, payload: payload ?? null}});
   } finally { setBusy(false); }
 }
@@ -574,6 +581,14 @@ async function takeFile(name) {
   if (!confirm(`取走 ${name}？\n传输成功后设备会删除该源文件（含同名 .TXT）。`)) return;
   setBusy(true, '传输中…');
   try { await api('/api/take', {method:'POST', body:{name, wav: $('saveWav').checked}}); }
+  finally { setBusy(false); }
+}
+
+/// FILE_UPLOAD_OLDEST：设备自选最旧的（非正在录的）.APM 传回并删除（主控 0.3.13+）
+async function takeOldest() {
+  if (!confirm('取走 SD 上最旧的录音文件？\n设备自动选文件（跳过正在录的），传输成功后删除源文件。')) return;
+  setBusy(true, '传输中…');
+  try { await api('/api/take-oldest', {method:'POST', body:{wav: $('saveWav').checked}}); }
   finally { setBusy(false); }
 }
 
