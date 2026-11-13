@@ -10,6 +10,50 @@ pub struct DiscoveredDevice {
     pub rssi: Option<i16>,
 }
 
+/// Persist Wi-Fi firmware version in nRF52840 local Flash KV (`setting_lib`, max key 31 / value 63).
+/// Does not match `wifi_*` / `*_wifi`, so `CONFIG_GET` / `CONFIG_SET` stay on BLE without waking ESP32.
+pub const BLE_WIFI_VERSION_CONFIG_KEY: &str = "ble_wver";
+
+/// Cached or live ESP32 Wi-Fi firmware version pair (`version` + `versionCode`).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WifiFirmwareVersion {
+    pub version: String,
+    pub version_code: u32,
+}
+
+impl WifiFirmwareVersion {
+    /// Builds a validated version descriptor (`!version.is_empty()`, `version_code > 0`).
+    pub fn new(version: impl Into<String>, version_code: u32) -> Option<Self> {
+        let trimmed = version.into().trim().to_owned();
+        if trimmed.is_empty() || trimmed.len() > 32 || version_code == 0 {
+            return None;
+        }
+        if !trimmed
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'))
+        {
+            return None;
+        }
+        Some(Self {
+            version: trimmed,
+            version_code,
+        })
+    }
+
+    /// Encodes as `"<version>:<version_code>"` for nRF52840 `CONFIG_SET` (≤ 63 bytes).
+    pub fn encode_ble_kv(&self) -> String {
+        format!("{}:{}", self.version, self.version_code)
+    }
+
+    /// Parses `"<version>:<version_code>"` read back from nRF52840 `CONFIG_GET`.
+    pub fn parse_ble_kv(raw: &str) -> Option<Self> {
+        let (version, code_str) = raw.trim().rsplit_once(':')?;
+        let version_code = code_str.trim().parse::<u32>().ok()?;
+        Self::new(version, version_code)
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct DeviceInfo {
@@ -1002,7 +1046,7 @@ mod recording_stamp_tests {
 
 #[cfg(test)]
 mod ota_status_tests {
-    use super::OtaStatus;
+    use super::{OtaStatus, WifiFirmwareVersion};
 
     #[test]
     fn parses_firmware_vocabulary_and_keeps_unknown_values() {
@@ -1026,5 +1070,17 @@ mod ota_status_tests {
             serde_json::to_string(&OtaStatus::Checking).unwrap(),
             "\"CHECKING\""
         );
+    }
+
+    #[test]
+    fn wifi_firmware_version_ble_kv_roundtrip() {
+        let ver = WifiFirmwareVersion::new("0.1.4", 104).unwrap();
+        let encoded = ver.encode_ble_kv();
+        assert_eq!(encoded, "0.1.4:104");
+        assert_eq!(WifiFirmwareVersion::parse_ble_kv(&encoded), Some(ver));
+        assert_eq!(WifiFirmwareVersion::parse_ble_kv(""), None);
+        assert_eq!(WifiFirmwareVersion::parse_ble_kv("0.1.4:0"), None);
+        assert_eq!(WifiFirmwareVersion::parse_ble_kv(":104"), None);
+        assert_eq!(WifiFirmwareVersion::new(" ", 104), None);
     }
 }
