@@ -45,7 +45,9 @@ pub struct BatteryInfo {
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct StorageInfo {
+    /// SD 卡总容量，单位 MB（固件 handler_base.c 以 MB 上报；8GB 卡约 7373）
     pub total: u32,
+    /// 已用容量，单位 MB
     pub used: u32,
 }
 
