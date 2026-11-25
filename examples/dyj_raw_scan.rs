@@ -20,14 +20,14 @@ async fn main() {
     tokio::time::sleep(Duration::from_secs(secs)).await;
     let mut named = 0;
     for p in adapter.peripherals().await.unwrap() {
-        if let Ok(Some(props)) = p.properties().await {
-            if let Some(name) = props.local_name.or(props.advertisement_name) {
-                println!(
-                    "{}  name={name:?}  rssi={:?}  tx={:?}",
-                    props.address, props.rssi, props.tx_power_level
-                );
-                named += 1;
-            }
+        if let Ok(Some(props)) = p.properties().await
+            && let Some(name) = props.local_name.or(props.advertisement_name)
+        {
+            println!(
+                "{}  name={name:?}  rssi={:?}  tx={:?}",
+                props.address, props.rssi, props.tx_power_level
+            );
+            named += 1;
         }
     }
     println!("total named peripherals: {named}");

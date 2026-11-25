@@ -9,7 +9,7 @@ use chrono::{DateTime, Local, TimeZone};
 
 use crate::{
     Result,
-    audio::{AdpcmDecoder, SAMPLE_RATE_HZ, wav_bytes},
+    audio::{AdpcmDecoder, AudioProcessOptions, SAMPLE_RATE_HZ, process_pcm_samples, wav_bytes},
     types::RecordingStamp,
 };
 
@@ -100,8 +100,18 @@ impl WavFile {
 
 /// 离线转换：固件 `.apm`（裸 IMA ADPCM 流）→ 16kHz/16bit 单声道 WAV。
 pub async fn apm_to_wav(apm: &Path, wav: &Path) -> Result<WavFile> {
+    apm_to_wav_with_options(apm, wav, &AudioProcessOptions::default()).await
+}
+
+/// 离线转换（带预处理与重采样选项）：固件 `.apm` → 16kHz/16bit 单声道 WAV。
+pub async fn apm_to_wav_with_options(
+    apm: &Path,
+    wav: &Path,
+    options: &AudioProcessOptions,
+) -> Result<WavFile> {
     let adpcm = tokio::fs::read(apm).await?;
-    let samples = AdpcmDecoder::new().decode(&adpcm);
+    let decoded = AdpcmDecoder::new().decode(&adpcm);
+    let samples = process_pcm_samples(&decoded, options);
     tokio::fs::write(wav, wav_bytes(&samples, SAMPLE_RATE_HZ)).await?;
     let file = WavFile {
         path: wav.to_path_buf(),
@@ -219,6 +229,18 @@ mod tests {
         let bytes = tokio::fs::read(&wav.path).await.unwrap();
         assert_eq!(&bytes[0..4], b"RIFF");
         assert_eq!(bytes.len(), 44 + 1_600 * 2);
+
+        let conditioned = apm_to_wav_with_options(
+            &apm,
+            &dir.join("rec_conditioned.wav"),
+            &AudioProcessOptions {
+                source_sample_rate_hz: Some(15_578),
+                remove_dc_and_normalize: true,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(conditioned.samples, 1_643);
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 }

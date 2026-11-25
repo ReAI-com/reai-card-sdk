@@ -49,7 +49,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             .ok_or_else(|| format!("未找到指定设备 {id}"))?,
         None => devices
             .first()
-            .ok_or_else(|| "扫描不到任何 DYJ 设备，请确认设备开机")?,
+            .ok_or("扫描不到任何 DYJ 设备，请确认设备开机")?,
     };
     println!("🔗 连接 {} ({}) …", found.name, found.id);
     let device = manager.connect(found).await?;
@@ -110,13 +110,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
         "60s 段 1 已落定",
         seg1.is_some(),
         "({:?})",
-        seg1.as_ref().map(|e| (e.name.clone(), e.session.clone(), e.seq))
+        seg1.as_ref()
+            .map(|e| (e.name.clone(), e.session.clone(), e.seq))
     );
     check!(
         "段 2 在录",
         seg2.is_some(),
         "({:?})",
-        seg2.as_ref().map(|e| (e.name.clone(), e.session.clone(), e.seq))
+        seg2.as_ref()
+            .map(|e| (e.name.clone(), e.session.clone(), e.seq))
     );
 
     // 5. 录音中取最旧
@@ -126,7 +128,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .iter()
         .filter(|e| e.is_dir != Some(1))
         .filter(|e| {
-            !(seg2.as_ref()
+            !(seg2
+                .as_ref()
                 .is_some_and(|s2| e.session == s2.session && e.seq == s2.seq))
         })
         .min_by_key(|e| e.created_at.unwrap_or(i64::MAX))
@@ -141,7 +144,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let saved = match device.take_oldest_file_to_dir(DOWNLOADS).await {
         Ok(saved) => saved,
         Err(e) => {
-            check!("取最旧成功", false, "({e})");
+            println!("  ❌ 取最旧成功 ({e})");
             let _ = device.stop_recording().await;
             return fail(format!("take_oldest 失败（{e}），已停止录音，中止后续步骤"));
         }
@@ -166,9 +169,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
         "源文件已从卡上删除",
         expect
             .as_deref()
-            .map(|want| !after_take
-                .iter()
-                .any(|e| e.name.as_deref().is_some_and(|n| n.eq_ignore_ascii_case(want))))
+            .map(|want| !after_take.iter().any(|e| e
+                .name
+                .as_deref()
+                .is_some_and(|n| n.eq_ignore_ascii_case(want))))
             .unwrap_or(false),
         ""
     );
@@ -187,12 +191,20 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let session = seg2.as_ref().and_then(|e| e.session.clone());
     let max_seq_now = late
         .iter()
-        .filter(|e| session.as_ref().is_some_and(|s| e.session.as_ref() == Some(s)))
+        .filter(|e| {
+            session
+                .as_ref()
+                .is_some_and(|s| e.session.as_ref() == Some(s))
+        })
         .filter_map(|e| e.seq)
         .max();
     let max_seq_take = mid
         .iter()
-        .filter(|e| session.as_ref().is_some_and(|s| e.session.as_ref() == Some(s)))
+        .filter(|e| {
+            session
+                .as_ref()
+                .is_some_and(|s| e.session.as_ref() == Some(s))
+        })
         .filter_map(|e| e.seq)
         .max();
     check!(
@@ -216,7 +228,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
 /// 从设备改名结果 `synced_/nosync_<时间戳>_<会话>_<段序>.apm` 里提取 (session, seq)。
 fn parse_device_name(name: &Option<String>) -> Option<(Option<String>, Option<u32>)> {
     let name = name.as_deref()?;
-    let stem = name.strip_suffix(".apm").or_else(|| name.strip_suffix(".APM"))?;
+    let stem = name
+        .strip_suffix(".apm")
+        .or_else(|| name.strip_suffix(".APM"))?;
     let parts: Vec<&str> = stem.split('_').collect();
     if parts.len() < 4 {
         return None;

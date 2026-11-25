@@ -21,9 +21,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let device = manager.connect(found).await?;
 
     println!("\n[1] take_oldest（预期可能 30s 超时）…");
-    let saved = match device.take_oldest_file_to_dir("downloads-segment-test").await {
+    match device
+        .take_oldest_file_to_dir("downloads-segment-test")
+        .await
+    {
         Ok(s) => {
-            println!("    ✅ 完成 {:?} {}字节 → {}", s.device_name, s.bytes_written, s.path.display());
+            println!(
+                "    ✅ 完成 {:?} {}字节 → {}",
+                s.device_name,
+                s.bytes_written,
+                s.path.display()
+            );
             return Ok(());
         }
         Err(SdkError::Timeout { command, seconds }) => {
@@ -37,7 +45,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("\n[2] 超时后同一连接内 device_info（链路是否存活）…");
     match tokio::time::timeout(Duration::from_secs(10), device.device_info()).await {
-        Ok(Ok(info)) => println!("    ✅ 链路存活 version={} code={}", info.version, info.version_code),
+        Ok(Ok(info)) => println!(
+            "    ✅ 链路存活 version={} code={}",
+            info.version, info.version_code
+        ),
         Ok(Err(e)) => println!("    ❌ 链路异常: {e}"),
         Err(_) => println!("    ❌ device_info 也超时——设备端主循环卡死？"),
     }

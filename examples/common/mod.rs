@@ -7,7 +7,10 @@
 //! dyj_cli 只用 stdout 输出，level/line 字段与 log_sender 在那边是死代码。
 #![allow(dead_code)]
 
-use std::sync::OnceLock;
+use std::sync::{
+    OnceLock,
+    atomic::{AtomicBool, Ordering},
+};
 
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -23,6 +26,13 @@ struct LogHub {
 }
 
 static HUB: OnceLock<LogHub> = OnceLock::new();
+static LOG_TO_STDERR: AtomicBool = AtomicBool::new(false);
+
+/// 初始化全局日志（CLI `--json` 模式下输出到 stderr，保持 stdout 纯净 JSON）。
+pub fn init_tracing_stderr(verbosity: u8) {
+    LOG_TO_STDERR.store(true, Ordering::Relaxed);
+    init_tracing(verbosity);
+}
 
 /// 初始化全局日志。`verbosity`: 0=INFO（默认）、1=DEBUG（--verbose）、2+=TRACE（--trace），
 /// `RUST_LOG` 环境变量可覆盖。返回订阅句柄前日志即可用；网页端用 [`log_sender`] 拿广播。
@@ -63,8 +73,13 @@ impl<S: tracing::Subscriber> tracing_subscriber::layer::Layer<S> for ConsoleHubL
 
         {
             use std::io::Write;
-            let mut out = std::io::stdout().lock();
-            let _ = writeln!(out, "{line}");
+            if LOG_TO_STDERR.load(Ordering::Relaxed) {
+                let mut err = std::io::stderr().lock();
+                let _ = writeln!(err, "{line}");
+            } else {
+                let mut out = std::io::stdout().lock();
+                let _ = writeln!(out, "{line}");
+            }
         }
         if let Some(hub) = HUB.get() {
             let _ = hub.tx.send(LogLine { level, line });

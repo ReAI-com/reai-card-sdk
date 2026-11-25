@@ -271,7 +271,10 @@ impl DyjDevice {
     /// （默认 600 秒）。固件下限 10 秒（更低按 10 处理），成功响应 `extra.duration`
     /// 带实际生效值；旧固件忽略该参数（响应无 `duration` 字段），行为与
     /// [`Self::start_recording`] 一致。
-    pub async fn start_recording_with_duration(&self, duration_secs: u32) -> Result<CommandResponse> {
+    pub async fn start_recording_with_duration(
+        &self,
+        duration_secs: u32,
+    ) -> Result<CommandResponse> {
         if duration_secs == 0 {
             return Err(SdkError::InvalidCommand(
                 "duration_secs 必须大于 0（要沿用固件当前值请用 start_recording）".into(),
@@ -395,8 +398,13 @@ impl DyjDevice {
         name: &str,
         writer: &mut W,
     ) -> Result<TakenFile> {
-        self.take_file_core("FILE_UPLOAD", Some(json!({"name": name})), writer, Some(name))
-            .await
+        self.take_file_core(
+            "FILE_UPLOAD",
+            Some(json!({"name": name})),
+            writer,
+            Some(name),
+        )
+        .await
     }
 
     /// 蓝牙取走 SD 卡上最旧的（非正在录的）.APM 文件（主控 0.3.13 起）。
@@ -439,8 +447,7 @@ impl DyjDevice {
         self.write_command(command, payload).await?;
 
         let mut expected_size = None;
-        let mut result_name =
-            display_name.unwrap_or(command).to_owned();
+        let mut result_name = display_name.unwrap_or(command).to_owned();
         let mut written = 0_u64;
         let mut next_milestone = FILE_PROGRESS_STEP;
         loop {
@@ -498,9 +505,7 @@ impl DyjDevice {
                             });
                         }
                         _ => {
-                            return Err(SdkError::InvalidFrame(format!(
-                                "invalid {command} state"
-                            )));
+                            return Err(SdkError::InvalidFrame(format!("invalid {command} state")));
                         }
                     }
                 }
@@ -528,13 +533,8 @@ impl DyjDevice {
         dir: impl AsRef<Path>,
     ) -> Result<SavedRecording> {
         let original = recording::base_name(name).to_owned();
-        self.take_to_dir_core(
-            dir,
-            "FILE_UPLOAD",
-            Some(json!({"name": name})),
-            &original,
-        )
-        .await
+        self.take_to_dir_core(dir, "FILE_UPLOAD", Some(json!({"name": name})), &original)
+            .await
     }
 
     /// [`Self::take_oldest_file_to`] 的落盘版：设备自选最旧文件，取走后按固件改名
@@ -557,7 +557,10 @@ impl DyjDevice {
         tokio::fs::create_dir_all(dir).await?;
         let part = recording::part_path(dir, original);
         let mut file = tokio::fs::File::create(&part).await?;
-        let result = match self.take_file_core(command, payload, &mut file, Some(original)).await {
+        let result = match self
+            .take_file_core(command, payload, &mut file, Some(original))
+            .await
+        {
             Ok(result) => result,
             Err(error) => {
                 drop(file);

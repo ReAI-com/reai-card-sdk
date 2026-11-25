@@ -458,6 +458,121 @@ pub fn generated_recording_name(
     }
 }
 
+/// 经时间轴重建辅助处理后的文件列表条目。
+///
+/// 正常单调递增会话或无会话标记的条目保持 `effective_start_at = entry.start_at` 且
+/// `reconstructed = false`；若同 `session` 下检测到 24-bit RTC 1024s 回绕等时间戳倒退/折叠异常，
+/// 则以首段可信 `start_at` 为锚点，按段字节长度推算后续各段 `effective_start_at` 并置
+/// `reconstructed = true`。
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ReconstructedFileEntry {
+    pub entry: FileEntry,
+    pub effective_start_at: Option<i64>,
+    pub reconstructed: bool,
+}
+
+fn segment_duration_secs(entry: &FileEntry) -> i64 {
+    // 16kHz 4-bit IMA ADPCM ≈ 8000 B/s，每段至少按 1 秒步进保证严格递增。
+    i64::try_from((entry.size.unwrap_or(0) / 8_000).max(1)).unwrap_or(i64::MAX)
+}
+
+fn normalized_session_key(entry: &FileEntry) -> Option<String> {
+    let session = entry.session.as_deref()?;
+    let _seq = entry.seq?;
+    if !is_valid_session_id(session) {
+        return None;
+    }
+    Some(session.to_ascii_uppercase())
+}
+
+fn has_timeline_anomaly(group: &[&FileEntry]) -> bool {
+    group.windows(2).any(|pair| {
+        let prev = pair[0];
+        let curr = pair[1];
+        let (Some(prev_seq), Some(curr_seq)) = (prev.seq, curr.seq) else {
+            return false;
+        };
+        if curr_seq <= prev_seq {
+            return false;
+        }
+        let (Some(prev_start), Some(curr_start)) = (prev.start_at, curr.start_at) else {
+            return false;
+        };
+        let prev_dur = segment_duration_secs(prev);
+        curr_start < prev_start || curr_start < prev_start.saturating_add(prev_dur / 2)
+    })
+}
+
+/// 按录音会话重建时间轴，修复旧固件 24-bit RTC 1024s 回绕导致的长会议时间戳折叠。
+///
+/// - 按 `session`（8 位 hex，大小写无关归一）分组，同组严格按 `seq` 升序；
+/// - 若同组存在 `seq` 严格递增但 `start_at` 倒退（`< prev_start_at`）或前后折叠异常
+///   （`start_at < prev_start_at + prev_duration_secs / 2`），且首段具备可信 `start_at` 锚点，
+///   则按每段 `size / 8000` 秒（至少 1 秒）累加推算后续各段 `effective_start_at`，并标记
+///   `reconstructed = true`；
+/// - 正常单调递增会话与无有效 `(session, seq)` 的条目保持原 `start_at` 且 `reconstructed = false`。
+pub fn reconstruct_session_timeline(entries: &[FileEntry]) -> Vec<ReconstructedFileEntry> {
+    use std::collections::HashMap;
+
+    let mut groups: HashMap<String, Vec<(usize, &FileEntry)>> = HashMap::new();
+    for (idx, entry) in entries.iter().enumerate() {
+        if let Some(key) = normalized_session_key(entry) {
+            groups.entry(key).or_default().push((idx, entry));
+        }
+    }
+
+    let mut rebuilt_groups: HashMap<String, Vec<ReconstructedFileEntry>> =
+        HashMap::with_capacity(groups.len());
+    for (key, mut members) in groups {
+        members.sort_by_key(|(idx, entry)| (entry.seq.unwrap_or(u32::MAX), *idx));
+        let ordered: Vec<&FileEntry> = members.iter().map(|(_, entry)| *entry).collect();
+        let anomaly = has_timeline_anomaly(&ordered);
+        let anchor = ordered.first().and_then(|first| first.start_at);
+
+        let rebuilt = if anomaly && let Some(mut cursor) = anchor {
+            ordered
+                .into_iter()
+                .enumerate()
+                .map(|(pos, entry)| {
+                    let item = ReconstructedFileEntry {
+                        entry: entry.clone(),
+                        effective_start_at: Some(cursor),
+                        reconstructed: pos > 0,
+                    };
+                    cursor = cursor.saturating_add(segment_duration_secs(entry));
+                    item
+                })
+                .collect()
+        } else {
+            ordered
+                .into_iter()
+                .map(|entry| ReconstructedFileEntry {
+                    entry: entry.clone(),
+                    effective_start_at: entry.start_at,
+                    reconstructed: false,
+                })
+                .collect()
+        };
+        rebuilt_groups.insert(key, rebuilt);
+    }
+
+    let mut out = Vec::with_capacity(entries.len());
+    for entry in entries {
+        if let Some(key) = normalized_session_key(entry) {
+            if let Some(group_items) = rebuilt_groups.remove(&key) {
+                out.extend(group_items);
+            }
+        } else {
+            out.push(ReconstructedFileEntry {
+                entry: entry.clone(),
+                effective_start_at: entry.start_at,
+                reconstructed: false,
+            });
+        }
+    }
+    out
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct WifiNetwork {
     pub index: i32,
@@ -866,7 +981,7 @@ pub fn new_session_id() -> String {
 mod recording_stamp_tests {
     use super::{
         AccessPointFileEntry, FileEntry, RecordingSegmentName, RecordingStamp, is_valid_session_id,
-        new_session_id,
+        new_session_id, reconstruct_session_timeline,
     };
 
     #[test]
@@ -999,6 +1114,102 @@ mod recording_stamp_tests {
         assert!(!is_valid_session_id("A1B2C3D4 ")); // 含空格
         let id = new_session_id();
         assert!(is_valid_session_id(&id), "生成的编号应可通过校验: {id}");
+    }
+
+    #[test]
+    fn normal_monotonic_session_is_untouched_by_timeline_reconstruction() {
+        let base = 1_792_392_500_i64;
+        let entries = vec![
+            FileEntry {
+                index: 2,
+                name: Some("SEG002.APM".into()),
+                size: Some(4_800_000),
+                is_dir: Some(0),
+                session: Some("A1B2C3D4".into()),
+                seq: Some(2),
+                start_at: Some(base + 600),
+                synced: Some(true),
+                ..Default::default()
+            },
+            FileEntry {
+                index: 1,
+                name: Some("SEG001.APM".into()),
+                size: Some(4_800_000),
+                is_dir: Some(0),
+                session: Some("a1b2c3d4".into()),
+                seq: Some(1),
+                start_at: Some(base),
+                synced: Some(true),
+                ..Default::default()
+            },
+            FileEntry {
+                index: 3,
+                name: Some("LEGACY.APM".into()),
+                size: Some(16_000),
+                is_dir: Some(0),
+                start_at: Some(base - 1_000),
+                ..Default::default()
+            },
+        ];
+
+        let rebuilt = reconstruct_session_timeline(&entries);
+        assert_eq!(rebuilt.len(), 3);
+        assert_eq!(rebuilt[0].entry.seq, Some(1));
+        assert_eq!(rebuilt[1].entry.seq, Some(2));
+        assert_eq!(rebuilt[0].effective_start_at, Some(base));
+        assert_eq!(rebuilt[1].effective_start_at, Some(base + 600));
+        assert_eq!(rebuilt[2].effective_start_at, Some(base - 1_000));
+        assert!(rebuilt.iter().all(|item| !item.reconstructed));
+    }
+
+    #[test]
+    fn reconstructs_25_segment_1024s_wrapped_meeting_strictly_increasing() {
+        let anchor = 1_792_372_020_i64; // 09:07:00
+        let segment_secs = 600_u64;
+        let segment_bytes = segment_secs * 8_000;
+
+        // 构造 25 段（4 小时+）会议，固件 24-bit RTC 每 1024s 回绕折叠，且目录顺序打乱
+        let mut entries: Vec<FileEntry> = (1_u32..=25)
+            .map(|seq| {
+                let elapsed = i64::from(seq - 1) * segment_secs as i64;
+                let wrapped_start = anchor + (elapsed % 1024);
+                FileEntry {
+                    index: seq as i32,
+                    name: Some(format!("SEG_{seq:02}.APM")),
+                    size: Some(segment_bytes),
+                    is_dir: Some(0),
+                    session: Some(if seq % 2 == 0 { "abcd1234" } else { "ABCD1234" }.into()),
+                    seq: Some(seq),
+                    start_at: Some(wrapped_start),
+                    synced: Some(true),
+                    ..Default::default()
+                }
+            })
+            .collect();
+        entries.reverse();
+
+        let rebuilt = reconstruct_session_timeline(&entries);
+        assert_eq!(rebuilt.len(), 25);
+        assert!(!rebuilt[0].reconstructed);
+        assert_eq!(rebuilt[0].effective_start_at, Some(anchor));
+
+        let mut prev_ts = rebuilt[0].effective_start_at.unwrap();
+        for (idx, item) in rebuilt.iter().enumerate().skip(1) {
+            assert_eq!(item.entry.seq, Some((idx + 1) as u32));
+            assert!(
+                item.reconstructed,
+                "segment {} should be marked reconstructed",
+                idx + 1
+            );
+            let ts = item.effective_start_at.unwrap();
+            assert!(
+                ts > prev_ts,
+                "segment {} timestamp {ts} must strictly exceed prev {prev_ts}",
+                idx + 1
+            );
+            assert_eq!(ts, anchor + (idx as i64) * segment_secs as i64);
+            prev_ts = ts;
+        }
     }
 }
 

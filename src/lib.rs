@@ -18,7 +18,10 @@ pub mod transport;
 pub mod types;
 
 pub use access_point::AccessPointClient;
-pub use audio::{AdpcmDecoder, CHANNELS, PcmChunk, SAMPLE_RATE_HZ, wav_bytes};
+pub use audio::{
+    AdpcmDecoder, AudioProcessOptions, CHANNELS, PcmChunk, SAMPLE_RATE_HZ,
+    condition_speech_samples, process_pcm_samples, resample_linear_i16, wav_bytes,
+};
 pub use controls::{
     ButtonEvent, ButtonGesture, ChargeEdge, ControlAction, ControlBindings, ControlInput,
     SwitchPosition, ToggleSwitchEvent,
@@ -33,7 +36,10 @@ pub use dfu::{
     DfuPackage, DfuProgress, DfuReport, DfuStage, DfuTarget, DfuTransport, SharedDfuTransport,
 };
 pub use ota::{OTA_DEFAULT_API_BASE_URL, OTA_DEFAULT_INFO_PATH, OtaInfo, OtaModule};
-pub use recording::{RecordingFileName, SavedRecording, WavFile, apm_to_wav, recording_file_name};
+pub use recording::{
+    RecordingFileName, SavedRecording, WavFile, apm_to_wav, apm_to_wav_with_options,
+    recording_file_name,
+};
 pub use transport::{BleTransport, NotificationStream, SharedTransport};
 pub use types::*;
 

@@ -107,8 +107,7 @@ async fn main() {
                     .duration_since(UNIX_EPOCH)
                     .map(|d| d.as_secs())
                     .unwrap_or(0);
-                let elapsed_min =
-                    started.elapsed().map(|d| d.as_secs()).unwrap_or(0) as f64 / 60.0;
+                let elapsed_min = started.elapsed().map(|d| d.as_secs()).unwrap_or(0) as f64 / 60.0;
                 println!(
                     "[t+{elapsed_min:7.1}min] level={}%, voltage={}mV, adc_raw={}, charging={}",
                     b.level, b.voltage, b.adc_raw, b.is_charging
@@ -128,7 +127,7 @@ async fn main() {
         }
 
         tick += 1;
-        if tick % STATUS_CHECK_EVERY == 0 {
+        if tick.is_multiple_of(STATUS_CHECK_EVERY) {
             match device.record_status().await {
                 Ok(status) => println!("record_status: {status:?}"),
                 Err(error) => eprintln!("录音状态查询失败: {error}"),

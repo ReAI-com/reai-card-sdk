@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -6,10 +7,10 @@ use std::{
 use async_trait::async_trait;
 use btleplug::{
     api::{
-        Central, CharPropFlags, Characteristic, Manager as _, Peripheral as _, ScanFilter,
-        WriteType,
+        Central, CentralEvent, CharPropFlags, Characteristic, Manager as _, Peripheral as _,
+        ScanFilter, WriteType,
     },
-    platform::{Adapter, Manager, Peripheral},
+    platform::{Adapter, Manager, Peripheral, PeripheralId},
 };
 use futures::StreamExt;
 use tokio::time::sleep;
@@ -49,38 +50,94 @@ impl DeviceManager {
         Ok(Self { adapter })
     }
 
-    /// Scans the NUS service for `duration` and returns devices whose local name begins with `DYJ`.
+    /// Scans without controller-level UUID filtering for `duration` and matches DYJ devices in software.
+    ///
+    /// Windows WinRT drops ADV packets that carry `local_name` without the 128-bit NUS UUID when a
+    /// `ScanFilter { services }` is set, so we collect active peripheral IDs via `adapter.events()`
+    /// during the scan window and apply [`match_card_candidate`] on the merged peripheral properties.
     pub async fn scan(&self, duration: Duration) -> Result<Vec<DiscoveredDevice>> {
-        let service = parse_uuid(NUS_SERVICE_UUID)?;
-        tracing::info!(target: "dyj.ble", "🔍 开始扫描 duration={}ms service={service}", duration.as_millis());
-        self.adapter
-            .start_scan(ScanFilter {
-                services: vec![service],
+        let nus_uuid = parse_uuid(NUS_SERVICE_UUID)?;
+        tracing::info!(target: "dyj.ble", "🔍 开始扫描 duration={}ms service={nus_uuid}", duration.as_millis());
+        let devices = self
+            .scan_with(duration, |local_name, services| {
+                match_card_candidate(local_name, services, nus_uuid)
             })
+            .await?;
+        for device in &devices {
+            tracing::debug!(target: "dyj.ble", "🔍 发现设备 name={} id={} rssi={:?}", device.name, device.id, device.rssi);
+        }
+        tracing::info!(target: "dyj.ble", "🔍 扫描完成 共{}台DYJ设备", devices.len());
+        Ok(devices)
+    }
+
+    async fn scan_with(
+        &self,
+        duration: Duration,
+        mut matcher: impl FnMut(Option<&str>, &[Uuid]) -> Option<String>,
+    ) -> Result<Vec<DiscoveredDevice>> {
+        let events = match self.adapter.events().await {
+            Ok(stream) => Some(stream),
+            Err(error) => {
+                tracing::debug!(
+                    target: "dyj.ble",
+                    "⚠️ 获取 adapter.events() 失败，退回全量外设列表过滤: {error}"
+                );
+                None
+            }
+        };
+
+        self.adapter
+            .start_scan(ScanFilter::default())
             .await
             .map_err(transport_error)?;
-        sleep(duration).await;
+
+        let active_ids = match events {
+            Some(mut stream) => {
+                let mut ids = HashSet::new();
+                let deadline = tokio::time::Instant::now() + duration;
+                loop {
+                    match tokio::time::timeout_at(deadline, stream.next()).await {
+                        Ok(Some(event)) => {
+                            if let Some(id) = active_event_peripheral_id(&event) {
+                                ids.insert(id);
+                            }
+                        }
+                        Ok(None) => {
+                            tokio::time::sleep_until(deadline).await;
+                            break;
+                        }
+                        Err(_) => break,
+                    }
+                }
+                Some(ids)
+            }
+            None => {
+                sleep(duration).await;
+                None
+            }
+        };
+
         self.adapter.stop_scan().await.map_err(transport_error)?;
 
         let mut devices = Vec::new();
         for peripheral in self.adapter.peripherals().await.map_err(transport_error)? {
+            if let Some(ids) = active_ids.as_ref()
+                && !ids.contains(&peripheral.id())
+            {
+                continue;
+            }
             let Some(properties) = peripheral.properties().await.map_err(transport_error)? else {
                 continue;
             };
-            let Some(name) = properties.local_name else {
+            let Some(name) = matcher(properties.local_name.as_deref(), &properties.services) else {
                 continue;
             };
-            if !name.to_ascii_uppercase().starts_with("DYJ") {
-                continue;
-            }
-            tracing::debug!(target: "dyj.ble", "🔍 发现设备 name={name} id={} rssi={:?}", peripheral.id(), properties.rssi);
             devices.push(DiscoveredDevice {
                 id: peripheral.id().to_string(),
                 name,
                 rssi: properties.rssi,
             });
         }
-        tracing::info!(target: "dyj.ble", "🔍 扫描完成 共{}台DYJ设备", devices.len());
         Ok(devices)
     }
 
@@ -164,39 +221,18 @@ impl DeviceManager {
 
 impl DeviceManager {
     /// 扫描处于 DFU 模式的主控：bootloader 广播 Secure DFU 服务（`0xFE59`），
-    /// 名为 [`DFU_ADVERTISED_NAME`]。按服务 UUID 过滤，名字只作辅助。
+    /// 名为 [`DFU_ADVERTISED_NAME`]。使用无过滤扫描 + 应用层 [`match_dfu_candidate`]，
+    /// 避免 Windows 下 ADV/Scan Response 分包导致漏扫。
     pub async fn scan_dfu_targets(&self, duration: Duration) -> Result<Vec<DiscoveredDevice>> {
-        let service = parse_uuid(DFU_SERVICE_UUID)?;
+        let dfu_uuid = parse_uuid(DFU_SERVICE_UUID)?;
         tracing::info!(target: "dyj.dfu", "🔍 扫描 DFU 目标 duration={}ms", duration.as_millis());
-        self.adapter
-            .start_scan(ScanFilter {
-                services: vec![service],
+        let targets = self
+            .scan_with(duration, |local_name, services| {
+                match_dfu_candidate(local_name, services, dfu_uuid)
             })
-            .await
-            .map_err(transport_error)?;
-        sleep(duration).await;
-        self.adapter.stop_scan().await.map_err(transport_error)?;
-
-        let mut targets = Vec::new();
-        for peripheral in self.adapter.peripherals().await.map_err(transport_error)? {
-            let Some(properties) = peripheral.properties().await.map_err(transport_error)? else {
-                continue;
-            };
-            let advertises_dfu = properties.services.contains(&service);
-            let name = properties.local_name.unwrap_or_default();
-            if !advertises_dfu && !name.to_ascii_uppercase().starts_with("DFU") {
-                continue;
-            }
-            tracing::debug!(target: "dyj.dfu", "🔍 发现 DFU 目标 name={name} id={} rssi={:?}", peripheral.id(), properties.rssi);
-            targets.push(DiscoveredDevice {
-                id: peripheral.id().to_string(),
-                name: if name.is_empty() {
-                    DFU_ADVERTISED_NAME.to_owned()
-                } else {
-                    name
-                },
-                rssi: properties.rssi,
-            });
+            .await?;
+        for target in &targets {
+            tracing::debug!(target: "dyj.dfu", "🔍 发现 DFU 目标 name={} id={} rssi={:?}", target.name, target.id, target.rssi);
         }
         tracing::info!(target: "dyj.dfu", "🔍 扫描完成 共{}个 DFU 目标", targets.len());
         Ok(targets)
@@ -417,6 +453,69 @@ impl BleTransport for BtleplugTransport {
     }
 }
 
+fn starts_with_ignore_ascii_case(text: &str, prefix: &str) -> bool {
+    text.get(..prefix.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+}
+
+fn active_event_peripheral_id(event: &CentralEvent) -> Option<PeripheralId> {
+    match event {
+        CentralEvent::DeviceDiscovered(id)
+        | CentralEvent::DeviceUpdated(id)
+        | CentralEvent::DeviceServicesModified(id)
+        | CentralEvent::ManufacturerDataAdvertisement { id, .. }
+        | CentralEvent::ServiceDataAdvertisement { id, .. }
+        | CentralEvent::ServicesAdvertisement { id, .. }
+        | CentralEvent::RssiUpdate { id, .. } => Some(id.clone()),
+        CentralEvent::DeviceConnected(_)
+        | CentralEvent::DeviceDisconnected(_)
+        | CentralEvent::StateUpdate(_) => None,
+    }
+}
+
+/// 判断外设广播属性是否匹配正常 DYJ 录音卡，并返回展示名。
+///
+/// 规则：
+/// - 若 `local_name` 以 `DYJ` 开头（大小写不敏感）且不以 `DFU` 开头，直接返回原名；
+/// - 否则若 `services` 包含 `nus_uuid` 且名称不以 `DFU` 开头，返回非空 `local_name` 或兜底 `"DYJV2"`。
+pub(crate) fn match_card_candidate(
+    local_name: Option<&str>,
+    services: &[Uuid],
+    nus_uuid: Uuid,
+) -> Option<String> {
+    let non_empty_name = local_name.filter(|name| !name.trim().is_empty());
+    if non_empty_name.is_some_and(|name| starts_with_ignore_ascii_case(name, "DFU")) {
+        return None;
+    }
+    if let Some(name) = non_empty_name
+        && starts_with_ignore_ascii_case(name, "DYJ")
+    {
+        return Some(name.to_owned());
+    }
+    if services.contains(&nus_uuid) {
+        return Some(non_empty_name.unwrap_or("DYJV2").to_owned());
+    }
+    None
+}
+
+/// 判断外设广播属性是否匹配 DFU bootloader，并返回展示名。
+///
+/// 若 `services` 包含 `dfu_uuid` 或 `local_name` 以 `DFU` 开头（大小写不敏感），
+/// 返回非空 `local_name` 或兜底 [`DFU_ADVERTISED_NAME`]。
+pub(crate) fn match_dfu_candidate(
+    local_name: Option<&str>,
+    services: &[Uuid],
+    dfu_uuid: Uuid,
+) -> Option<String> {
+    let non_empty_name = local_name.filter(|name| !name.trim().is_empty());
+    let is_dfu_name = non_empty_name.is_some_and(|name| starts_with_ignore_ascii_case(name, "DFU"));
+    if services.contains(&dfu_uuid) || is_dfu_name {
+        Some(non_empty_name.unwrap_or(DFU_ADVERTISED_NAME).to_owned())
+    } else {
+        None
+    }
+}
+
 fn parse_uuid(value: &str) -> Result<Uuid> {
     Uuid::parse_str(value)
         .map_err(|error| SdkError::Transport(format!("invalid SDK UUID `{value}`: {error}")))
@@ -424,4 +523,97 @@ fn parse_uuid(value: &str) -> Result<Uuid> {
 
 fn transport_error(error: impl std::fmt::Display) -> SdkError {
     SdkError::Transport(error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn nus_uuid() -> Uuid {
+        parse_uuid(NUS_SERVICE_UUID).unwrap()
+    }
+
+    fn dfu_uuid() -> Uuid {
+        parse_uuid(DFU_SERVICE_UUID).unwrap()
+    }
+
+    #[test]
+    fn card_scan_matches_split_adv_and_scan_response_scenarios() {
+        let nus = nus_uuid();
+        let dfu = dfu_uuid();
+
+        // 仅 ADV 主包有设备名、未携带 NUS UUID（WinRT 分包常见场景）
+        assert_eq!(
+            match_card_candidate(Some("DYJV2_8A1B2C"), &[], nus),
+            Some("DYJV2_8A1B2C".to_owned())
+        );
+        // 大小写不敏感且保留原名
+        assert_eq!(
+            match_card_candidate(Some("dyjv2_lower"), &[], nus),
+            Some("dyjv2_lower".to_owned())
+        );
+
+        // 仅 Scan Response 有 NUS UUID、缺 local_name 或为空
+        assert_eq!(
+            match_card_candidate(None, &[nus], nus),
+            Some("DYJV2".to_owned())
+        );
+        assert_eq!(
+            match_card_candidate(Some(""), &[nus], nus),
+            Some("DYJV2".to_owned())
+        );
+        assert_eq!(
+            match_card_candidate(Some("   "), &[nus], nus),
+            Some("DYJV2".to_owned())
+        );
+
+        // 带自定义非空名称 + NUS UUID
+        assert_eq!(
+            match_card_candidate(Some("ReAI-Card-01"), &[nus], nus),
+            Some("ReAI-Card-01".to_owned())
+        );
+
+        // DFU 目标不得混入普通扫描，即使同时带了 NUS UUID
+        assert_eq!(match_card_candidate(Some("DFU_DYJ"), &[], nus), None);
+        assert_eq!(match_card_candidate(Some("dfu_dyj"), &[nus], nus), None);
+        assert_eq!(
+            match_card_candidate(Some("DFU_DYJ"), &[nus, dfu], nus),
+            None
+        );
+
+        // 无关 BLE 设备必须被过滤
+        assert_eq!(match_card_candidate(Some("AirPods Pro"), &[], nus), None);
+        assert_eq!(match_card_candidate(Some("Other"), &[dfu], nus), None);
+        assert_eq!(match_card_candidate(None, &[], nus), None);
+    }
+
+    #[test]
+    fn dfu_scan_matches_uuid_or_prefix_and_filters_unrelated() {
+        let nus = nus_uuid();
+        let dfu = dfu_uuid();
+
+        // 仅 UUID 无名字 -> 兜底 DFU_ADVERTISED_NAME
+        assert_eq!(
+            match_dfu_candidate(None, &[dfu], dfu),
+            Some(DFU_ADVERTISED_NAME.to_owned())
+        );
+        assert_eq!(
+            match_dfu_candidate(Some(""), &[dfu], dfu),
+            Some(DFU_ADVERTISED_NAME.to_owned())
+        );
+
+        // 仅名字无 UUID（ADV/Scan Response 分包）
+        assert_eq!(
+            match_dfu_candidate(Some("DFU_DYJ"), &[], dfu),
+            Some("DFU_DYJ".to_owned())
+        );
+        assert_eq!(
+            match_dfu_candidate(Some("dfu_target"), &[], dfu),
+            Some("dfu_target".to_owned())
+        );
+
+        // 普通 DYJ 设备与无关设备不匹配
+        assert_eq!(match_dfu_candidate(Some("DYJV2_123456"), &[nus], dfu), None);
+        assert_eq!(match_dfu_candidate(Some("Random"), &[], dfu), None);
+    }
 }
