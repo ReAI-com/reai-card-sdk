@@ -20,6 +20,9 @@ pub struct DeviceInfo {
     pub timestamp: i64,
     pub wifi_version: Option<String>,
     pub wifi_version_code: Option<u32>,
+    /// 设备端声明的录音采样率（Hz，固件支持后携带；旧固件为 `None`）。
+    #[serde(default, alias = "sample_rate")]
+    pub sample_rate: Option<u32>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
@@ -419,6 +422,9 @@ pub struct FileEntry {
     pub start_at: Option<i64>,
     /// 录音时设备时钟是否已同步（与 `start_at` 同时携带；`false` 时时间不是真实日期）。
     pub synced: Option<bool>,
+    /// 录音段实际采样率（Hz，来自同名 `.txt` 元数据或固件列表；如 `16000` 或历史固件 `15578`）。
+    #[serde(default, alias = "sampleRate")]
+    pub sample_rate: Option<u32>,
 }
 
 impl FileEntry {
@@ -1160,6 +1166,32 @@ mod recording_stamp_tests {
         assert_eq!(rebuilt[1].effective_start_at, Some(base + 600));
         assert_eq!(rebuilt[2].effective_start_at, Some(base - 1_000));
         assert!(rebuilt.iter().all(|item| !item.reconstructed));
+    }
+
+    #[test]
+    fn parses_sample_rate_metadata_with_snake_and_camel_aliases() {
+        let entry_snake: FileEntry =
+            serde_json::from_str(r#"{"index":0,"name":"A.APM","sample_rate":15578}"#).unwrap();
+        assert_eq!(entry_snake.sample_rate, Some(15_578));
+
+        let entry_camel: FileEntry =
+            serde_json::from_str(r#"{"index":1,"name":"B.APM","sampleRate":16000}"#).unwrap();
+        assert_eq!(entry_camel.sample_rate, Some(16_000));
+
+        let entry_none: FileEntry = serde_json::from_str(r#"{"index":2,"name":"C.APM"}"#).unwrap();
+        assert_eq!(entry_none.sample_rate, None);
+
+        let info_camel: super::DeviceInfo = serde_json::from_str(
+            r#"{"version":"0.3.20","versionCode":320,"deviceId":"id","deviceName":"DYJV2","timestamp":1,"sampleRate":16000}"#,
+        )
+        .unwrap();
+        assert_eq!(info_camel.sample_rate, Some(16_000));
+
+        let info_snake: super::DeviceInfo = serde_json::from_str(
+            r#"{"version":"0.3.19","versionCode":319,"deviceId":"id","deviceName":"DYJV2","timestamp":1,"sample_rate":15578}"#,
+        )
+        .unwrap();
+        assert_eq!(info_snake.sample_rate, Some(15_578));
     }
 
     #[test]

@@ -104,6 +104,11 @@ pub async fn apm_to_wav(apm: &Path, wav: &Path) -> Result<WavFile> {
 }
 
 /// 离线转换（带预处理与重采样选项）：固件 `.apm` → 16kHz/16bit 单声道 WAV。
+///
+/// 当 `.txt` 旁车或 [`crate::FileEntry::sample_rate`] 含 `sample_rate`（如 `16000` vs `15578`）
+/// 时，推荐将其传入 `options.source_sample_rate_hz`（或使用
+/// `AudioProcessOptions::conditioned_for_asr().with_source_sample_rate(entry.sample_rate)`），
+/// 从而对 `16000` Hz 新固件零拷贝跳过重采样、对 `15578` Hz 历史固件自动线性校正到 16kHz。
 pub async fn apm_to_wav_with_options(
     apm: &Path,
     wav: &Path,
@@ -233,14 +238,24 @@ mod tests {
         let conditioned = apm_to_wav_with_options(
             &apm,
             &dir.join("rec_conditioned.wav"),
-            &AudioProcessOptions {
-                source_sample_rate_hz: Some(15_578),
-                remove_dc_and_normalize: true,
-            },
+            &AudioProcessOptions::conditioned_for_asr().with_source_sample_rate(Some(15_578)),
         )
         .await
         .unwrap();
         assert_eq!(conditioned.samples, 1_643);
+
+        // 当旁车元数据显式上报 sample_rate = 16000 时，跳过重采样并保持原始样本数
+        let entry_16k: crate::FileEntry =
+            serde_json::from_str(r#"{"index":0,"name":"rec.apm","sample_rate":16000}"#).unwrap();
+        let wav_16k = apm_to_wav_with_options(
+            &apm,
+            &dir.join("rec_16k.wav"),
+            &AudioProcessOptions::conditioned_for_asr()
+                .with_source_sample_rate(entry_16k.sample_rate),
+        )
+        .await
+        .unwrap();
+        assert_eq!(wav_16k.samples, 1_600);
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 }

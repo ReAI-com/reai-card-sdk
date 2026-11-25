@@ -990,6 +990,59 @@ impl DyjDevice {
         self.config_value("ota_path").await
     }
 
+    /// 读取设备麦克风增益档位配置（`mic_gain`；未配置返回 `None`）。
+    pub async fn mic_gain(&self) -> Result<Option<String>> {
+        self.config_value("mic_gain").await
+    }
+
+    /// 设置设备麦克风增益档位配置（`mic_gain`，例如 `"near"` / `"meeting"` 或增益 dB 值）。
+    pub async fn set_mic_gain(&self, mode: &str) -> Result<CommandResponse> {
+        let mode = mode.trim();
+        if mode.is_empty() {
+            return Err(SdkError::InvalidCommand(
+                "mic_gain mode must not be empty".into(),
+            ));
+        }
+        self.set_config("mic_gain", mode).await
+    }
+
+    /// 读取静音超时自动停录分钟数（`silence_stop_min`；`None` 表示未配置，`Some(0)` 表示关闭）。
+    pub async fn silence_stop_minutes(&self) -> Result<Option<u32>> {
+        let Some(raw) = self.config_value("silence_stop_min").await? else {
+            return Ok(None);
+        };
+        let mins = raw.trim().parse::<u32>().map_err(|error| {
+            SdkError::InvalidFrame(format!("invalid `silence_stop_min` value `{raw}`: {error}"))
+        })?;
+        Ok(Some(mins))
+    }
+
+    /// 设置连续静音超时自动停录分钟数（`silence_stop_min`；`0` 关闭，如 `30` 表示静音 30 分钟后停录）。
+    pub async fn set_silence_stop_minutes(&self, minutes: u32) -> Result<CommandResponse> {
+        self.set_config("silence_stop_min", &minutes.to_string())
+            .await
+    }
+
+    /// 读取「仅本机」隐私模式开关（`local_only`；未配置返回 `None`）。
+    pub async fn local_only(&self) -> Result<Option<bool>> {
+        let Some(raw) = self.config_value("local_only").await? else {
+            return Ok(None);
+        };
+        match raw.trim() {
+            "1" | "true" | "TRUE" | "yes" | "on" => Ok(Some(true)),
+            "0" | "false" | "FALSE" | "no" | "off" => Ok(Some(false)),
+            other => Err(SdkError::InvalidFrame(format!(
+                "invalid `local_only` value `{other}`"
+            ))),
+        }
+    }
+
+    /// 设置「仅本机」隐私模式（`local_only`：`1`/`0`；开启后固件拒绝云端上传，仅保留本地导出）。
+    pub async fn set_local_only(&self, enabled: bool) -> Result<CommandResponse> {
+        self.set_config("local_only", if enabled { "1" } else { "0" })
+            .await
+    }
+
     /// 原样返回 `CONFIG_GET` 响应；nRF 侧键不存在时固件回错误（`code 3`）。
     /// 只想拿值请用 [`Self::config_value`]。
     pub async fn get_config(&self, key: &str) -> Result<Value> {
@@ -2914,6 +2967,46 @@ mod tests {
             .unwrap();
         assert!(device.clear_config("api_url").await.unwrap());
         assert_eq!(device.sta_api_base_url().await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn typed_device_settings_round_trip_through_kv_config() {
+        let transport = Arc::new(MockTransport::new());
+        let device = DyjDevice::from_transport(transport.clone()).await.unwrap();
+
+        assert_eq!(device.mic_gain().await.unwrap(), None);
+        assert_eq!(device.silence_stop_minutes().await.unwrap(), None);
+        assert_eq!(device.local_only().await.unwrap(), None);
+
+        assert!(matches!(
+            device.set_mic_gain("   ").await,
+            Err(SdkError::InvalidCommand(_))
+        ));
+
+        device.set_mic_gain("meeting").await.unwrap();
+        device.set_silence_stop_minutes(30).await.unwrap();
+        device.set_local_only(true).await.unwrap();
+
+        assert_eq!(device.mic_gain().await.unwrap().as_deref(), Some("meeting"));
+        assert_eq!(device.silence_stop_minutes().await.unwrap(), Some(30));
+        assert_eq!(device.local_only().await.unwrap(), Some(true));
+
+        device.set_silence_stop_minutes(0).await.unwrap();
+        device.set_local_only(false).await.unwrap();
+        assert_eq!(device.silence_stop_minutes().await.unwrap(), Some(0));
+        assert_eq!(device.local_only().await.unwrap(), Some(false));
+
+        // 异常字符值应返回 InvalidFrame 而非静默忽略
+        device.set_config("silence_stop_min", "abc").await.unwrap();
+        assert!(matches!(
+            device.silence_stop_minutes().await,
+            Err(SdkError::InvalidFrame(_))
+        ));
+        device.set_config("local_only", "maybe").await.unwrap();
+        assert!(matches!(
+            device.local_only().await,
+            Err(SdkError::InvalidFrame(_))
+        ));
     }
 
     #[tokio::test]

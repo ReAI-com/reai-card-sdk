@@ -115,10 +115,14 @@ impl AdpcmDecoder {
 /// 默认值 [`AudioProcessOptions::default()`] 不做重采样也不做归一化，
 /// 保持 [`crate::apm_to_wav`] 原有解码行为 100% 不变；
 /// 面向 ASR / VAD 预处理时使用 [`AudioProcessOptions::conditioned_for_asr()`]。
+/// 当 `.txt` 旁车或 [`crate::FileEntry::sample_rate`] / [`crate::DeviceInfo::sample_rate`]
+/// 携带 `sample_rate`（例如新固件 `16000` 或历史固件 `15578`）时，可通过
+/// [`Self::with_source_sample_rate`] 优先按其值判定是否需要重采样。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct AudioProcessOptions {
     /// 源采样率（Hz）；`None` 或等于 [`SAMPLE_RATE_HZ`] 时不做重采样。
-    /// 例如历史固件（<= 0.3.19）实际采样率约 `15578` Hz，可在此传入以线性重采样到 16kHz。
+    /// 例如历史固件（<= 0.3.19）实际采样率约 `15578` Hz，可在此传入以线性重采样到 16kHz；
+    /// 若 `.txt` 元数据或固件上报 `16000`，则自动跳过重采样。
     pub source_sample_rate_hz: Option<u32>,
     /// 是否执行一阶高通去直流、噪声门控语音增益与软限幅。
     pub remove_dc_and_normalize: bool,
@@ -131,6 +135,13 @@ impl AudioProcessOptions {
             source_sample_rate_hz: None,
             remove_dc_and_normalize: true,
         }
+    }
+
+    /// 绑定源采样率（通常直接传入 `.txt` 旁车或 `FileEntry.sample_rate`）；
+    /// 当值为 `None` 或 `Some(16000)` 时跳过重采样，为 `Some(15578)` 等非 16kHz 值时自动重采样。
+    pub const fn with_source_sample_rate(mut self, sample_rate_hz: Option<u32>) -> Self {
+        self.source_sample_rate_hz = sample_rate_hz;
+        self
     }
 }
 
