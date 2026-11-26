@@ -3,6 +3,19 @@
 版本号独立于主控固件（nRF `v0.3.x` / WiFi `v0.0.x`）；SDK 与固件的协议对应关系见
 [`docs/protocol-support.md`](docs/protocol-support.md)。
 
+## 0.0.10（2026-11-26）
+
+配套固件：兼容历史主控 `<=0.3.19`（支持频偏与 1024s 回绕补偿），推荐搭配主控 `0.3.20` + Wi-Fi `0.1.5`。
+
+**修复与新增**：
+
+- **Windows 11 BLE 扫描修复**：`DeviceManager::scan` / `scan_dfu_targets` 统一使用 `ScanFilter::default()` + `adapter.events()` 聚合与纯函数匹配（`match_card_candidate` / `match_dfu_candidate`），解决 Windows WinRT 按 UUID 过滤丢弃广播名导致返回 0 台的问题。
+- **音频预处理、历史采样率重采样与元数据透传**：`DeviceInfo` 与 `FileEntry` 新增 `sample_rate: Option<u32>`；新增 `AudioProcessOptions`、`condition_speech_samples`（去直流 + 噪声门控语音增益 + 软限幅）、`resample_linear_i16`、`process_pcm_samples`、`apm_to_wav_with_options`。
+- **24-bit RTC 1024s 回绕时间轴重建**：新增 `reconstruct_session_timeline` 与 `ReconstructedFileEntry`，按 `session` + `seq` 修复倒退切片的 `effective_start_at`。
+- **类型化设备配置**：`DyjDevice` 新增 `mic_gain` / `set_mic_gain`、`silence_stop_minutes` / `set_silence_stop_minutes`、`local_only` / `set_local_only`。
+- **`dyj_cli --json` 与 `decode` 增强**：支持全局 `--json` 结构化输出，以及 `decode --normalize --source-rate <hz>`。
+- **官方 Python 绑定子包 `python/`**：基于 PyO3 `abi3-py310` + `maturin`，暴露扫描、连接、文件/时间轴重建、音频转码调理与 AP 快传客户端。
+
 ## 0.0.9（2026-11-12）
 
 配套固件不变（主控 ≥0.3.13 / WiFi 0.1.4）。**纯工具与诊断增强，库 API 无变化**，0.0.8 消费方无需升级。

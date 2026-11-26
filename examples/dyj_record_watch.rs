@@ -64,7 +64,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 若仍在录，取一次最旧文件再停
     if device.record_status().await?.is_recording {
         println!("\n📄 录音中 take_oldest…");
-        match device.take_oldest_file_to_dir("downloads-segment-test").await {
+        match device
+            .take_oldest_file_to_dir("downloads-segment-test")
+            .await
+        {
             Ok(saved) => println!(
                 "  取到 {:?}（{} 字节）→ {}",
                 saved.device_name,

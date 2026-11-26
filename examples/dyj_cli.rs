@@ -13,12 +13,13 @@
 //!
 //! 连接期间会起一个事件打印任务，按键/开关/录音状态等主动上报会实时打到 stdout。
 
-use std::time::Duration;
+use std::{path::Path, time::Duration};
 
 use reai_card_sdk::{
-    ControlAction, ControlBindings, ControlInput, DeviceEvent, DeviceManager, DfuOptions,
-    DfuPackage, DfuProgress, DfuStage, DisplayShowRequest, DyjDevice, LedState, OtaInfo, OtaModule,
-    SdkError,
+    AudioProcessOptions, ControlAction, ControlBindings, ControlInput, DeviceEvent, DeviceManager,
+    DfuOptions, DfuPackage, DfuProgress, DfuStage, DisplayShowRequest, DyjDevice, LedState,
+    OtaInfo, OtaModule, SAMPLE_RATE_HZ, SdkError, apm_to_wav_with_options,
+    reconstruct_session_timeline,
 };
 use serde_json::Value;
 
@@ -31,26 +32,37 @@ const DEFAULT_SCAN_SECS: u64 = 5;
 async fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let (global, command) = split_globals(&args);
-    common::init_tracing(global.verbosity);
+    if global.json {
+        common::init_tracing_stderr(global.verbosity);
+    } else {
+        common::init_tracing(global.verbosity);
+    }
     let result = run(&global, &command).await;
     if let Err(error) = result {
-        eprintln!("error: {error}");
+        if global.json {
+            eprintln!("{}", serde_json::json!({ "error": error.to_string() }));
+        } else {
+            eprintln!("error: {error}");
+        }
         std::process::exit(1);
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
 struct Globals {
     id: Option<String>,
     scan_secs: u64,
     verbosity: u8,
+    json: bool,
 }
 
-/// 把 `--id x` / `--seconds n` / `--verbose` / `--trace` 从子命令参数里摘出来。
+/// 把 `--id x` / `--seconds n` / `--verbose` / `--trace` / `--json` 从子命令参数里摘出来。
 fn split_globals(args: &[String]) -> (Globals, Vec<String>) {
     let mut globals = Globals {
         id: None,
         scan_secs: DEFAULT_SCAN_SECS,
         verbosity: 0,
+        json: false,
     };
     let mut command = Vec::new();
     let mut iter = args.iter();
@@ -65,6 +77,7 @@ fn split_globals(args: &[String]) -> (Globals, Vec<String>) {
             }
             "--verbose" => globals.verbosity = globals.verbosity.max(1),
             "--trace" => globals.verbosity = 2,
+            "--json" => globals.json = true,
             _ => command.push(arg.clone()),
         }
     }
@@ -79,8 +92,8 @@ fn usage() {
   info | state | battery | storage  查询类
   record start|stop|toggle|status|mark | realtime on|off
   realtime <seconds> [output.wav]   开始实时录音并收流 N 秒（Ctrl-C 中止），可选保存 16k 单声道 WAV
-  decode <in.apm> <out.wav>         离线把录音 .apm（IMA ADPCM）转成 16k 单声道 WAV，不需要设备
-  files [folder]                    FILE_LIST
+  decode <in.apm> <out.wav> [--normalize] [--source-rate <hz>]  离线把录音 .apm 转成 16k 单声道 WAV，不需要设备
+  files [folder]                    FILE_LIST（--json 时附带重建后的时间轴）
   take <name> <output>              FILE_UPLOAD（取走语义：设备会删源文件，先写 .part 再改名）
   delete <filename> | clear-files   删除类（clear-files 会删根目录全部文件）
   wifi open|close|status|scan|disconnect | wifi connect <ssid> <password>
@@ -111,7 +124,7 @@ fn usage() {
   events                             挂机只打印主动上报事件（Ctrl-C 退出）
   raw <CMD> [json]                  发送任意协议命令
 
-global options: --id <device-id>  --seconds <scan-secs>  --verbose(调试日志)  --trace(字节级)"
+global options: --id <device-id>  --seconds <scan-secs>  --json(结构化JSON输出)  --verbose(调试日志)  --trace(字节级)"
     );
 }
 
@@ -122,7 +135,7 @@ async fn run(globals: &Globals, command: &[String]) -> reai_card_sdk::Result<()>
     };
     // 离线命令：不需要蓝牙适配器
     if first == "decode" {
-        return decode(&command[1..]).await;
+        return decode(&command[1..], globals.json).await;
     }
 
     // 不需要设备的在线命令
@@ -138,13 +151,16 @@ async fn run(globals: &Globals, command: &[String]) -> reai_card_sdk::Result<()>
 
     let manager = DeviceManager::new().await?;
     if first == "scan" {
-        return scan(&manager, globals.scan_secs).await;
+        return scan(&manager, globals.scan_secs, globals.json).await;
     }
     // bootloader 不提供 NUS，这两条直接找 DFU_DYJ，不走普通连接
     if first == "dfu-scan" {
         let targets = manager
             .scan_dfu_targets(Duration::from_secs(globals.scan_secs))
             .await?;
+        if globals.json {
+            return print_json(serde_json::to_value(&targets)?);
+        }
         println!("{} DFU target(s)", targets.len());
         for target in &targets {
             println!("{}  name={} rssi={:?}", target.id, target.name, target.rssi);
@@ -160,13 +176,15 @@ async fn run(globals: &Globals, command: &[String]) -> reai_card_sdk::Result<()>
             .into_iter()
             .next()
             .ok_or_else(|| reai_card_sdk::SdkError::DeviceNotFound("DFU_DYJ".into()))?;
-        println!("connecting DFU target {} ({}) ...", target.name, target.id);
+        if !globals.json {
+            println!("connecting DFU target {} ({}) ...", target.name, target.id);
+        }
         let dfu = manager.connect_dfu(&target).await?;
         let report = dfu
-            .upload(&package, &options, dfu_progress_printer())
+            .upload(&package, &options, dfu_progress_printer(globals.json))
             .await?;
         let _ = dfu.disconnect().await;
-        return print_dfu_report(&report);
+        return print_dfu_report(&report, globals.json);
     }
 
     let device = connect(&manager, globals).await?;
@@ -183,27 +201,36 @@ async fn run(globals: &Globals, command: &[String]) -> reai_card_sdk::Result<()>
             let files = device
                 .list_files(rest.first().map(|value| value.as_str()))
                 .await?;
-            println!("{} entries", files.len());
-            print_json(serde_json::to_value(files)?)?;
+            if globals.json {
+                let timeline = reconstruct_session_timeline(&files);
+                print_json(serde_json::to_value(timeline)?)?;
+            } else {
+                println!("{} entries", files.len());
+                print_json(serde_json::to_value(files)?)?;
+            }
             Ok(())
         }
-        "take" => take(&device, rest).await,
-        "take-oldest" => take_oldest(&device, rest).await,
+        "take" => take(&device, rest, globals.json).await,
+        "take-oldest" => take_oldest(&device, rest, globals.json).await,
         "delete" => {
             let name = required(rest, 0, "filename")?;
             print_json(serde_json::to_value(device.delete_file(name).await?)?)
         }
         "clear-files" => {
             let files = device.clear_files().await?;
-            println!("cleared {} entries", files.len());
+            if globals.json {
+                print_json(serde_json::to_value(files)?)?;
+            } else {
+                println!("cleared {} entries", files.len());
+            }
             Ok(())
         }
-        "wifi" => wifi(&device, rest).await,
-        "ap" => ap(&device, rest).await,
-        "uploads" => uploads(&device, rest).await,
+        "wifi" => wifi(&device, rest, globals.json).await,
+        "ap" => ap(&device, rest, globals.json).await,
+        "uploads" => uploads(&device, rest, globals.json).await,
         "config" => config(&device, rest).await,
-        "controls" => controls(&device, rest).await,
-        "sync" => sync(&device, rest).await,
+        "controls" => controls(&device, rest, globals.json).await,
+        "sync" => sync(&device, rest, globals.json).await,
         "creds" => creds(&device, rest).await,
         "led" => {
             let state: LedState = required(rest, 0, "state (on/off/toggle)")?.parse()?;
@@ -236,7 +263,7 @@ async fn run(globals: &Globals, command: &[String]) -> reai_card_sdk::Result<()>
                     .into(),
             )),
         },
-        "ota" => ota(&device, rest).await,
+        "ota" => ota(&device, rest, globals.json).await,
         "auth" => auth(&device, rest).await,
         "restart" => print_json(serde_json::to_value(device.restart().await?)?),
         "shutdown" => print_json(serde_json::to_value(device.shutdown().await?)?),
@@ -245,17 +272,24 @@ async fn run(globals: &Globals, command: &[String]) -> reai_card_sdk::Result<()>
             Some(path) => {
                 let package = DfuPackage::from_zip_path(path)?;
                 let options = dfu_options(rest.get(1), rest.get(2))?;
-                println!(
-                    "updating main firmware: init {} B, image {} B, packet {} B, prn {}",
-                    package.init_packet.len(),
-                    package.firmware.len(),
-                    options.packet_size,
-                    options.prn
-                );
+                if !globals.json {
+                    println!(
+                        "updating main firmware: init {} B, image {} B, packet {} B, prn {}",
+                        package.init_packet.len(),
+                        package.firmware.len(),
+                        options.packet_size,
+                        options.prn
+                    );
+                }
                 let report = manager
-                    .update_main_firmware(&device, &package, &options, dfu_progress_printer())
+                    .update_main_firmware(
+                        &device,
+                        &package,
+                        &options,
+                        dfu_progress_printer(globals.json),
+                    )
                     .await?;
-                print_dfu_report(&report)
+                print_dfu_report(&report, globals.json)
             }
         },
         "events" => {
@@ -272,6 +306,11 @@ async fn run(globals: &Globals, command: &[String]) -> reai_card_sdk::Result<()>
             print_json(device.raw_command(name, payload).await?)
         }
         other => {
+            if globals.json {
+                return Err(SdkError::InvalidCommand(format!(
+                    "unknown command `{other}`"
+                )));
+            }
             println!("unknown command `{other}`");
             usage();
             Ok(())
@@ -279,8 +318,11 @@ async fn run(globals: &Globals, command: &[String]) -> reai_card_sdk::Result<()>
     }
 }
 
-async fn scan(manager: &DeviceManager, secs: u64) -> reai_card_sdk::Result<()> {
+async fn scan(manager: &DeviceManager, secs: u64, json: bool) -> reai_card_sdk::Result<()> {
     let devices = manager.scan(Duration::from_secs(secs)).await?;
+    if json {
+        return print_json(serde_json::to_value(&devices)?);
+    }
     if devices.is_empty() {
         println!("no DYJ device found in {secs}s");
         return Ok(());
@@ -308,18 +350,26 @@ async fn connect(manager: &DeviceManager, globals: &Globals) -> reai_card_sdk::R
     .ok_or_else(|| {
         reai_card_sdk::SdkError::DeviceNotFound(globals.id.clone().unwrap_or_default())
     })?;
-    println!("connecting {} ({}) ...", found.name, found.id);
+    if !globals.json {
+        println!("connecting {} ({}) ...", found.name, found.id);
+    }
     let device = manager.connect(found).await?;
-    spawn_event_printer(&device);
+    spawn_event_printer(&device, globals.json);
     Ok(device)
 }
 
-fn spawn_event_printer(device: &DyjDevice) {
+fn spawn_event_printer(device: &DyjDevice, json_to_stderr: bool) {
     let mut events = device.subscribe_events();
     tokio::spawn(async move {
         loop {
             match events.recv().await {
-                Ok(event) => println!("event: {}", summarize(event)),
+                Ok(event) => {
+                    if json_to_stderr {
+                        eprintln!("event: {}", summarize(event));
+                    } else {
+                        println!("event: {}", summarize(event));
+                    }
+                }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(count)) => {
                     eprintln!("event printer lagged by {count}");
                 }
@@ -473,33 +523,104 @@ async fn realtime_stream(device: &DyjDevice, rest: &[String]) -> reai_card_sdk::
     result
 }
 
-/// `decode <in.apm> <out.wav>`：固件录音是裸 IMA ADPCM 流，离线解码成可播放的 WAV。
-async fn decode(rest: &[String]) -> reai_card_sdk::Result<()> {
-    let input = required(rest, 0, "input .apm")?;
-    let output = required(rest, 1, "output .wav")?;
-    let adpcm = tokio::fs::read(input).await?;
-    let samples = reai_card_sdk::AdpcmDecoder::new().decode(&adpcm);
-    tokio::fs::write(
+#[derive(Debug, PartialEq, Eq)]
+struct DecodeArgs {
+    input: String,
+    output: String,
+    options: AudioProcessOptions,
+}
+
+fn parse_decode_args(rest: &[String]) -> reai_card_sdk::Result<DecodeArgs> {
+    let mut options = AudioProcessOptions::default();
+    let mut positional = Vec::new();
+    let mut iter = rest.iter();
+    while let Some(arg) = iter.next() {
+        if arg == "--normalize" {
+            options.remove_dc_and_normalize = true;
+        } else if arg == "--source-rate" {
+            let raw = iter.next().ok_or_else(|| {
+                SdkError::InvalidCommand("missing value for `--source-rate`".into())
+            })?;
+            let hz: u32 = raw.parse().map_err(|_| {
+                SdkError::InvalidCommand(format!("invalid `--source-rate` `{raw}`"))
+            })?;
+            if hz == 0 {
+                return Err(SdkError::InvalidCommand(
+                    "`--source-rate` must be greater than 0".into(),
+                ));
+            }
+            options.source_sample_rate_hz = Some(hz);
+        } else if let Some(raw) = arg.strip_prefix("--source-rate=") {
+            let hz: u32 = raw.parse().map_err(|_| {
+                SdkError::InvalidCommand(format!("invalid `--source-rate` `{raw}`"))
+            })?;
+            if hz == 0 {
+                return Err(SdkError::InvalidCommand(
+                    "`--source-rate` must be greater than 0".into(),
+                ));
+            }
+            options.source_sample_rate_hz = Some(hz);
+        } else if arg.starts_with("--") {
+            return Err(SdkError::InvalidCommand(format!(
+                "unknown decode option `{arg}`"
+            )));
+        } else {
+            positional.push(arg.clone());
+        }
+    }
+    let input = required(&positional, 0, "input .apm")?.to_owned();
+    let output = required(&positional, 1, "output .wav")?.to_owned();
+    Ok(DecodeArgs {
+        input,
         output,
-        reai_card_sdk::wav_bytes(&samples, reai_card_sdk::SAMPLE_RATE_HZ),
+        options,
+    })
+}
+
+/// `decode <in.apm> <out.wav> [--normalize] [--source-rate <hz>]`：固件录音是裸 IMA ADPCM 流，离线解码成可播放的 WAV。
+async fn decode(rest: &[String], json: bool) -> reai_card_sdk::Result<()> {
+    let args = parse_decode_args(rest)?;
+    let wav = apm_to_wav_with_options(
+        Path::new(&args.input),
+        Path::new(&args.output),
+        &args.options,
     )
     .await?;
+    if json {
+        return print_json(serde_json::json!({
+            "input": args.input,
+            "output": wav.path,
+            "samples": wav.samples,
+            "sample_rate_hz": SAMPLE_RATE_HZ,
+            "duration_secs": wav.duration_secs(),
+            "normalized": args.options.remove_dc_and_normalize,
+            "source_sample_rate_hz": args.options.source_sample_rate_hz,
+        }));
+    }
     println!(
-        "decoded {} bytes ADPCM -> {} samples ({:.2}s @16kHz) -> {output}",
-        adpcm.len(),
-        samples.len(),
-        samples.len() as f64 / reai_card_sdk::SAMPLE_RATE_HZ as f64
+        "decoded {} -> {} samples ({:.2}s @16kHz) -> {}",
+        args.input,
+        wav.samples,
+        wav.duration_secs(),
+        args.output
     );
     Ok(())
 }
 
-async fn take(device: &DyjDevice, rest: &[String]) -> reai_card_sdk::Result<()> {
+async fn take(device: &DyjDevice, rest: &[String], json: bool) -> reai_card_sdk::Result<()> {
     let name = required(rest, 0, "file name")?;
     let output = required(rest, 1, "output path")?;
     let part = format!("{output}.part");
     let mut writer = tokio::fs::File::create(&part).await?;
     let result = device.take_file_to(name, &mut writer).await?;
     tokio::fs::rename(&part, output).await?;
+    if json {
+        return print_json(serde_json::json!({
+            "name": result.name,
+            "output": output,
+            "bytes_written": result.bytes_written,
+        }));
+    }
     println!(
         "took {} bytes (device file `{}` removed) -> {output}",
         result.bytes_written, result.name
@@ -508,7 +629,7 @@ async fn take(device: &DyjDevice, rest: &[String]) -> reai_card_sdk::Result<()> 
 }
 
 /// `take-oldest [output]`：FILE_UPLOAD_OLDEST，设备自选最旧的（非正在录的）.APM。
-async fn take_oldest(device: &DyjDevice, rest: &[String]) -> reai_card_sdk::Result<()> {
+async fn take_oldest(device: &DyjDevice, rest: &[String], json: bool) -> reai_card_sdk::Result<()> {
     let output = match rest.first() {
         Some(path) => path.clone(),
         None => "oldest.apm".to_owned(),
@@ -517,6 +638,13 @@ async fn take_oldest(device: &DyjDevice, rest: &[String]) -> reai_card_sdk::Resu
     let mut writer = tokio::fs::File::create(&part).await?;
     let result = device.take_oldest_file_to(&mut writer).await?;
     tokio::fs::rename(&part, &output).await?;
+    if json {
+        return print_json(serde_json::json!({
+            "name": result.name,
+            "output": output,
+            "bytes_written": result.bytes_written,
+        }));
+    }
     println!(
         "took {} bytes (device file `{}` removed) -> {output}",
         result.bytes_written, result.name
@@ -524,13 +652,16 @@ async fn take_oldest(device: &DyjDevice, rest: &[String]) -> reai_card_sdk::Resu
     Ok(())
 }
 
-async fn wifi(device: &DyjDevice, rest: &[String]) -> reai_card_sdk::Result<()> {
+async fn wifi(device: &DyjDevice, rest: &[String], json: bool) -> reai_card_sdk::Result<()> {
     match required(rest, 0, "wifi subcommand")? {
         "open" => print_json(serde_json::to_value(device.open_wifi().await?)?),
         "close" => print_json(serde_json::to_value(device.close_wifi().await?)?),
         "status" => print_json(serde_json::to_value(device.wifi_status().await?)?),
         "scan" => {
             let networks = device.scan_wifi().await?;
+            if json {
+                return print_json(serde_json::to_value(&networks)?);
+            }
             println!("{} networks", networks.len());
             for network in networks {
                 println!(
@@ -558,7 +689,7 @@ async fn wifi(device: &DyjDevice, rest: &[String]) -> reai_card_sdk::Result<()> 
     }
 }
 
-async fn ap(device: &DyjDevice, rest: &[String]) -> reai_card_sdk::Result<()> {
+async fn ap(device: &DyjDevice, rest: &[String], json: bool) -> reai_card_sdk::Result<()> {
     match required(rest, 0, "ap subcommand")? {
         "start" => print_json(serde_json::to_value(
             device
@@ -584,15 +715,19 @@ async fn ap(device: &DyjDevice, rest: &[String]) -> reai_card_sdk::Result<()> {
                 .to_owned();
             let client = device.access_point_client().await?;
             let before = client.ota_status().await?;
-            println!(
-                "current WiFi firmware {} (code {}), uploading {} ({} bytes) ...",
-                before.current_version,
-                before.current_version_code,
-                name,
-                firmware.len()
-            );
+            if !json {
+                println!(
+                    "current WiFi firmware {} (code {}), uploading {} ({} bytes) ...",
+                    before.current_version,
+                    before.current_version_code,
+                    name,
+                    firmware.len()
+                );
+            }
             let result = client.upload_firmware(firmware, &name).await?;
-            println!("ESP32 restarts in ~3s; wait for WIFI_AP_START before using the AP again");
+            if !json {
+                println!("ESP32 restarts in ~3s; wait for WIFI_AP_START before using the AP again");
+            }
             print_json(serde_json::to_value(result)?)
         }
         other => Err(reai_card_sdk::SdkError::InvalidCommand(other.into())),
@@ -618,9 +753,12 @@ fn dfu_options(
 }
 
 /// 每 5% 或阶段切换时打一行进度。
-fn dfu_progress_printer() -> impl FnMut(DfuProgress) + Send {
+fn dfu_progress_printer(json: bool) -> impl FnMut(DfuProgress) + Send {
     let mut last: Option<(DfuStage, u8)> = None;
     move |progress| {
+        if json {
+            return;
+        }
         let bucket = progress.percent() / 5;
         if last != Some((progress.stage, bucket)) {
             let label = match progress.stage {
@@ -638,7 +776,17 @@ fn dfu_progress_printer() -> impl FnMut(DfuProgress) + Send {
     }
 }
 
-fn print_dfu_report(report: &reai_card_sdk::DfuReport) -> reai_card_sdk::Result<()> {
+fn print_dfu_report(report: &reai_card_sdk::DfuReport, json: bool) -> reai_card_sdk::Result<()> {
+    if json {
+        return print_json(serde_json::json!({
+            "firmware_bytes": report.firmware_bytes,
+            "elapsed_secs": report.elapsed.as_secs_f64(),
+            "objects": report.objects,
+            "rewinds": report.rewinds,
+            "retries": report.retries,
+            "resumed_from": report.resumed_from,
+        }));
+    }
     println!(
         "dfu done: {} bytes in {:.1}s, {} objects, {} rewinds (dropped tail packets), {} rebuilds{}; bootloader validates and reboots into the new app",
         report.firmware_bytes,
@@ -655,18 +803,22 @@ fn print_dfu_report(report: &reai_card_sdk::DfuReport) -> reai_card_sdk::Result<
     Ok(())
 }
 
-async fn uploads(device: &DyjDevice, rest: &[String]) -> reai_card_sdk::Result<()> {
+async fn uploads(device: &DyjDevice, rest: &[String], json: bool) -> reai_card_sdk::Result<()> {
     match required(rest, 0, "uploads subcommand")? {
         "list" => {
             let files = device.list_uploads().await?;
-            println!("{} uploads", files.len());
+            if !json {
+                println!("{} uploads", files.len());
+            }
             print_json(serde_json::to_value(files)?)?;
             Ok(())
         }
         "upload" => {
             let name = required(rest, 1, "name")?;
             let url = rest.get(2).map(String::as_str);
-            println!("uploading {name} (blocks until the device finishes the HTTP upload) ...");
+            if !json {
+                println!("uploading {name} (blocks until the device finishes the HTTP upload) ...");
+            }
             print_json(serde_json::to_value(
                 device.upload_file_via_sta_to(name, url).await?,
             )?)
@@ -674,6 +826,16 @@ async fn uploads(device: &DyjDevice, rest: &[String]) -> reai_card_sdk::Result<(
         "upload-all" => {
             let url = rest.get(1).map(String::as_str);
             let results = device.upload_all_via_sta(url).await?;
+            if json {
+                let items: Vec<Value> = results
+                    .iter()
+                    .map(|(name, outcome)| match outcome {
+                        Ok(res) => serde_json::json!({ "name": name, "ok": true, "response": res }),
+                        Err(err) => serde_json::json!({ "name": name, "ok": false, "error": err.to_string() }),
+                    })
+                    .collect();
+                return print_json(Value::Array(items));
+            }
             for (name, outcome) in &results {
                 match outcome {
                     Ok(_) => println!("✅ {name}"),
@@ -709,12 +871,14 @@ async fn config(device: &DyjDevice, rest: &[String]) -> reai_card_sdk::Result<()
 
 /// 按键 / 侧边开关绑定：固件在设备侧执行动作并上报事件，这里只改配置表。
 /// 设备侧一键同步（0.3.9+）：受理后进度经事件通道推送，可用 `events` 子命令观察。
-async fn sync(device: &DyjDevice, rest: &[String]) -> reai_card_sdk::Result<()> {
+async fn sync(device: &DyjDevice, rest: &[String], json: bool) -> reai_card_sdk::Result<()> {
     match required(rest, 0, "sync subcommand (start|status)")? {
         "start" => {
             let response = device.start_sync().await?;
             print_json(serde_json::to_value(response)?)?;
-            println!("已受理：进度看 `events` 的 SYNC_STATUS，或 `sync status` 轮询");
+            if !json {
+                println!("已受理：进度看 `events` 的 SYNC_STATUS，或 `sync status` 轮询");
+            }
             Ok(())
         }
         "status" => print_json(serde_json::to_value(device.sync_status().await?)?),
@@ -739,7 +903,7 @@ async fn creds(device: &DyjDevice, rest: &[String]) -> reai_card_sdk::Result<()>
     }
 }
 
-async fn controls(device: &DyjDevice, rest: &[String]) -> reai_card_sdk::Result<()> {
+async fn controls(device: &DyjDevice, rest: &[String], json: bool) -> reai_card_sdk::Result<()> {
     fn input(text: &str) -> reai_card_sdk::Result<ControlInput> {
         ControlInput::from_config_key(text).ok_or_else(|| {
             reai_card_sdk::SdkError::InvalidCommand(format!(
@@ -758,13 +922,24 @@ async fn controls(device: &DyjDevice, rest: &[String]) -> reai_card_sdk::Result<
             let target = input(required(rest, 1, "input")?)?;
             let action = ControlAction::parse(required(rest, 2, "action")?);
             device.set_control_action(target, action.clone()).await?;
-            println!("{target} → {action}");
+            if json {
+                print_json(serde_json::json!({
+                    "input": target.config_key(),
+                    "action": action.to_string(),
+                }))?;
+            } else {
+                println!("{target} → {action}");
+            }
             Ok(())
         }
         "clear" => {
             let target = input(required(rest, 1, "input")?)?;
             device.clear_control_action(target).await?;
-            println!("{target} cleared");
+            if json {
+                print_json(serde_json::json!({ "cleared": target.config_key() }))?;
+            } else {
+                println!("{target} cleared");
+            }
             Ok(())
         }
         "preset" => match required(rest, 1, "preset name")? {
@@ -781,14 +956,18 @@ async fn controls(device: &DyjDevice, rest: &[String]) -> reai_card_sdk::Result<
             for target in ControlInput::ALL {
                 device.clear_control_action(target).await?;
             }
-            println!("all six inputs cleared");
+            if json {
+                print_json(serde_json::json!({ "reset": true }))?;
+            } else {
+                println!("all six inputs cleared");
+            }
             Ok(())
         }
         other => Err(reai_card_sdk::SdkError::InvalidCommand(other.into())),
     }
 }
 
-async fn ota(device: &DyjDevice, rest: &[String]) -> reai_card_sdk::Result<()> {
+async fn ota(device: &DyjDevice, rest: &[String], json: bool) -> reai_card_sdk::Result<()> {
     match required(rest, 0, "ota subcommand")? {
         "check" => print_json(serde_json::to_value(device.check_wifi_ota().await?)?),
         "start" => print_json(serde_json::to_value(device.start_wifi_ota().await?)?),
@@ -800,6 +979,9 @@ async fn ota(device: &DyjDevice, rest: &[String]) -> reai_card_sdk::Result<()> {
                 .unwrap_or(600);
             let check = device.check_wifi_ota().await?;
             if !check.update_available {
+                if json {
+                    return print_json(serde_json::to_value(check)?);
+                }
                 println!("no update available");
                 return Ok(());
             }
@@ -840,4 +1022,67 @@ fn print_json(value: Value) -> reai_card_sdk::Result<()> {
         serde_json::to_string_pretty(&value).unwrap_or_default()
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn split_globals_extracts_json_and_preserves_subcommand_args() {
+        let args: Vec<String> = [
+            "--json",
+            "--seconds",
+            "8",
+            "decode",
+            "in.apm",
+            "out.wav",
+            "--normalize",
+            "--source-rate",
+            "15578",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+        let (globals, cmd) = split_globals(&args);
+        assert!(globals.json);
+        assert_eq!(globals.scan_secs, 8);
+        assert_eq!(
+            cmd,
+            vec![
+                "decode",
+                "in.apm",
+                "out.wav",
+                "--normalize",
+                "--source-rate",
+                "15578"
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_decode_args_supports_flags_in_any_order() {
+        let args: Vec<String> = ["--normalize", "a.apm", "--source-rate=15578", "b.wav"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        let parsed = parse_decode_args(&args).unwrap();
+        assert_eq!(
+            parsed,
+            DecodeArgs {
+                input: "a.apm".into(),
+                output: "b.wav".into(),
+                options: AudioProcessOptions {
+                    source_sample_rate_hz: Some(15_578),
+                    remove_dc_and_normalize: true,
+                },
+            }
+        );
+
+        let invalid: Vec<String> = ["--source-rate", "0", "a.apm", "b.wav"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        assert!(parse_decode_args(&invalid).is_err());
+    }
 }

@@ -1,5 +1,6 @@
 # Rust
 /target/
+/python/target/
 
 # 测试工具落盘目录（dyj_web / dyj_cli 下载的录音与 WAV）
 /downloads/

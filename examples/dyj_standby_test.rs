@@ -82,8 +82,15 @@ async fn main() {
         .open(CSV_PATH)
         .expect("无法打开 CSV 日志文件");
     use std::io::Write;
-    if std::fs::metadata(CSV_PATH).map(|m| m.len() == 0).unwrap_or(true) {
-        writeln!(csv, "unix_ts,elapsed_min,level_pct,voltage_mv,adc_raw,charging").unwrap();
+    if std::fs::metadata(CSV_PATH)
+        .map(|m| m.len() == 0)
+        .unwrap_or(true)
+    {
+        writeln!(
+            csv,
+            "unix_ts,elapsed_min,level_pct,voltage_mv,adc_raw,charging"
+        )
+        .unwrap();
     }
 
     println!("已连接，进入待机观测。Ctrl-C 结束。");
