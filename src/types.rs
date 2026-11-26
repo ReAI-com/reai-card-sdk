@@ -203,6 +203,23 @@ pub enum PowerEvent {
     StartupComplete,
     /// 充电状态变化（0.3.7 新增：插入/拔出时推送，`level` 为当时电量百分比）。
     Charging { charging: bool, level: Option<u8> },
+    /// 低电量（主控 ≥0.3.20）：未插 USB 且电量 ≤10% 时推送，每 60 秒最多一条。
+    /// `critical=true`（≤5% 或 <3300mV）表示设备已同时优雅停录并拒绝新开录。
+    LowBattery {
+        critical: bool,
+        /// 电量百分比。
+        level: u8,
+        /// 电池电压（mV）。
+        voltage: u16,
+    },
+    /// 电池已充满但充电器仍插着（主控 ≥0.3.20）：满电后长期浮置会鼓包，设备提醒拔充电器。
+    /// 进入该状态时推一条，之后每 4 小时重复一条；拔电或恢复充电后不再推送。
+    ChargeFull {
+        /// 电量百分比。
+        level: u8,
+        /// 电池电压（mV）。
+        voltage: u16,
+    },
 }
 
 /// 一键同步的状态（`SYNC_STATUS` 事件的 `state` 字段）。

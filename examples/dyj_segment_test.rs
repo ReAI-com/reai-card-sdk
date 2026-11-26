@@ -54,8 +54,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     println!("🔗 连接 {} ({}) …", found.name, found.id);
     let device = manager.connect(found).await?;
 
-    let mut passed = 0usize;
-    let mut failed = 0usize;
+    // 通过/失败数在收尾时按 summary 统计（避免宏内增减计数器的写法）
     let mut summary = Vec::new();
     macro_rules! check {
         ($name:expr, $cond:expr, $($detail:tt)*) => {{
@@ -63,11 +62,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
             if $cond {
                 println!("  ✅ {} {}", $name, detail);
                 summary.push(format!("✅ {}", $name));
-                passed += 1;
             } else {
                 println!("  ❌ {} {}", $name, detail);
                 summary.push(format!("❌ {}", $name));
-                failed += 1;
             }
         }};
     }
@@ -215,6 +212,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
     device.stop_recording().await?;
     println!("  ⏹ 已停止录音");
 
+    let failed = summary.iter().filter(|line| line.starts_with("❌")).count();
+    let passed = summary.len() - failed;
     println!("\n========== 结果: {passed} 通过 / {failed} 失败 ==========");
     for line in &summary {
         println!("  {line}");

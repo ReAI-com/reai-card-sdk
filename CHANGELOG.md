@@ -5,6 +5,28 @@
 
 ## 0.0.10（2026-11-26）
 
+
+## 0.0.11（2026-11-26）
+
+配套固件 **主控 0.3.20 + WiFi 0.1.5**（已真机验证）。**新增两个事件变体，其余 API 无变化**；对 `PowerEvent` 做穷尽 `match` 的代码需要补分支。
+
+**新增**：
+
+- `PowerEvent::LowBattery { critical, level, voltage }`：主控 0.3.20 未在充电且电量 ≤10% 时推送；`critical=true` 表示设备已优雅停录并拒绝新开录。
+- `PowerEvent::ChargeFull { level, voltage }`：主控 0.3.20 每次充电结束时推送（电量已高，提示拔充电器）。
+
+**与 0.0.10 里类型化配置的对应关系（固件侧已调整，2026-11-26 真机验证后）**：
+
+- `set_mic_gain` / `mic_gain`：固件仍支持，但**默认是 0 dB，且不建议设成非 0 dB**——实测所有非 0 dB 档位都带固定的直流偏移（+8 dB 时直流占满刻度 77%），会削顶。
+- `set_silence_stop_minutes` / `silence_stop_minutes`：固件 **0.3.20 已移除静音自动停录**（固定阈值判断不了静音），这两个接口写进去的配置不再有任何效果。
+- `local_only` / `set_local_only`（全局开关）：固件改为**按单次录音**打标记——`RECORD` / `RECORD_START` 带 `local_only:true`（该次录音的分片旁车写 `local_only:true`，WiFi 不上传、不删除，蓝牙取走不受限），全局开关不再生效；SDK 尚无发送该参数的方法。
+
+**内部**：
+
+- 测试工具：连接/扫描默认时长 5s → 15s，`dyj_web` 连接前扫描 2s → 12s（主控 ≥0.3.19 空闲广播间隔 1s，短窗口在 macOS 上经常扫不到）。
+- 修复 `cargo fmt` / `cargo clippy -D warnings` 在测试工具示例里的报错（`dyj_segment_test` 的通过/失败计数改为收尾按汇总统计）。
+- `server-protocol.md` §3.2：上传回执校验契约（`x-sha256` 头、2xx 且回执校验通过才删源、失败重发说明）。
+
 配套固件：兼容历史主控 `<=0.3.19`（支持频偏与 1024s 回绕补偿），推荐搭配主控 `0.3.20` + Wi-Fi `0.1.5`。
 
 **修复与新增**：

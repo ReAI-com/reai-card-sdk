@@ -2760,6 +2760,45 @@ mod tests {
         ));
     }
 
+    /// 主控 0.3.20 的两种电量事件必须映射成强类型，而不是落到 Unhandled。
+    #[tokio::test]
+    async fn battery_events_of_0_3_20_parse_from_power_frame() {
+        let transport = Arc::new(MockTransport::new());
+        let device = DyjDevice::from_transport(transport.clone()).await.unwrap();
+        let mut events = device.subscribe_events();
+        transport.reply(
+            b"POWER:{\"type\":\"low_battery\",\"critical\":false,\"level\":9,\"voltage\":3500}\r\n",
+        );
+        transport.reply(
+            b"POWER:{\"type\":\"low_battery\",\"critical\":true,\"level\":4,\"voltage\":3200}\r\n",
+        );
+        transport.reply(b"POWER:{\"type\":\"charge_full\",\"level\":100,\"voltage\":4180}\r\n");
+        let _ = device.device_info().await.unwrap();
+        assert!(matches!(
+            events.recv().await.unwrap(),
+            DeviceEvent::Power(PowerEvent::LowBattery {
+                critical: false,
+                level: 9,
+                voltage: 3500
+            })
+        ));
+        assert!(matches!(
+            events.recv().await.unwrap(),
+            DeviceEvent::Power(PowerEvent::LowBattery {
+                critical: true,
+                level: 4,
+                voltage: 3200
+            })
+        ));
+        assert!(matches!(
+            events.recv().await.unwrap(),
+            DeviceEvent::Power(PowerEvent::ChargeFull {
+                level: 100,
+                voltage: 4180
+            })
+        ));
+    }
+
     #[tokio::test]
     async fn control_bindings_round_trip_through_device_config() {
         use crate::controls::{ButtonGesture, SwitchPosition};
