@@ -25,10 +25,10 @@ use crate::{
     recording::SavedRecording,
     transport::SharedTransport,
     types::{
-        AccessPointInfo, BatteryInfo, CommandResponse, DeviceEvent, DeviceInfo, DeviceState,
-        FileEntry, LedState, ModuleCheck, OtaProgress, PowerEvent, RecordMark, RecordStatus,
-        StorageInfo, SyncEvent, SyncState, TakenFile, WifiCredential, WifiNetwork,
-        WifiOnlineOtaOutcome, WifiOtaCheck, WifiStatus,
+        AccessPointInfo, BLE_WIFI_VERSION_CONFIG_KEY, BatteryInfo, CommandResponse, DeviceEvent,
+        DeviceInfo, DeviceState, FileEntry, LedState, ModuleCheck, OtaProgress, PowerEvent,
+        RecordMark, RecordStatus, StorageInfo, SyncEvent, SyncState, TakenFile, WifiCredential,
+        WifiFirmwareVersion, WifiNetwork, WifiOnlineOtaOutcome, WifiOtaCheck, WifiStatus,
     },
 };
 
@@ -82,6 +82,12 @@ struct Core {
     file_transfer_active: Arc<AtomicBool>,
     /// SDK 侧实时录音会话进行中：禁止 take_file 与实时流在同一 wire 上混流。
     realtime_active: AtomicBool,
+    /// 最近一次观察到的 Wi-Fi 模块固件版本（来自 `WIFI_OPEN`/`WIFI_STATUS`/`BASE_INFO` 或 nRF KV `ble_wver`）。
+    wifi_version_cache: Arc<std::sync::Mutex<Option<WifiFirmwareVersion>>>,
+    /// 本连接已与 nRF BLE KV (`ble_wver`) 对齐的版本，避免重复下发 `CONFIG_SET`。
+    ble_wifi_kv_synced: std::sync::Mutex<Option<WifiFirmwareVersion>>,
+    /// 是否已在本连接上尝试读取过一次 `ble_wver` BLE KV（即使缺失也只查一次）。
+    ble_wifi_kv_probed: AtomicBool,
 }
 
 /// 离开作用域时自动清除布尔标志。
@@ -109,6 +115,7 @@ impl DyjDevice {
         let (ap_ready_tx, ap_ready_rx) = watch::channel(false);
         let ap_ready_tx = Arc::new(ap_ready_tx);
         let file_transfer_active = Arc::new(AtomicBool::new(false));
+        let wifi_version_cache = Arc::new(std::sync::Mutex::new(None));
         spawn_notification_worker(
             stream,
             incoming_tx,
@@ -116,6 +123,7 @@ impl DyjDevice {
             audio.clone(),
             file_transfer_active.clone(),
             ap_ready_tx.clone(),
+            wifi_version_cache.clone(),
         );
 
         let device = Self {
@@ -129,6 +137,9 @@ impl DyjDevice {
                 ap_ready_tx,
                 file_transfer_active,
                 realtime_active: AtomicBool::new(false),
+                wifi_version_cache,
+                ble_wifi_kv_synced: std::sync::Mutex::new(None),
+                ble_wifi_kv_probed: AtomicBool::new(false),
             }),
         };
         device.sync_time_now().await?;
@@ -149,9 +160,137 @@ impl DyjDevice {
         self.request_value(command, payload, NORMAL_TIMEOUT).await
     }
 
-    pub async fn device_info(&self) -> Result<DeviceInfo> {
-        self.request_typed("BASE_INFO", None, NORMAL_TIMEOUT).await
+    fn cached_wifi_version(&self) -> Option<WifiFirmwareVersion> {
+        self.core
+            .wifi_version_cache
+            .lock()
+            .expect("wifi_version_cache lock")
+            .clone()
     }
+
+    fn store_cached_wifi_version(&self, ver: &WifiFirmwareVersion) {
+        let mut guard = self
+            .core
+            .wifi_version_cache
+            .lock()
+            .expect("wifi_version_cache lock");
+        *guard = Some(ver.clone());
+    }
+
+    async fn sync_ble_wifi_version_kv(&self, ver: &WifiFirmwareVersion) {
+        let already_synced = self
+            .core
+            .ble_wifi_kv_synced
+            .lock()
+            .expect("ble_wifi_kv_synced lock")
+            .as_ref()
+            == Some(ver);
+        if already_synced {
+            return;
+        }
+        let encoded = ver.encode_ble_kv();
+        if self
+            .set_config(BLE_WIFI_VERSION_CONFIG_KEY, &encoded)
+            .await
+            .is_ok()
+        {
+            *self
+                .core
+                .ble_wifi_kv_synced
+                .lock()
+                .expect("ble_wifi_kv_synced lock") = Some(ver.clone());
+            self.core.ble_wifi_kv_probed.store(true, Ordering::SeqCst);
+        }
+    }
+
+    async fn read_ble_wifi_version_kv_once(&self) -> Option<WifiFirmwareVersion> {
+        if !self.core.ble_wifi_kv_probed.swap(true, Ordering::SeqCst)
+            && let Ok(Some(raw)) = self.config_value(BLE_WIFI_VERSION_CONFIG_KEY).await
+            && let Some(kv_ver) = WifiFirmwareVersion::parse_ble_kv(&raw)
+        {
+            *self
+                .core
+                .ble_wifi_kv_synced
+                .lock()
+                .expect("ble_wifi_kv_synced lock") = Some(kv_ver.clone());
+            let mut cache = self
+                .core
+                .wifi_version_cache
+                .lock()
+                .expect("wifi_version_cache lock");
+            let replace = cache
+                .as_ref()
+                .is_none_or(|cur| kv_ver.version_code > cur.version_code);
+            if replace {
+                *cache = Some(kv_ver);
+            }
+        }
+        self.cached_wifi_version()
+    }
+
+    pub async fn device_info(&self) -> Result<DeviceInfo> {
+        let mut info: DeviceInfo = self
+            .request_typed("BASE_INFO", None, NORMAL_TIMEOUT)
+            .await?;
+        let base_ver = WifiFirmwareVersion::new(
+            info.wifi_version.as_deref().unwrap_or(""),
+            info.wifi_version_code.unwrap_or(0),
+        );
+        if base_ver.is_none() || !self.core.ble_wifi_kv_probed.load(Ordering::SeqCst) {
+            let _ = self.read_ble_wifi_version_kv_once().await;
+        }
+        let cached = self.cached_wifi_version();
+        let best = match (base_ver, cached) {
+            (Some(b), Some(c)) if c.version_code > b.version_code => Some(c),
+            (Some(b), _) => Some(b),
+            (None, Some(c)) => Some(c),
+            (None, None) => None,
+        };
+        if let Some(ver) = best {
+            self.store_cached_wifi_version(&ver);
+            info.wifi_version = Some(ver.version.clone());
+            info.wifi_version_code = Some(ver.version_code);
+            self.sync_ble_wifi_version_kv(&ver).await;
+        }
+        Ok(info)
+    }
+
+    /// Reads the cached Wi-Fi firmware version over pure BLE without powering on ESP32.
+    pub async fn wifi_firmware_version(&self) -> Result<Option<WifiFirmwareVersion>> {
+        if let Some(cached) = self.cached_wifi_version() {
+            return Ok(Some(cached));
+        }
+        let info = self.device_info().await?;
+        Ok(WifiFirmwareVersion::new(
+            info.wifi_version.as_deref().unwrap_or(""),
+            info.wifi_version_code.unwrap_or(0),
+        ))
+    }
+
+    /// Ensures the Wi-Fi firmware version is known and persisted in nRF BLE KV (`ble_wver`).
+    ///
+    /// Queries BLE-only metadata (`BASE_INFO` + `ble_wver`) first. Only when neither has ever
+    /// recorded a version (e.g., factory device) does it briefly open Wi-Fi, read live version,
+    /// persist `ble_wver` in nRF Flash, and restore Wi-Fi powered off if it was closed.
+    pub async fn ensure_wifi_firmware_version(&self) -> Result<WifiFirmwareVersion> {
+        if let Some(ver) = self.wifi_firmware_version().await? {
+            return Ok(ver);
+        }
+        let was_open = self.state().await?.wifi_open;
+        if !was_open {
+            self.open_wifi().await?;
+        }
+        if was_open || self.cached_wifi_version().is_none() {
+            let _ = self.wifi_status().await;
+        }
+        if !was_open {
+            let _ = self.close_wifi().await;
+        }
+        self.cached_wifi_version().ok_or_else(|| {
+            SdkError::InvalidFrame("Wi-Fi firmware version unavailable from module".to_owned())
+        })
+    }
+
     pub async fn state(&self) -> Result<DeviceState> {
         self.request_typed("STATE_INFO", None, NORMAL_TIMEOUT).await
     }
@@ -182,8 +321,17 @@ impl DyjDevice {
                 ..Default::default()
             });
         }
-        self.request_typed("WIFI_STATUS", None, NORMAL_TIMEOUT)
-            .await
+        let status: WifiStatus = self
+            .request_typed("WIFI_STATUS", None, NORMAL_TIMEOUT)
+            .await?;
+        if let Some(ver) = WifiFirmwareVersion::new(
+            status.version.as_deref().unwrap_or(""),
+            status.version_code.unwrap_or(0),
+        ) {
+            self.store_cached_wifi_version(&ver);
+            self.sync_ble_wifi_version_kv(&ver).await;
+        }
+        Ok(status)
     }
     /// ESP32 透传命令的上电预检：模块断电时 UART 无人应答，只会白等到超时。
     /// `STATE_INFO.wifiOpen` 即模块电源状态（WIFI_OPEN/WIFI_CLOSE 由 nRF 本地处理）。
@@ -271,7 +419,10 @@ impl DyjDevice {
     /// （默认 600 秒）。固件下限 10 秒（更低按 10 处理），成功响应 `extra.duration`
     /// 带实际生效值；旧固件忽略该参数（响应无 `duration` 字段），行为与
     /// [`Self::start_recording`] 一致。
-    pub async fn start_recording_with_duration(&self, duration_secs: u32) -> Result<CommandResponse> {
+    pub async fn start_recording_with_duration(
+        &self,
+        duration_secs: u32,
+    ) -> Result<CommandResponse> {
         if duration_secs == 0 {
             return Err(SdkError::InvalidCommand(
                 "duration_secs 必须大于 0（要沿用固件当前值请用 start_recording）".into(),
@@ -395,8 +546,13 @@ impl DyjDevice {
         name: &str,
         writer: &mut W,
     ) -> Result<TakenFile> {
-        self.take_file_core("FILE_UPLOAD", Some(json!({"name": name})), writer, Some(name))
-            .await
+        self.take_file_core(
+            "FILE_UPLOAD",
+            Some(json!({"name": name})),
+            writer,
+            Some(name),
+        )
+        .await
     }
 
     /// 蓝牙取走 SD 卡上最旧的（非正在录的）.APM 文件（主控 0.3.13 起）。
@@ -439,8 +595,7 @@ impl DyjDevice {
         self.write_command(command, payload).await?;
 
         let mut expected_size = None;
-        let mut result_name =
-            display_name.unwrap_or(command).to_owned();
+        let mut result_name = display_name.unwrap_or(command).to_owned();
         let mut written = 0_u64;
         let mut next_milestone = FILE_PROGRESS_STEP;
         loop {
@@ -498,9 +653,7 @@ impl DyjDevice {
                             });
                         }
                         _ => {
-                            return Err(SdkError::InvalidFrame(format!(
-                                "invalid {command} state"
-                            )));
+                            return Err(SdkError::InvalidFrame(format!("invalid {command} state")));
                         }
                     }
                 }
@@ -528,13 +681,8 @@ impl DyjDevice {
         dir: impl AsRef<Path>,
     ) -> Result<SavedRecording> {
         let original = recording::base_name(name).to_owned();
-        self.take_to_dir_core(
-            dir,
-            "FILE_UPLOAD",
-            Some(json!({"name": name})),
-            &original,
-        )
-        .await
+        self.take_to_dir_core(dir, "FILE_UPLOAD", Some(json!({"name": name})), &original)
+            .await
     }
 
     /// [`Self::take_oldest_file_to`] 的落盘版：设备自选最旧文件，取走后按固件改名
@@ -557,7 +705,10 @@ impl DyjDevice {
         tokio::fs::create_dir_all(dir).await?;
         let part = recording::part_path(dir, original);
         let mut file = tokio::fs::File::create(&part).await?;
-        let result = match self.take_file_core(command, payload, &mut file, Some(original)).await {
+        let result = match self
+            .take_file_core(command, payload, &mut file, Some(original))
+            .await
+        {
             Ok(result) => result,
             Err(error) => {
                 drop(file);
@@ -591,8 +742,13 @@ impl DyjDevice {
                 extra: Default::default(),
             });
         }
-        self.request_success("WIFI_OPEN", None, WIFI_OPEN_TIMEOUT)
-            .await
+        let response = self
+            .request_success("WIFI_OPEN", None, WIFI_OPEN_TIMEOUT)
+            .await?;
+        if let Some(ver) = self.cached_wifi_version() {
+            self.sync_ble_wifi_version_kv(&ver).await;
+        }
+        Ok(response)
     }
     pub async fn close_wifi(&self) -> Result<CommandResponse> {
         self.request_success("WIFI_CLOSE", None, NORMAL_TIMEOUT)
@@ -1366,6 +1522,56 @@ impl Drop for RealtimeRecordingSession {
     }
 }
 
+fn observe_wifi_version_frame(
+    frame: &TextFrame,
+    wifi_version_cache: &std::sync::Mutex<Option<WifiFirmwareVersion>>,
+) {
+    let payload = &frame.payload;
+    let code_ok = payload
+        .get("code")
+        .and_then(Value::as_i64)
+        .is_none_or(|c| c == 0);
+    if !code_ok {
+        return;
+    }
+    let (ver_str, code_u32, authoritative) = match frame.command.as_str() {
+        "WIFI_OPEN" | "WIFI_STATUS" => (
+            payload.get("version").and_then(Value::as_str).unwrap_or(""),
+            payload
+                .get("versionCode")
+                .and_then(Value::as_u64)
+                .and_then(|v| u32::try_from(v).ok())
+                .unwrap_or(0),
+            true,
+        ),
+        "BASE_INFO" => (
+            payload
+                .get("wifiVersion")
+                .and_then(Value::as_str)
+                .unwrap_or(""),
+            payload
+                .get("wifiVersionCode")
+                .and_then(Value::as_u64)
+                .and_then(|v| u32::try_from(v).ok())
+                .unwrap_or(0),
+            false,
+        ),
+        _ => return,
+    };
+    let Some(ver) = WifiFirmwareVersion::new(ver_str, code_u32) else {
+        return;
+    };
+    let mut guard = wifi_version_cache.lock().expect("wifi_version_cache lock");
+    let replace = match guard.as_ref() {
+        None => true,
+        Some(cur) if authoritative => ver != *cur,
+        Some(cur) => ver.version_code >= cur.version_code,
+    };
+    if replace {
+        *guard = Some(ver);
+    }
+}
+
 fn spawn_notification_worker(
     mut stream: crate::NotificationStream,
     incoming: mpsc::UnboundedSender<Inbound>,
@@ -1373,6 +1579,7 @@ fn spawn_notification_worker(
     audio: broadcast::Sender<PcmChunk>,
     file_transfer_active: Arc<AtomicBool>,
     ap_ready: Arc<watch::Sender<bool>>,
+    wifi_version_cache: Arc<std::sync::Mutex<Option<WifiFirmwareVersion>>>,
 ) {
     tokio::spawn(async move {
         let mut decoder = FrameDecoder::default();
@@ -1422,6 +1629,7 @@ fn spawn_notification_worker(
                             }
                             _ => {}
                         }
+                        observe_wifi_version_frame(&frame, &wifi_version_cache);
                         audio_decoder.observe_frame(&frame);
                         if let Some(event) = event_from_frame(&frame) {
                             tracing::info!(target: "dyj.event", "🎛️ 硬件事件 cmd={} payload={}", frame.command, frame.payload);
@@ -1957,6 +2165,10 @@ mod tests {
         recording: AtomicBool,
         /// 置位后 SYNC_START 回 code:1 busy（一键同步受理失败路径用）。
         sync_busy: AtomicBool,
+        /// 可选在 BASE_INFO 中携带 Wi-Fi 固件版本（模拟 nRF 缓存未丢时）。
+        base_info_wifi_version: std::sync::Mutex<Option<(String, u32)>>,
+        /// 模拟 live ESP32 `WIFI_OPEN` / `WIFI_STATUS` 回报的版本。
+        wifi_module_version: std::sync::Mutex<(String, u32)>,
     }
 
     impl MockTransport {
@@ -1974,6 +2186,8 @@ mod tests {
                 silent: AtomicBool::new(false),
                 recording: AtomicBool::new(false),
                 sync_busy: AtomicBool::new(false),
+                base_info_wifi_version: std::sync::Mutex::new(None),
+                wifi_module_version: std::sync::Mutex::new(("0.1.0".to_owned(), 100)),
             }
         }
 
@@ -2022,10 +2236,42 @@ mod tests {
                         .as_bytes(),
                     );
                 }
-                "WIFI_STATUS" => {
-                    self.reply(b"WIFI_STATUS:{\"version\":\"0.1.0\",\"versionCode\":100,\"status\":\"connected\",\"enabled\":true,\"connected\":true,\"mode\":\"sta\",\"ssid\":\"home\",\"ip\":\"192.168.1.23\",\"rssi\":-52}\r\n");
+                "WIFI_OPEN" => {
+                    self.wifi_open.store(true, Ordering::Relaxed);
+                    let (ver, code) = self.wifi_module_version.lock().unwrap().clone();
+                    self.reply(
+                        format!(
+                            "WIFI_OPEN:{{\"code\":0,\"version\":\"{ver}\",\"versionCode\":{code}}}\r\n"
+                        )
+                        .as_bytes(),
+                    );
                 }
-                "BASE_INFO" => self.reply(b"BASE_INFO:{\"version\":\"0.3.6\",\"versionCode\":306,\"deviceId\":\"DYJ1\",\"deviceName\":\"DYJ\",\"timestamp\":1}\r\n"),
+                "WIFI_CLOSE" => {
+                    self.wifi_open.store(false, Ordering::Relaxed);
+                    self.reply(b"WIFI_CLOSE:{\"code\":0}\r\n");
+                }
+                "WIFI_STATUS" => {
+                    let (ver, code) = self.wifi_module_version.lock().unwrap().clone();
+                    self.reply(
+                        format!(
+                            "WIFI_STATUS:{{\"version\":\"{ver}\",\"versionCode\":{code},\"status\":\"connected\",\"enabled\":true,\"connected\":true,\"mode\":\"sta\",\"ssid\":\"home\",\"ip\":\"192.168.1.23\",\"rssi\":-52}}\r\n"
+                        )
+                        .as_bytes(),
+                    );
+                }
+                "BASE_INFO" => {
+                    let base_wifi = self.base_info_wifi_version.lock().unwrap().clone();
+                    if let Some((ver, code)) = base_wifi {
+                        self.reply(
+                            format!(
+                                "BASE_INFO:{{\"version\":\"0.3.6\",\"versionCode\":306,\"deviceId\":\"DYJ1\",\"deviceName\":\"DYJ\",\"timestamp\":1,\"wifiVersion\":\"{ver}\",\"wifiVersionCode\":{code}}}\r\n"
+                            )
+                            .as_bytes(),
+                        );
+                    } else {
+                        self.reply(b"BASE_INFO:{\"version\":\"0.3.6\",\"versionCode\":306,\"deviceId\":\"DYJ1\",\"deviceName\":\"DYJ\",\"timestamp\":1}\r\n");
+                    }
+                }
                 "FILE_LIST" => {
                     self.reply(b"FILE_LIST:{\"index\":0,\"name\":\"a.apm\",\"size\":3}\r\n");
                     self.reply(b"FILE_LIST:{\"index\":-1}\r\n");
@@ -3358,5 +3604,83 @@ mod tests {
         let taken = device.take_file_to("a.apm", &mut writer).await.unwrap();
         assert_eq!(taken.bytes_written, 3);
         assert_eq!(writer.0, b"abc");
+    }
+
+    #[tokio::test]
+    async fn wifi_status_persists_ble_wifi_version_and_next_session_reads_without_opening_wifi() {
+        let transport1 = Arc::new(MockTransport::new());
+        *transport1.wifi_module_version.lock().unwrap() = ("0.1.4".to_owned(), 104);
+        transport1.wifi_open.store(true, Ordering::Relaxed);
+        let device1 = DyjDevice::from_transport(transport1.clone()).await.unwrap();
+        let status = device1.wifi_status().await.unwrap();
+        assert_eq!(status.version.as_deref(), Some("0.1.4"));
+        let persisted = transport1.config.lock().unwrap().clone();
+        assert_eq!(
+            persisted
+                .get(BLE_WIFI_VERSION_CONFIG_KEY)
+                .map(String::as_str),
+            Some("0.1.4:104")
+        );
+
+        // Next BLE connection after nRF reboot: BASE_INFO omits wifiVersion, Wi-Fi stays OFF
+        let transport2 = Arc::new(MockTransport::new());
+        *transport2.config.lock().unwrap() = persisted;
+        let device2 = DyjDevice::from_transport(transport2.clone()).await.unwrap();
+        let info = device2.device_info().await.unwrap();
+        assert_eq!(info.wifi_version.as_deref(), Some("0.1.4"));
+        assert_eq!(info.wifi_version_code, Some(104));
+        let ver = device2.wifi_firmware_version().await.unwrap();
+        assert_eq!(ver, WifiFirmwareVersion::new("0.1.4", 104));
+        let cmds = transport2.commands.lock().await;
+        assert!(!cmds.contains(&"WIFI_OPEN".to_owned()));
+        assert!(!cmds.contains(&"WIFI_STATUS".to_owned()));
+        assert!(!cmds.contains(&"CONFIG_SET".to_owned()));
+    }
+
+    #[tokio::test]
+    async fn base_info_wifi_version_syncs_to_ble_kv_once() {
+        let transport = Arc::new(MockTransport::new());
+        *transport.base_info_wifi_version.lock().unwrap() = Some(("0.1.4".to_owned(), 104));
+        let device = DyjDevice::from_transport(transport.clone()).await.unwrap();
+
+        let info1 = device.device_info().await.unwrap();
+        assert_eq!(info1.wifi_version.as_deref(), Some("0.1.4"));
+        assert_eq!(info1.wifi_version_code, Some(104));
+        assert_eq!(
+            transport
+                .config
+                .lock()
+                .unwrap()
+                .get(BLE_WIFI_VERSION_CONFIG_KEY)
+                .map(String::as_str),
+            Some("0.1.4:104")
+        );
+
+        let _ = device.device_info().await.unwrap();
+        let cmds = transport.commands.lock().await;
+        assert_eq!(cmds.iter().filter(|c| *c == "CONFIG_GET").count(), 1);
+        assert_eq!(cmds.iter().filter(|c| *c == "CONFIG_SET").count(), 1);
+    }
+
+    #[tokio::test]
+    async fn ensure_wifi_firmware_version_bootstraps_once_then_uses_ble() {
+        let transport1 = Arc::new(MockTransport::new());
+        *transport1.wifi_module_version.lock().unwrap() = ("0.1.4".to_owned(), 104);
+        let device1 = DyjDevice::from_transport(transport1.clone()).await.unwrap();
+        let ver1 = device1.ensure_wifi_firmware_version().await.unwrap();
+        assert_eq!(ver1, WifiFirmwareVersion::new("0.1.4", 104).unwrap());
+        assert!(!transport1.wifi_open.load(Ordering::Relaxed));
+        let cmds1 = transport1.commands.lock().await.clone();
+        assert!(cmds1.contains(&"WIFI_OPEN".to_owned()));
+        assert!(cmds1.contains(&"WIFI_CLOSE".to_owned()));
+
+        let transport2 = Arc::new(MockTransport::new());
+        *transport2.config.lock().unwrap() = transport1.config.lock().unwrap().clone();
+        let device2 = DyjDevice::from_transport(transport2.clone()).await.unwrap();
+        let ver2 = device2.ensure_wifi_firmware_version().await.unwrap();
+        assert_eq!(ver2, ver1);
+        let cmds2 = transport2.commands.lock().await;
+        assert!(!cmds2.contains(&"WIFI_OPEN".to_owned()));
+        assert!(!cmds2.contains(&"WIFI_CLOSE".to_owned()));
     }
 }
