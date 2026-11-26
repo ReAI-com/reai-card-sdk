@@ -26,7 +26,8 @@ use serde_json::Value;
 #[path = "common/mod.rs"]
 mod common;
 
-const DEFAULT_SCAN_SECS: u64 = 5;
+/// 主控 ≥0.3.19 空闲时广播间隔 1s，macOS 上 5s 的窗口经常扫不到；默认给到 15s。
+const DEFAULT_SCAN_SECS: u64 = 15;
 
 #[tokio::main]
 async fn main() {

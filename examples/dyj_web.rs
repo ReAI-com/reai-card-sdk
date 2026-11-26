@@ -34,7 +34,8 @@ mod common;
 
 const INDEX_HTML: &str = include_str!("dyj_web.html");
 const DEFAULT_PORT: u16 = 8787;
-const DEFAULT_SCAN_SECS: u64 = 5;
+/// 主控 ≥0.3.19 空闲时广播间隔 1s，macOS 上 5s 的窗口经常扫不到；默认给到 15s。
+const DEFAULT_SCAN_SECS: u64 = 15;
 
 struct AppState {
     manager: DeviceManager,
@@ -220,8 +221,10 @@ async fn connect(
         .ok_or_else(|| invalid_body("缺少 id 字段"))?;
 
     let _link = state.link_lock.lock().await;
-    // btleplug 连接需要适配器已见过该外设：先短扫描刷新，再按 id 匹配。
-    let devices = state.manager.scan(Duration::from_secs(2)).await?;
+    // btleplug 连接需要适配器已见过该外设：先扫描刷新，再按 id 匹配。
+    // 主控 ≥0.3.19 连接建立 30s 后广播间隔放慢到 1s，macOS 上 2s 的窗口几乎扫不到
+    // （实测连续 6 次 not discoverable，20s 扫描 3/3 命中），所以这里给足 12s。
+    let devices = state.manager.scan(Duration::from_secs(12)).await?;
     let found = devices
         .iter()
         .find(|device| device.id == id)
